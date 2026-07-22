@@ -14,12 +14,14 @@
 
 export { PartialDispatchError, WorkflowRuntime } from "./runtime/runtime.ts";
 export { InMemoryLedger } from "./runtime/ledger.ts";
+export { FsLedger, resolveLedgerRoot } from "./runtime/fs-ledger.ts";
 export type { Ledger, LeaseHandle } from "./runtime/ledger.ts";
 export { reduce } from "./runtime/reducer.ts";
 export type { LaneView, RunView } from "./runtime/reducer.ts";
 export type {
   ContractState,
   ControlMode,
+  FixedPoint,
   NewRunEvent,
   RunEvent,
   RunEventActor,
@@ -28,6 +30,7 @@ export type {
   RunEventType,
   RunFinishStatus,
   RunOutcomeBreakdown,
+  RunnerEvidence,
   RuntimeState,
   SemanticState,
   VerificationState,

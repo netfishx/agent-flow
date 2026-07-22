@@ -1,0 +1,93 @@
+import { FsLedger, resolveLedgerRoot } from "../runtime/fs-ledger.ts";
+import type { RunView } from "../runtime/reducer.ts";
+
+const USAGE = "usage: flow status | flow inspect <runId>";
+
+interface TextSink {
+  write(text: string): unknown;
+}
+
+function runState(run: RunView): string {
+  if (run.finishStatus !== null) {
+    return run.finishStatus === "clean" ? "complete" : "partial";
+  }
+  if (
+    run.laneOrder.some((laneId) => {
+      const lane = run.lanes[laneId]!;
+      return lane.runtimeState === "running" || lane.dispatchedAt !== null;
+    })
+  ) {
+    return "running";
+  }
+  return "dispatched";
+}
+
+function value(input: string | number | null): string {
+  return input === null ? "null" : String(input);
+}
+
+export async function runFlowCli(
+  args: readonly string[],
+  stdout: TextSink = process.stdout,
+  stderr: TextSink = process.stderr,
+): Promise<number> {
+  const [command, runId, ...extra] = args;
+  if (
+    (command !== "status" && command !== "inspect") ||
+    (command === "status" && (runId !== undefined || extra.length > 0)) ||
+    (command === "inspect" && (runId === undefined || extra.length > 0))
+  ) {
+    stderr.write(`${USAGE}\n`);
+    return 2;
+  }
+
+  try {
+    const ledger = new FsLedger(resolveLedgerRoot());
+    if (command === "status") {
+      for (const { runId: listedRunId } of await ledger.list()) {
+        const run = await ledger.load(listedRunId);
+        if (!run) continue;
+        stdout.write(
+          `${run.runId} workflow=${run.workflow} state=${runState(run)} finishStatus=${value(run.finishStatus)} lanes=${run.laneOrder.length} updatedAt=${run.updatedAt}\n`,
+        );
+      }
+      return 0;
+    }
+
+    const run = await ledger.load(runId!);
+    if (!run) {
+      stderr.write(`run "${runId}" not found\n`);
+      return 1;
+    }
+    stdout.write(
+      `runId=${run.runId} workflow=${run.workflow} state=${runState(run)} finishStatus=${value(run.finishStatus)} updatedAt=${run.updatedAt}\n`,
+    );
+    stdout.write(`fixedPoint=${JSON.stringify(run.fixedPoint)}\n`);
+    for (const laneId of run.laneOrder) {
+      const lane = run.lanes[laneId]!;
+      stdout.write(`lane=${laneId}\n`);
+      stdout.write(
+        `  runtimeState=${lane.runtimeState} semanticState=${lane.semanticState} contractState=${lane.contractState} verificationState=${lane.verificationState}\n`,
+      );
+      stdout.write(
+        `  controlMode=${lane.controlMode} exitCode=${value(lane.exitCode)}\n`,
+      );
+      stdout.write(
+        `  registeredAt=${lane.registeredAt} dispatchedAt=${value(lane.dispatchedAt)} liveAt=${value(lane.liveAt)} completedAt=${value(lane.completedAt)} checkpointAt=${value(lane.checkpointAt)} contractEvaluatedAt=${value(lane.contractEvaluatedAt)} verificationRecordedAt=${value(lane.verificationRecordedAt)}\n`,
+      );
+      stdout.write(
+        `  artifacts log=${lane.logFile} checkpoint=${value(lane.checkpointFile)} result=${value(lane.resultFile)} evidence=${value(lane.evidenceFile)}\n`,
+      );
+    }
+    return 0;
+  } catch (error) {
+    stderr.write(
+      `flow: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    return 1;
+  }
+}
+
+if (import.meta.main) {
+  process.exitCode = await runFlowCli(process.argv.slice(2));
+}
