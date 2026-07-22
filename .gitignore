@@ -1,0 +1,3 @@
+node_modules/
+*.log
+# real-stack smoke evidence lives under /private/tmp, never in the repo
