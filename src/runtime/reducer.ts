@@ -206,6 +206,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
     }
     case "lane_dispatch_intent":
       return withLane(state, event, (lane) => {
+        assertNonTerminal(lane, event.type);
         if (lane.dispatchIntentAt !== null) {
           throw new Error("duplicate lane_dispatch_intent");
         }
@@ -217,6 +218,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       });
     case "lane_dispatched":
       return withLane(state, event, (lane) => {
+        assertNonTerminal(lane, event.type);
         if (lane.dispatchedAt !== null) {
           throw new Error("duplicate lane_dispatched");
         }

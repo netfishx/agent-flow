@@ -381,3 +381,107 @@ describe("reduce", () => {
     expect(state!.lanes["lane-1"]!.humanCoordinationMs).toBe(10);
   });
 });
+
+describe("terminal lanes cannot be re-dispatched", () => {
+  const base = (): RunView => {
+    const started = reduce(
+      undefined,
+      event(1, "run_started", {
+        data: {
+          workflow: "wf",
+          workspace: "w1",
+          cwd: "/tmp/ev",
+          splitDirection: "down",
+          tabId: "t1",
+          controllerPaneId: "p0",
+        },
+      }),
+    );
+    return reduce(
+      started,
+      event(2, "lane_registered", {
+        laneId: "lane-1",
+        data: {
+          laneId: "lane-1",
+          paneId: "p1",
+          logFile: "/tmp/ev/lane-1.log",
+          sentinelToken: "FLOW_run-1_LANE_lane-1_EXIT",
+          steps: 1,
+          stepDelaySeconds: 0.1,
+        },
+      }),
+    );
+  };
+
+  const TERMINALS: Array<[string, RunEvent]> = [
+    [
+      "exited",
+      event(3, "lane_exited", {
+        laneId: "lane-1",
+        data: { exitCode: 0, waitMatched: true },
+      }),
+    ],
+    ["crashed", event(3, "lane_crashed", { laneId: "lane-1", data: {} })],
+    [
+      "lost",
+      event(3, "lane_lost", { laneId: "lane-1", data: { cause: "gone" } }),
+    ],
+    [
+      "failed_to_start",
+      event(3, "lane_failed_to_start", {
+        laneId: "lane-1",
+        data: { rejection: "refused" },
+      }),
+    ],
+  ];
+
+  for (const [name, terminalEvent] of TERMINALS) {
+    for (const dispatchType of ["lane_dispatch_intent", "lane_dispatched"] as const) {
+      test(`${dispatchType} after ${name} fails closed`, () => {
+        const terminal = reduce(base(), terminalEvent);
+        expect(() =>
+          reduce(
+            terminal,
+            event(4, dispatchType, { laneId: "lane-1", data: {} }),
+          ),
+        ).toThrow(/terminal/);
+      });
+    }
+    test(`post-${name} checkpoint/contract/verification/takeover stay legal`, () => {
+      let state = reduce(base(), terminalEvent);
+      state = reduce(
+        state,
+        event(4, "lane_checkpoint", {
+          actor: "agent",
+          laneId: "lane-1",
+          data: { semanticState: "partial", checkpointFile: "/tmp/cp" },
+        }),
+      );
+      state = reduce(
+        state,
+        event(5, "lane_contract_evaluated", {
+          actor: "validator",
+          laneId: "lane-1",
+          data: { contractState: "violated", resultFile: "/tmp/r", errors: ["x"] },
+        }),
+      );
+      state = reduce(
+        state,
+        event(6, "lane_verification_recorded", {
+          actor: "runner",
+          laneId: "lane-1",
+          data: { verificationState: "failed", evidenceFile: "/tmp/e" },
+        }),
+      );
+      state = reduce(
+        state,
+        event(7, "lane_takeover", { actor: "human", laneId: "lane-1", data: {} }),
+      );
+      const lane = state.lanes["lane-1"]!;
+      expect(lane.semanticState).toBe("partial");
+      expect(lane.contractState).toBe("violated");
+      expect(lane.verificationState).toBe("failed");
+      expect(lane.controlMode).toBe("human_owned");
+    });
+  }
+});
