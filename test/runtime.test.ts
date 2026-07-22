@@ -8,6 +8,7 @@ import {
   scanSingleQuoted,
 } from "../src/herdr/fake-adapter.ts";
 import { PartialDispatchError } from "../src/runtime/runtime.ts";
+import { InMemoryLedger } from "../src/runtime/ledger.ts";
 import type { LaneSpec, RuntimeDeps } from "../src/runtime/types.ts";
 import { SmokeRuntime } from "../src/smoke/smoke-runtime.ts";
 
@@ -29,6 +30,7 @@ function makeRuntime(
   let n = 0;
   const deps: RuntimeDeps = {
     adapter: fake,
+    ledger: new InMemoryLedger(),
     clock: clock.now,
     idgen: () => `run${++n}`,
     readResultFile: fake.readResultFile,

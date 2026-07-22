@@ -24,6 +24,7 @@
 
 import { mkdir } from "node:fs/promises";
 import { RealHerdrAdapter } from "../herdr/real-adapter.ts";
+import { InMemoryLedger } from "../runtime/ledger.ts";
 import type { LaneResult, LaneSpec, RuntimeDeps } from "../runtime/types.ts";
 import { SmokeRuntime } from "./smoke-runtime.ts";
 
@@ -44,6 +45,7 @@ const line = (message: string): void => {
 function makeDeps(): RuntimeDeps {
   return {
     adapter: new RealHerdrAdapter(),
+    ledger: new InMemoryLedger(),
     clock: () => Date.now(),
     idgen: () =>
       `flow-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,

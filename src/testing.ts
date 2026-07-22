@@ -15,3 +15,4 @@ export type {
   MutableClock,
 } from "./herdr/fake-adapter.ts";
 export { classifyWaitOutput } from "./herdr/real-adapter.ts";
+export { InMemoryLedger } from "./runtime/ledger.ts";

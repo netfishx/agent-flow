@@ -13,6 +13,25 @@
 // shell quoting live behind the HerdrAdapter seam and never appear here.
 
 export { PartialDispatchError, WorkflowRuntime } from "./runtime/runtime.ts";
+export { InMemoryLedger } from "./runtime/ledger.ts";
+export type { Ledger, LeaseHandle } from "./runtime/ledger.ts";
+export { reduce } from "./runtime/reducer.ts";
+export type { LaneView, RunView } from "./runtime/reducer.ts";
+export type {
+  ContractState,
+  ControlMode,
+  NewRunEvent,
+  RunEvent,
+  RunEventActor,
+  RunEventDataByType,
+  RunEventEnvelope,
+  RunEventType,
+  RunFinishStatus,
+  RunOutcomeBreakdown,
+  RuntimeState,
+  SemanticState,
+  VerificationState,
+} from "./runtime/events.ts";
 export type {
   InterruptOutcome,
   LanePhaseTiming,

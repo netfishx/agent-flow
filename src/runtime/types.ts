@@ -3,6 +3,7 @@
 // address work through opaque `runId` / `laneId` strings only.
 
 import type { HerdrAdapter } from "../herdr/adapter.ts";
+import type { Ledger } from "./ledger.ts";
 
 export type LaneState =
   | "starting"
@@ -105,6 +106,8 @@ export interface RunHandle {
 /** Everything the runtime needs from the outside — all injectable for tests. */
 export interface RuntimeDeps {
   readonly adapter: HerdrAdapter;
+  /** Required event ledger; InMemoryLedger is the explicit ephemeral choice. */
+  readonly ledger: Ledger;
   /** Monotonic-ish millisecond clock, stamped at phase boundaries. */
   readonly clock: () => number;
   /** Generates the opaque run id. */
