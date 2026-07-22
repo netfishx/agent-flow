@@ -42,6 +42,8 @@ export interface FakeLaneProgram {
   readonly waitMatches?: boolean;
   /** Make `wait-output` throw, exercising the CLI/environment failure path. */
   readonly waitErrors?: boolean;
+  /** Make the durable-log read throw, exercising an I/O failure on a real lane. */
+  readonly readErrors?: boolean;
   /**
    * Keep the lane's foreground process group alive even after the sentinel
    * matches, so completion cannot be declared without a process-info check.
@@ -269,7 +271,12 @@ export class FakeHerdrAdapter implements HerdrAdapter {
   /** Wired into RuntimeDeps.readResultFile: reconstruct a lane's durable log. */
   readResultFile = async (path: string): Promise<string> => {
     for (const state of this.panes.values()) {
-      if (state.logFile === path) return this.durable(state);
+      if (state.logFile === path) {
+        if (state.program?.readErrors) {
+          throw new Error("fake: durable read failed (I/O)");
+        }
+        return this.durable(state);
+      }
     }
     throw new Error(`fake: no durable log for ${path}`);
   };

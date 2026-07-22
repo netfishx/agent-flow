@@ -39,6 +39,10 @@ export interface LaneRecord {
   readonly sentinelToken: string;
   readonly steps: number;
   readonly stepDelaySeconds: number;
+  // True only once `runInPane` has accepted the lane. A lane that was never
+  // dispatched (or whose dispatch threw) has no process and no durable log; a
+  // dispatched lane is expected to have one, so its read errors must propagate.
+  dispatchAccepted: boolean;
   dispatchedAt: number | null;
   liveAt: number | null;
   completedAt: number | null;
@@ -139,6 +143,7 @@ export class WorkflowRuntime {
         sentinelToken: laneSentinelToken(runId, spec.laneId),
         steps: spec.steps,
         stepDelaySeconds: spec.stepDelaySeconds ?? 0.2,
+        dispatchAccepted: false,
         dispatchedAt: null,
         liveAt: null,
         completedAt: null,
@@ -184,7 +189,7 @@ export class WorkflowRuntime {
       try {
         await this.deps.adapter.runInPane(lane.pane, command);
       } catch (cause) {
-        lane.state = "failed";
+        lane.state = "failed"; // dispatchAccepted stays false — never ran
         // Lanes after the failure were never dispatched; give them a terminal
         // state so the whole run is inspectable — an idle, never-run pane is not
         // a completed process and must not be read as one.
@@ -196,6 +201,7 @@ export class WorkflowRuntime {
         // can inspect and interrupt them via the runId carried on the error.
         throw new PartialDispatchError(runId, started, cause);
       }
+      lane.dispatchAccepted = true;
       lane.state = "running";
       started.push(laneId);
     }
@@ -251,9 +257,12 @@ export class WorkflowRuntime {
   async inspectLaneResult(runId: string, laneId: string): Promise<LaneResult> {
     const run = this.getRun(runId);
     const lane = this.getLane(run, laneId);
-    // A never-dispatched lane (e.g. after a partial dispatch) has no durable
-    // log; inspection must still return a result, not throw.
-    const output = await this.readDurable(lane.logFile).catch(() => "");
+    // A never-accepted lane has no durable log, so skip the read. A dispatched
+    // lane is expected to have one: its read errors PROPAGATE, so a broken
+    // durable read is never disguised as an empty result.
+    const output = lane.dispatchAccepted
+      ? await this.readDurable(lane.logFile)
+      : "";
     const parsedExit = parseExitFromSentinel(runId, laneId, output);
     const tail = output
       .trim()
@@ -363,9 +372,9 @@ export class WorkflowRuntime {
 
   private async refreshLane(run: RunRecord, lane: LaneRecord): Promise<void> {
     if (TERMINAL.has(lane.state)) return;
-    // A lane that was never dispatched has no process on its pane; its idle
-    // shell must not be mistaken for a completed process.
-    if (lane.dispatchedAt === null) return;
+    // A lane that was never accepted has no process on its pane; its idle shell
+    // must not be mistaken for a completed process.
+    if (!lane.dispatchAccepted) return;
     const info = await this.deps.adapter.processInfo(lane.pane);
     if (info.foregroundProcessGroupId === info.shellPid) {
       await this.finalizeLane(run, lane);
@@ -412,11 +421,14 @@ export class WorkflowRuntime {
   }
 
   private runState(run: RunRecord): RunState {
+    // Aggregate from lane lifecycle, not from a dispatch flag: a run with any
+    // running lane is running even if dispatch aborted partway.
     const states = run.laneOrder.map((id) => run.lanes.get(id)!.state);
+    if (states.some((s) => s === "running")) return "running";
     if (states.every((s) => TERMINAL.has(s))) {
       return states.every((s) => s === "complete") ? "complete" : "partial";
     }
-    return run.dispatchedAt === null ? "dispatched" : "running";
+    return "dispatched";
   }
 
   private laneTiming(lane: LaneRecord): LanePhaseTiming {

@@ -84,6 +84,8 @@ export class SmokeRuntime extends WorkflowRuntime {
         sentinelToken: laneSentinelToken(topology.runId, lane.laneId),
         steps: lane.steps,
         stepDelaySeconds: lane.stepDelaySeconds,
+        // Attached lanes were already dispatched by the exited controller.
+        dispatchAccepted: true,
         dispatchedAt: lane.dispatchedAt,
         liveAt: lane.liveAt,
         completedAt: null,
