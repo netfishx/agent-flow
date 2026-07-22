@@ -4,13 +4,12 @@ import {
   FakeHerdrAdapter,
   type FakeAdvances,
   type FakeLaneProgram,
+  type MutableClock,
+  scanSingleQuoted,
 } from "../src/herdr/fake-adapter.ts";
-import {
-  PartialDispatchError,
-  WorkflowRuntime,
-} from "../src/runtime/runtime.ts";
-import type { LaneSpec } from "../src/runtime/types.ts";
-import { scanSingleQuoted } from "../src/herdr/fake-adapter.ts";
+import { PartialDispatchError } from "../src/runtime/runtime.ts";
+import type { LaneSpec, RuntimeDeps } from "../src/runtime/types.ts";
+import { SmokeRuntime } from "../src/smoke/smoke-runtime.ts";
 
 interface SetupOptions {
   lanes?: FakeLaneProgram[];
@@ -22,6 +21,26 @@ interface SetupOptions {
   clockStart?: number;
 }
 
+function makeRuntime(
+  fake: FakeHerdrAdapter,
+  clock: MutableClock,
+  opts: SetupOptions = {},
+): SmokeRuntime {
+  let n = 0;
+  const deps: RuntimeDeps = {
+    adapter: fake,
+    clock: clock.now,
+    idgen: () => `run${++n}`,
+    readResultFile: fake.readResultFile,
+    sleep: async () => {},
+    processGoneTimeoutMs: opts.processGoneTimeoutMs,
+    processGoneIntervalMs: opts.processGoneIntervalMs,
+  };
+  // SmokeRuntime IS-A WorkflowRuntime, so it exercises the same public behavior
+  // while also exposing the smoke's export/attach handoff for the tests below.
+  return new SmokeRuntime(deps);
+}
+
 function setup(opts: SetupOptions = {}) {
   const clock = createClock(opts.clockStart ?? 0);
   const fake = new FakeHerdrAdapter({
@@ -31,16 +50,7 @@ function setup(opts: SetupOptions = {}) {
     failRunInPane: opts.failRunInPane,
     failRunInPaneAfter: opts.failRunInPaneAfter,
   });
-  let n = 0;
-  const runtime = new WorkflowRuntime({
-    adapter: fake,
-    clock: clock.now,
-    idgen: () => `run${++n}`,
-    readResultFile: fake.readResultFile,
-    sleep: async () => {},
-    processGoneTimeoutMs: opts.processGoneTimeoutMs,
-    processGoneIntervalMs: opts.processGoneIntervalMs,
-  });
+  const runtime = makeRuntime(fake, clock, opts);
   return { runtime, fake, clock };
 }
 
@@ -55,7 +65,7 @@ const config = (lanes: LaneSpec[]) => ({
   lanes,
 });
 
-async function startAndConfirm(runtime: WorkflowRuntime, ids: string[]) {
+async function startAndConfirm(runtime: SmokeRuntime, ids: string[]) {
   const handle = await runtime.startWorkflow(config(laneSpecs(...ids)));
   for (const laneId of handle.laneIds) {
     await runtime.confirmLaneStarted(handle.runId, laneId);
@@ -245,13 +255,7 @@ describe("controller loss (export / attach)", () => {
 
     // A fresh controller (new runtime) over the SAME adapter — as if the
     // dispatching controller had exited and the lanes kept running under Herdr.
-    const fresh = new WorkflowRuntime({
-      adapter: fake,
-      clock: clock.now,
-      idgen: () => "unused",
-      readResultFile: fake.readResultFile,
-      sleep: async () => {},
-    });
+    const fresh = makeRuntime(fake, clock);
     const attached = fresh.attachRun(topology);
     expect(attached.runId).toBe(handle.runId);
     expect(attached.laneIds).toEqual(["lane-1", "lane-2"]);
@@ -322,33 +326,39 @@ describe("error paths", () => {
     ).rejects.toBeInstanceOf(PartialDispatchError);
   });
 
-  test("a partial dispatch leaves the started lanes controllable", async () => {
-    // lane-1 dispatches; lane-2's dispatch throws.
+  test("a partial dispatch leaves the whole run inspectable and started lanes controllable", async () => {
+    // Three lanes: lane-1 dispatches, lane-2's dispatch throws, lane-3 is never
+    // dispatched — the case the two-lane test missed.
     const { runtime } = setup({
       failRunInPaneAfter: 1,
       lanes: [
         { laneId: "lane-1", exitCode: 0 },
         { laneId: "lane-2", exitCode: 0 },
+        { laneId: "lane-3", exitCode: 0 },
       ],
     });
     let error: PartialDispatchError | null = null;
     try {
-      await runtime.startWorkflow(config(laneSpecs("lane-1", "lane-2")));
+      await runtime.startWorkflow(config(laneSpecs("lane-1", "lane-2", "lane-3")));
     } catch (caught) {
       error = caught as PartialDispatchError;
     }
     expect(error).toBeInstanceOf(PartialDispatchError);
     expect(error!.startedLaneIds).toEqual(["lane-1"]);
 
-    // The run is registered under its runId — inspect/interrupt do NOT report
-    // "unknown runId", and the started lane is controllable.
+    // inspectWorkflow must NOT throw on the never-dispatched lane-3's idle pane.
     const status = await runtime.inspectWorkflow(error!.runId);
-    expect(status.lanes.find((l) => l.laneId === "lane-1")?.state).toBe(
-      "running",
-    );
-    expect(status.lanes.find((l) => l.laneId === "lane-2")?.state).toBe(
-      "failed",
-    );
+    expect(status.lanes.find((l) => l.laneId === "lane-1")?.state).toBe("running");
+    expect(status.lanes.find((l) => l.laneId === "lane-2")?.state).toBe("failed");
+    // lane-3 was never dispatched — a clear terminal state, not "starting".
+    expect(status.lanes.find((l) => l.laneId === "lane-3")?.state).toBe("failed");
+
+    // inspectLaneResult on the never-dispatched lane must not throw either.
+    const r3 = await runtime.inspectLaneResult(error!.runId, "lane-3");
+    expect(r3.state).toBe("failed");
+    expect(r3.exitCode).toBeNull();
+
+    // The started lane stays controllable.
     const outcome = await runtime.interruptLane(error!.runId, "lane-1");
     expect(outcome.delivered).toBe(true);
   });
