@@ -1,6 +1,7 @@
 import type {
   ContractState,
   ControlMode,
+  FixedPoint,
   RunEvent,
   RunFinishStatus,
   RunOutcomeBreakdown,
@@ -52,6 +53,7 @@ export interface RunView {
   readonly splitDirection: "right" | "down";
   readonly tabId: string;
   readonly controllerPaneId: string;
+  readonly fixedPoint: FixedPoint | null;
   readonly startedAt: number;
   readonly updatedAt: number;
   readonly checkpointAnnouncedAt: number | null;
@@ -146,6 +148,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       splitDirection: event.data.splitDirection,
       tabId: event.data.tabId,
       controllerPaneId: event.data.controllerPaneId,
+      fixedPoint: event.data.fixedPoint,
       startedAt: event.at,
       updatedAt: event.at,
       checkpointAnnouncedAt: null,

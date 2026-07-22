@@ -4,6 +4,7 @@
 
 import type { HerdrAdapter } from "../herdr/adapter.ts";
 import type { Ledger } from "./ledger.ts";
+import type { FixedPoint } from "./events.ts";
 
 export type LaneState =
   | "starting"
@@ -96,6 +97,8 @@ export interface StartWorkflowConfig {
   readonly splitDirection?: "right" | "down";
   /** Pause after splitting before dispatch, to avoid the split→run race. */
   readonly startupSettleMs?: number;
+  /** Captured by the caller; the runtime stores it verbatim without validation. */
+  readonly fixedPoint?: FixedPoint | null;
 }
 
 export interface RunHandle {

@@ -45,6 +45,28 @@ export type VerificationState = "unverified" | "verified" | "failed";
 export type ControlMode = "managed" | "human_owned";
 export type RunFinishStatus = "clean" | "degraded";
 
+export interface FixedPoint {
+  readonly repoRoot: string;
+  readonly baseCommit: string;
+  readonly headCommit: string;
+  readonly diffHash: string;
+  readonly dirtyStatePolicy: "reject" | "record-hash";
+  readonly capturedAt: number;
+}
+
+export interface RunnerEvidence {
+  readonly schemaVersion: 1;
+  readonly runId: string;
+  readonly laneId: string;
+  readonly command: string;
+  readonly logFile: string;
+  readonly dispatchedAt: number | null;
+  readonly liveAt: number | null;
+  readonly completedAt: number | null;
+  readonly exitCode: number | null;
+  readonly termination: "sentinel-exit" | "crashed" | "lost";
+}
+
 export type EmptyEventData = Readonly<Record<string, never>>;
 
 export interface RunStartedData {
@@ -54,6 +76,7 @@ export interface RunStartedData {
   readonly splitDirection: "right" | "down";
   readonly tabId: string;
   readonly controllerPaneId: string;
+  readonly fixedPoint: FixedPoint | null;
 }
 
 export interface LaneRegisteredData {

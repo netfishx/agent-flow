@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   escapeRegex,
   paneRunArgv,
@@ -57,6 +60,8 @@ describe("buildLaneCommand", () => {
       runId: "run1",
       laneId: "lane-2",
       logFile: "/tmp/ev/lane-2.log",
+      checkpointFile: "/tmp/ev/checkpoints/lane-2.md",
+      resultFile: "/tmp/ev/results/lane-2-result.txt",
       steps: 5,
       stepDelaySeconds: 0.2,
     });
@@ -74,6 +79,8 @@ describe("buildLaneCommand", () => {
       runId: "run1",
       laneId: "lane-2",
       logFile: "/tmp/ev/lane-2.log",
+      checkpointFile: "/tmp/ev/checkpoints/lane-2.md",
+      resultFile: "/tmp/ev/results/lane-2-result.txt",
       steps: 5,
       stepDelaySeconds: 0.2,
     });
@@ -87,9 +94,53 @@ describe("buildLaneCommand", () => {
       runId: "run1",
       laneId: "l'x",
       logFile: "/tmp/ev/lane.log",
+      checkpointFile: "/tmp/ev/checkpoints/lane.md",
+      resultFile: "/tmp/ev/results/lane-result.txt",
       steps: 1,
       stepDelaySeconds: 0.2,
     });
     expect(scanSingleQuoted(command)[2]).toBe("l'x");
+  });
+
+  test("writes the checkpoint and result schemas through adversarial paths", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-flow-lane-' quoted "));
+    try {
+      const logFile = join(root, "logs", "lane's log.txt");
+      const checkpointFile = join(root, "check points", "lane's checkpoint.md");
+      const resultFile = join(root, "result files", "lane's result.txt");
+      const command = buildLaneCommand({
+        runId: "run1",
+        laneId: "lane-2",
+        logFile,
+        checkpointFile,
+        resultFile,
+        steps: 1,
+        stepDelaySeconds: 0.001,
+      });
+      const process = Bun.spawn(["bash", "-c", command], {
+        stdout: "ignore",
+        stderr: "pipe",
+      });
+      expect(await process.exited).toBe(0);
+      expect(await readFile(logFile, "utf8")).toContain(
+        "FLOW_run1_LANE_lane-2_EXIT=0",
+      );
+      const checkpoint = await readFile(checkpointFile, "utf8");
+      for (const field of [
+        "STATUS: complete",
+        "PHASE:",
+        "COMPLETED:",
+        "NEXT:",
+        "BLOCKERS:",
+        "ARTIFACTS:",
+        "VERIFICATION_CLAIMS:",
+        "GAPS:",
+      ]) {
+        expect(checkpoint).toContain(field);
+      }
+      expect(await readFile(resultFile, "utf8")).toBe("RESULT: ok steps=1\n");
+    } finally {
+      await rm(root, { recursive: true });
+    }
   });
 });
