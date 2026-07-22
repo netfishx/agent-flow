@@ -113,4 +113,8 @@ export interface RuntimeDeps {
   readonly readResultFile: (path: string) => Promise<string>;
   /** Real delay for settle/poll waits; a no-op in deterministic tests. */
   readonly sleep?: (ms: number) => Promise<void>;
+  /** How long to confirm a lane's process has exited after its sentinel (default 2000ms). */
+  readonly processGoneTimeoutMs?: number;
+  /** Poll interval for the process-gone confirmation (default 100ms). */
+  readonly processGoneIntervalMs?: number;
 }

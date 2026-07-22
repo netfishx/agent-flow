@@ -5,7 +5,6 @@
 // the (centrally quoted) argument list varies.
 
 import { shellSingleQuote } from "../herdr/argv.ts";
-import { controllerSentinelToken } from "../runtime/ids.ts";
 
 // A self-contained simulated lane: streams progress to a durable log, prints a
 // run+lane-specific sentinel on exit, and turns SIGINT into exit 130. It reads
@@ -49,15 +48,4 @@ export function buildLaneCommand(input: LaneCommandInput): string {
     shellSingleQuote(String(input.steps)),
     shellSingleQuote(String(input.stepDelaySeconds)),
   ].join(" ");
-}
-
-/**
- * A brief controller "launcher" line: prints a banner plus the controller
- * sentinel, then exits so the controller pane returns to its shell — the
- * observable moment that the launcher has left while the lanes keep running.
- */
-export function buildControllerMarkerCommand(runId: string): string {
-  const line = `${controllerSentinelToken(runId)}=0`;
-  const script = `printf '%s\\n' 'flow controller dispatched lanes; leaving' ${shellSingleQuote(line)}`;
-  return `bash -c ${shellSingleQuote(script)}`;
 }

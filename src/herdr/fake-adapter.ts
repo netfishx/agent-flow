@@ -40,6 +40,13 @@ export interface FakeLaneProgram {
   readonly emitSentinel?: boolean;
   /** Whether `wait-output` reports a match. */
   readonly waitMatches?: boolean;
+  /** Make `wait-output` throw, exercising the CLI/environment failure path. */
+  readonly waitErrors?: boolean;
+  /**
+   * Keep the lane's foreground process group alive even after the sentinel
+   * matches, so completion cannot be declared without a process-info check.
+   */
+  readonly staysRunningAfterMatch?: boolean;
   readonly extraOutput?: readonly string[];
 }
 
@@ -56,8 +63,10 @@ export interface FakeHerdrAdapterOptions {
   readonly clock?: MutableClock;
   readonly lanes?: readonly FakeLaneProgram[];
   readonly advances?: FakeAdvances;
-  /** Panes whose command should make `runInPane` throw (command-failure path). */
+  /** Make every `runInPane` throw (command-failure path). */
   readonly failRunInPane?: boolean;
+  /** Throw on `runInPane` only after this many successful calls (partial dispatch). */
+  readonly failRunInPaneAfter?: number;
 }
 
 interface FakePaneState {
@@ -111,6 +120,8 @@ export class FakeHerdrAdapter implements HerdrAdapter {
   private readonly programs = new Map<string, FakeLaneProgram>();
   private readonly advances: FakeAdvances;
   private readonly failRunInPane: boolean;
+  private readonly failRunInPaneAfter: number | null;
+  private runInPaneCalls = 0;
   private readonly panes = new Map<string, FakePaneState>();
   private readonly paneByLane = new Map<string, string>();
   private tabSeq = 0;
@@ -119,12 +130,14 @@ export class FakeHerdrAdapter implements HerdrAdapter {
   // Observability for assertions.
   focusedPaneId: string | null = null;
   focusedTabId: string | null = null;
+  processInfoCalls = 0;
   readonly dispatched: { paneId: string; command: string }[] = [];
 
   constructor(options: FakeHerdrAdapterOptions = {}) {
     this.clock = options.clock ?? createClock();
     this.advances = options.advances ?? {};
     this.failRunInPane = options.failRunInPane ?? false;
+    this.failRunInPaneAfter = options.failRunInPaneAfter ?? null;
     for (const lane of options.lanes ?? []) this.programs.set(lane.laneId, lane);
   }
 
@@ -164,15 +177,17 @@ export class FakeHerdrAdapter implements HerdrAdapter {
   async runInPane(pane: PaneRef, shellCommand: string): Promise<void> {
     this.tick(this.advances.runInPane);
     this.dispatched.push({ paneId: pane.id, command: shellCommand });
-    if (this.failRunInPane) {
+    if (
+      this.failRunInPane ||
+      (this.failRunInPaneAfter !== null &&
+        this.runInPaneCalls >= this.failRunInPaneAfter)
+    ) {
+      this.runInPaneCalls++;
       throw new Error("fake: runInPane failed");
     }
+    this.runInPaneCalls++;
     const state = this.panes.get(pane.id);
     if (!state) throw new Error(`fake: unknown pane ${pane.id}`);
-    if (shellCommand.includes("_CONTROLLER_EXIT")) {
-      state.role = "controller";
-      return;
-    }
     const tokens = scanSingleQuoted(shellCommand);
     // tokens: [script, runId, laneId, logFile, steps, delay]
     const [, runId, laneId, logFile] = tokens;
@@ -197,14 +212,24 @@ export class FakeHerdrAdapter implements HerdrAdapter {
     const state = this.panes.get(pane.id);
     if (state?.role === "lane") {
       this.tick(state.program?.execMs);
-      state.finished = true;
-      return { matched: state.program?.waitMatches ?? true };
+      if (state.program?.waitErrors) {
+        throw new Error("fake: herdr pane wait-output failed");
+      }
+      const matched = state.program?.waitMatches ?? true;
+      // Normally a matched sentinel means the process has exited; a lane marked
+      // staysRunningAfterMatch keeps its foreground group alive, so completion
+      // must still be gated on process-info.
+      if (matched && !state.program?.staysRunningAfterMatch) {
+        state.finished = true;
+      }
+      return { matched, timedOut: !matched };
     }
     // controller marker or idle pane: matches immediately.
-    return { matched: true };
+    return { matched: true, timedOut: false };
   }
 
   async processInfo(pane: PaneRef): Promise<ProcessInfo> {
+    this.processInfoCalls++;
     this.tick(this.advances.processInfo);
     const state = this.panes.get(pane.id);
     if (!state) throw new Error(`fake: unknown pane ${pane.id}`);

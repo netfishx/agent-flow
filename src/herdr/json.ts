@@ -57,6 +57,28 @@ export function parseSplitPane(raw: string): PaneRef {
   return { id: paneId };
 }
 
+/** A structured Herdr error, e.g. `{"error":{"code":"timeout",...}}` on stderr. */
+export interface HerdrError {
+  readonly code: string;
+  readonly message: string;
+}
+
+/** Parse a Herdr error envelope from stderr, or null if it is not one. */
+export function parseHerdrError(stderr: string): HerdrError | null {
+  let root: unknown;
+  try {
+    root = JSON.parse(stderr);
+  } catch {
+    return null;
+  }
+  const error = isRecord(root) ? root.error : undefined;
+  if (!isRecord(error) || typeof error.code !== "string") return null;
+  return {
+    code: error.code,
+    message: typeof error.message === "string" ? error.message : "",
+  };
+}
+
 /** Parse `herdr pane process-info` → structured process facts. */
 export function parseProcessInfo(raw: string): ProcessInfo {
   const root = parseJson("pane process-info", raw);

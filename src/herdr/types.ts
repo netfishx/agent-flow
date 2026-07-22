@@ -47,10 +47,14 @@ export interface ProcessInfo {
 /**
  * Outcome of `herdr pane wait-output`. `matched` reports only whether the
  * pattern appeared — it is deliberately NOT a process exit code. A matched wait
- * says "the sentinel line was printed", never "the lane succeeded".
+ * says "the sentinel line was printed", never "the lane succeeded". `timedOut`
+ * distinguishes a clean timeout (no match within the window) from a match; a
+ * genuine CLI/environment failure is raised as an error, never folded into
+ * `matched: false`.
  */
 export interface WaitOutcome {
   readonly matched: boolean;
+  readonly timedOut: boolean;
 }
 
 /** Evidence from sending an interrupt to a pane's foreground process group. */

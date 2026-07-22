@@ -8,10 +8,9 @@
 // shell. `wait-output` matching is a liveness signal, never the exit code.
 
 import type { PaneRef, TabRef } from "../herdr/types.ts";
-import { buildControllerMarkerCommand, buildLaneCommand } from "../smoke/lane.ts";
+import { buildLaneCommand } from "../smoke/lane.ts";
 import {
   assertHandleId,
-  controllerSentinelRegex,
   laneSentinelRegex,
   laneSentinelToken,
   parseExitFromSentinel,
@@ -65,10 +64,55 @@ const TERMINAL: ReadonlySet<LaneState> = new Set([
   "failed",
 ]);
 
+// Opaque handoff of a dispatched run's topology. It carries only the static
+// facts a fresh controller needs to attach, inspect, and collect an in-flight
+// run — no lifecycle event log, no mutable snapshot, no work resume. Those
+// (the durable ledger and recovery) are #5. Callers treat the serialized form
+// as an opaque blob; pane ids live inside it, never in a public typed field.
+interface RunTopology {
+  readonly v: 1;
+  readonly runId: string;
+  readonly workflow: string;
+  readonly workspace: string;
+  readonly cwd: string;
+  readonly splitDirection: "right" | "down";
+  readonly tabId: string;
+  readonly controllerPaneId: string;
+  readonly startedAt: number;
+  readonly dispatchedAt: number | null;
+  readonly lanes: readonly {
+    readonly laneId: string;
+    readonly paneId: string;
+    readonly logFile: string;
+    readonly steps: number;
+    readonly stepDelaySeconds: number;
+    readonly dispatchedAt: number | null;
+    readonly liveAt: number | null;
+  }[];
+}
+
 function classifyExit(exitCode: number): LaneState {
   if (exitCode === 0) return "complete";
   if (exitCode === 130) return "interrupted";
   return "failed";
+}
+
+/**
+ * Raised when dispatch fails partway. The run is already registered, so the
+ * lanes that did start remain inspectable and interruptible via `runId` — a
+ * lane never runs without a handle to it.
+ */
+export class PartialDispatchError extends Error {
+  constructor(
+    readonly runId: string,
+    readonly startedLaneIds: readonly string[],
+    override readonly cause: unknown,
+  ) {
+    super(
+      `dispatch failed after ${startedLaneIds.length} lane(s) in run "${runId}"; started lanes remain controllable`,
+    );
+    this.name = "PartialDispatchError";
+  }
 }
 
 export class WorkflowRuntime {
@@ -81,9 +125,16 @@ export class WorkflowRuntime {
   async startWorkflow(config: StartWorkflowConfig): Promise<RunHandle> {
     const runId = this.deps.idgen();
     assertHandleId("runId", runId);
-    for (const lane of config.lanes) assertHandleId("laneId", lane.laneId);
     if (config.lanes.length === 0) {
       throw new Error("startWorkflow requires at least one lane");
+    }
+    const seen = new Set<string>();
+    for (const lane of config.lanes) {
+      assertHandleId("laneId", lane.laneId);
+      if (seen.has(lane.laneId)) {
+        throw new Error(`duplicate laneId "${lane.laneId}"`);
+      }
+      seen.add(lane.laneId);
     }
 
     const startedAt = this.deps.clock();
@@ -104,10 +155,12 @@ export class WorkflowRuntime {
         cwd: config.cwd,
       });
       previous = pane;
-      const record: LaneRecord = {
+      lanes.set(spec.laneId, {
         laneId: spec.laneId,
         pane,
-        logFile: `${config.cwd}/lane-${spec.laneId}.log`,
+        // The runId scopes the log path so a later or concurrent run with the
+        // same cwd + laneId cannot truncate this run's durable result.
+        logFile: `${config.cwd}/lane-${runId}-${spec.laneId}.log`,
         sentinelToken: laneSentinelToken(runId, spec.laneId),
         steps: spec.steps,
         stepDelaySeconds: spec.stepDelaySeconds ?? 0.2,
@@ -118,15 +171,31 @@ export class WorkflowRuntime {
         exitCode: null,
         waitMatched: false,
         humanCoordinationMs: null,
-      };
-      lanes.set(spec.laneId, record);
+      });
       laneOrder.push(spec.laneId);
     }
+
+    // Register the run before dispatch so a partial-dispatch failure still
+    // leaves every already-started lane inspectable and interruptible — a lane
+    // must never run without a handle to it.
+    const run: RunRecord = {
+      runId,
+      config,
+      tab,
+      controllerPane,
+      startedAt,
+      dispatchedAt: null,
+      checkpointAnnouncedAt: null,
+      lanes,
+      laneOrder,
+    };
+    this.runs.set(runId, run);
 
     // Let each freshly split pane's shell reach its prompt before dispatch,
     // otherwise `pane run` lands before the shell is ready (the split→run race).
     await this.settle(config.startupSettleMs ?? 0);
 
+    const started: string[] = [];
     for (const laneId of laneOrder) {
       const lane = lanes.get(laneId)!;
       const command = buildLaneCommand({
@@ -137,23 +206,18 @@ export class WorkflowRuntime {
         stepDelaySeconds: lane.stepDelaySeconds,
       });
       lane.dispatchedAt = this.deps.clock();
-      await this.deps.adapter.runInPane(lane.pane, command);
+      try {
+        await this.deps.adapter.runInPane(lane.pane, command);
+      } catch (cause) {
+        lane.state = "failed";
+        // The run stays registered with the lanes that did start, so the caller
+        // can inspect and interrupt them via the runId carried on the error.
+        throw new PartialDispatchError(runId, started, cause);
+      }
       lane.state = "running";
+      started.push(laneId);
     }
-    const dispatchedAt = this.deps.clock();
-
-    const run: RunRecord = {
-      runId,
-      config,
-      tab,
-      controllerPane,
-      startedAt,
-      dispatchedAt,
-      checkpointAnnouncedAt: null,
-      lanes,
-      laneOrder,
-    };
-    this.runs.set(runId, run);
+    run.dispatchedAt = this.deps.clock();
     return { runId, laneIds: [...laneOrder] };
   }
 
@@ -248,34 +312,36 @@ export class WorkflowRuntime {
       timeoutMs,
     );
     lane.waitMatched = outcome.matched;
-    if (outcome.matched) await this.finalizeLane(run, lane);
+    if (outcome.matched) {
+      // A matched sentinel is a liveness signal, not proof the process exited:
+      // the lane prints the sentinel immediately before exiting. Confirm via
+      // process-info that the foreground group is back at the shell before
+      // finalizing, so completion is never declared over a live process.
+      const gone = await this.confirmProcessGone(lane.pane);
+      if (!gone) {
+        throw new Error(
+          `lane "${laneId}" printed its sentinel but its process is still running`,
+        );
+      }
+      await this.finalizeLane(run, lane);
+    }
     return this.inspectLaneResult(runId, laneId);
   }
 
   /**
-   * Wait for the controller marker to finish, evidence that the launcher left.
-   * Returns process facts proving the lanes are not the launcher's children.
+   * Poll process-info until the pane's foreground group returns to the shell.
+   * Bounded by attempt count so it always terminates, even under a fake clock.
    */
-  async runControllerMarker(
-    runId: string,
-    timeoutMs: number,
-  ): Promise<{ controllerBackAtShell: boolean; markerMatched: boolean }> {
-    const run = this.getRun(runId);
-    await this.deps.adapter.runInPane(
-      run.controllerPane,
-      buildControllerMarkerCommand(runId),
-    );
-    const outcome = await this.deps.adapter.waitForOutput(
-      run.controllerPane,
-      controllerSentinelRegex(runId),
-      timeoutMs,
-    );
-    const info = await this.deps.adapter.processInfo(run.controllerPane);
-    return {
-      markerMatched: outcome.matched,
-      controllerBackAtShell:
-        info.foregroundProcessGroupId === info.shellPid,
-    };
+  private async confirmProcessGone(pane: PaneRef): Promise<boolean> {
+    const timeoutMs = this.deps.processGoneTimeoutMs ?? 2_000;
+    const intervalMs = this.deps.processGoneIntervalMs ?? 100;
+    const attempts = Math.max(1, Math.ceil(timeoutMs / Math.max(1, intervalMs)));
+    for (let i = 0; i < attempts; i++) {
+      const info = await this.deps.adapter.processInfo(pane);
+      if (info.foregroundProcessGroupId === info.shellPid) return true;
+      if (i < attempts - 1) await this.settle(intervalMs);
+    }
+    return false;
   }
 
   /** Confirm a lane's process is live and record its startup latency. */
@@ -297,6 +363,94 @@ export class WorkflowRuntime {
       if (this.deps.clock() >= deadline) return false;
       await this.settle(pollIntervalMs);
     }
+  }
+
+  /**
+   * Serialize a dispatched run so a fresh controller process can attach after
+   * this one exits — the basis of the controller-loss proof. Opaque to callers.
+   */
+  exportRun(runId: string): string {
+    const run = this.getRun(runId);
+    const topology: RunTopology = {
+      v: 1,
+      runId: run.runId,
+      workflow: run.config.workflow,
+      workspace: run.config.workspace,
+      cwd: run.config.cwd,
+      splitDirection: run.config.splitDirection ?? "down",
+      tabId: run.tab.id,
+      controllerPaneId: run.controllerPane.id,
+      startedAt: run.startedAt,
+      dispatchedAt: run.dispatchedAt,
+      lanes: run.laneOrder.map((laneId) => {
+        const lane = run.lanes.get(laneId)!;
+        return {
+          laneId: lane.laneId,
+          paneId: lane.pane.id,
+          logFile: lane.logFile,
+          steps: lane.steps,
+          stepDelaySeconds: lane.stepDelaySeconds,
+          dispatchedAt: lane.dispatchedAt,
+          liveAt: lane.liveAt,
+        };
+      }),
+    };
+    return JSON.stringify(topology);
+  }
+
+  /**
+   * Attach to a run dispatched by another (now-exited) controller, from its
+   * exported topology. The lanes keep running because they are children of the
+   * Herdr server, not of the controller that dispatched them.
+   */
+  attachRun(serialized: string): RunHandle {
+    const topology = JSON.parse(serialized) as RunTopology;
+    if (topology.v !== 1) {
+      throw new Error(`unsupported run topology version ${topology.v}`);
+    }
+    const lanes = new Map<string, LaneRecord>();
+    const laneOrder: string[] = [];
+    for (const lane of topology.lanes) {
+      lanes.set(lane.laneId, {
+        laneId: lane.laneId,
+        pane: { id: lane.paneId },
+        logFile: lane.logFile,
+        sentinelToken: laneSentinelToken(topology.runId, lane.laneId),
+        steps: lane.steps,
+        stepDelaySeconds: lane.stepDelaySeconds,
+        dispatchedAt: lane.dispatchedAt,
+        liveAt: lane.liveAt,
+        completedAt: null,
+        state: "running",
+        exitCode: null,
+        waitMatched: false,
+        humanCoordinationMs: null,
+      });
+      laneOrder.push(lane.laneId);
+    }
+    const run: RunRecord = {
+      runId: topology.runId,
+      config: {
+        workflow: topology.workflow,
+        workspace: topology.workspace,
+        cwd: topology.cwd,
+        splitDirection: topology.splitDirection,
+        lanes: topology.lanes.map((l) => ({
+          laneId: l.laneId,
+          steps: l.steps,
+          stepDelaySeconds: l.stepDelaySeconds,
+        })),
+      },
+      tab: { id: topology.tabId },
+      controllerPane: { id: topology.controllerPaneId },
+      startedAt: topology.startedAt,
+      dispatchedAt: topology.dispatchedAt,
+      checkpointAnnouncedAt: null,
+      lanes,
+      laneOrder,
+    };
+    this.runs.set(run.runId, run);
+    return { runId: run.runId, laneIds: [...laneOrder] };
   }
 
   // ── Internals ─────────────────────────────────────────────────────────────

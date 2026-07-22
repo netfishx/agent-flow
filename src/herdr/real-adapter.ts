@@ -16,6 +16,7 @@ import {
 } from "./argv.ts";
 import {
   parseCreatedTab,
+  parseHerdrError,
   parseProcessInfo,
   parseSplitPane,
 } from "./json.ts";
@@ -34,6 +35,26 @@ interface CommandResult {
   readonly stdout: string;
   readonly stderr: string;
   readonly exitCode: number;
+}
+
+/**
+ * Classify a `herdr pane wait-output` result. Exit 0 is a match. A non-zero
+ * exit is a clean timeout only when Herdr reports the `timeout` error code;
+ * anything else (bad pane, CLI/environment failure) is raised, so a real
+ * failure is never silently folded into `matched: false`.
+ */
+export function classifyWaitOutput(
+  exitCode: number,
+  stderr: string,
+): WaitOutcome {
+  if (exitCode === 0) return { matched: true, timedOut: false };
+  const error = parseHerdrError(stderr);
+  if (error?.code === "timeout") return { matched: false, timedOut: true };
+  throw new Error(
+    `herdr pane wait-output failed (exit ${exitCode}): ${
+      error ? `${error.code}: ${error.message}` : stderr.trim() || "no output"
+    }`,
+  );
 }
 
 export interface RealHerdrAdapterOptions {
@@ -97,10 +118,10 @@ export class RealHerdrAdapter implements HerdrAdapter {
     regex: string,
     timeoutMs: number,
   ): Promise<WaitOutcome> {
-    // Exit 0 = the pattern appeared; any non-zero (timeout or error) = no match.
-    // This is deliberately decoupled from the lane's own exit code.
-    const { exitCode } = await this.run(waitOutputArgv(pane, regex, timeoutMs));
-    return { matched: exitCode === 0 };
+    const { exitCode, stderr } = await this.run(
+      waitOutputArgv(pane, regex, timeoutMs),
+    );
+    return classifyWaitOutput(exitCode, stderr);
   }
 
   async processInfo(pane: PaneRef): Promise<ProcessInfo> {

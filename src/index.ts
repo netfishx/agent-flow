@@ -12,7 +12,7 @@
 // Pane identifiers, tab identifiers, Herdr JSON, sentinels, wait-output, and
 // shell quoting live behind the HerdrAdapter seam and never appear here.
 
-export { WorkflowRuntime } from "./runtime/runtime.ts";
+export { PartialDispatchError, WorkflowRuntime } from "./runtime/runtime.ts";
 export type {
   InterruptOutcome,
   LanePhaseTiming,
@@ -34,14 +34,6 @@ export type { HerdrAdapter } from "./herdr/adapter.ts";
 export { RealHerdrAdapter } from "./herdr/real-adapter.ts";
 export type { RealHerdrAdapterOptions } from "./herdr/real-adapter.ts";
 
-// Test infrastructure, exported so consumers can drive deterministic tests too.
-export {
-  createClock,
-  FakeHerdrAdapter,
-  scanSingleQuoted,
-} from "./herdr/fake-adapter.ts";
-export type {
-  FakeHerdrAdapterOptions,
-  FakeLaneProgram,
-  MutableClock,
-} from "./herdr/fake-adapter.ts";
+// Test infrastructure (fake adapter, clock, quoting inverse) is intentionally
+// NOT re-exported here — it lives in `./testing.ts` so the production entry
+// stays limited to the runtime surface.

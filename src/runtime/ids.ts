@@ -23,14 +23,6 @@ export function laneSentinelRegex(runId: string, laneId: string): string {
   return `${escapeRegex(laneSentinelToken(runId, laneId))}=[0-9]+`;
 }
 
-export function controllerSentinelToken(runId: string): string {
-  return `FLOW_${runId}_CONTROLLER_EXIT`;
-}
-
-export function controllerSentinelRegex(runId: string): string {
-  return `${escapeRegex(controllerSentinelToken(runId))}=[0-9]+`;
-}
-
 /** Parse the last `<token>=<digits>` occurrence from durable output. */
 export function parseExitFromSentinel(
   runId: string,
