@@ -24,7 +24,8 @@
 
 import { mkdir } from "node:fs/promises";
 import { RealHerdrAdapter } from "../herdr/real-adapter.ts";
-import { InMemoryLedger } from "../runtime/ledger.ts";
+import { FsLedger, resolveLedgerRoot } from "../runtime/fs-ledger.ts";
+import type { Ledger } from "../runtime/ledger.ts";
 import type { LaneResult, LaneSpec, RuntimeDeps } from "../runtime/types.ts";
 import { SmokeRuntime } from "./smoke-runtime.ts";
 
@@ -42,10 +43,10 @@ const line = (message: string): void => {
   process.stdout.write(`${message}\n`);
 };
 
-function makeDeps(): RuntimeDeps {
+function makeDeps(ledger: Ledger): RuntimeDeps {
   return {
     adapter: new RealHerdrAdapter(),
-    ledger: new InMemoryLedger(),
+    ledger,
     clock: () => Date.now(),
     idgen: () =>
       `flow-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,
@@ -69,6 +70,7 @@ function config() {
     interruptFile: env("FLOW_INTERRUPT_FILE", `${evidenceDir}/interrupt-request`),
     checkpointTimeout: num("FLOW_CHECKPOINT_TIMEOUT_MS", 300_000),
     laneTimeout: num("FLOW_LANE_TIMEOUT_MS", 300_000),
+    ledgerRoot: resolveLedgerRoot(),
   };
 }
 
@@ -77,7 +79,7 @@ function config() {
 async function dispatchPhase(): Promise<void> {
   const c = config();
   await mkdir(c.evidenceDir, { recursive: true });
-  const runtime = new SmokeRuntime(makeDeps());
+  const runtime = new SmokeRuntime(makeDeps(new FsLedger(c.ledgerRoot)));
   const lanes: LaneSpec[] = Array.from({ length: c.laneCount }, (_, i) => ({
     laneId: `lane-${i + 1}`,
     role: "simulated",
@@ -94,12 +96,16 @@ async function dispatchPhase(): Promise<void> {
     splitDirection: "down",
     startupSettleMs: 1000,
   });
-  line(`[dispatch] runId=${handle.runId} lanes=${handle.laneIds.join(", ")}`);
-  for (const laneId of handle.laneIds) {
-    await runtime.confirmLaneStarted(handle.runId, laneId);
+  try {
+    line(`[dispatch] runId=${handle.runId} lanes=${handle.laneIds.join(", ")}`);
+    for (const laneId of handle.laneIds) {
+      await runtime.confirmLaneStarted(handle.runId, laneId);
+    }
+    await Bun.write(c.handoffFile, await runtime.exportRun(handle.runId));
+    line(`[dispatch] handoff written; dispatcher exiting -> controller is now gone`);
+  } finally {
+    await runtime.releaseForHandoff(handle.runId);
   }
-  await Bun.write(c.handoffFile, runtime.exportRun(handle.runId));
-  line(`[dispatch] handoff written; dispatcher exiting -> controller is now gone`);
 }
 
 // ── Collect: a fresh controller after the dispatcher has exited ──────────────
@@ -158,8 +164,8 @@ async function collectPhase(): Promise<void> {
 
   // 2. Fresh controller (new pid, new runtime) attaches to the orphaned run.
   const handoff = await Bun.file(c.handoffFile).text();
-  const runtime = new SmokeRuntime(makeDeps());
-  const handle = runtime.attachRun(handoff);
+  const runtime = new SmokeRuntime(makeDeps(new FsLedger(c.ledgerRoot)));
+  const handle = await runtime.attachRun(handoff);
   line(`attached runId=${handle.runId} lanes=${handle.laneIds.join(", ")}`);
 
   // 3. Controller-loss proof: the dispatcher is dead, yet the lanes are alive.

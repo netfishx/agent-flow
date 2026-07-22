@@ -16,3 +16,4 @@ export type {
 } from "./herdr/fake-adapter.ts";
 export { classifyWaitOutput } from "./herdr/real-adapter.ts";
 export { InMemoryLedger } from "./runtime/ledger.ts";
+export { FsLedger } from "./runtime/fs-ledger.ts";

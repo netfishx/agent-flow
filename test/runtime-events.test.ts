@@ -40,17 +40,38 @@ class RejectingLedger implements Ledger {
 }
 
 class RecordingLedger implements Ledger {
-  readonly events: RunEvent[] = [];
+  private readonly committedEvents: RunEvent[] = [];
   private readonly delegate = new InMemoryLedger();
 
   constructor(private readonly rejectedType?: RunEvent["type"]) {}
+
+  // Keep the #13 assertions focused on their original envelope vocabulary;
+  // #14 fact-event behavior is covered through the public durable ledger seam.
+  get events(): RunEvent[] {
+    const legacy = this.committedEvents.filter(
+      (event) =>
+        event.type !== "lane_checkpoint" &&
+        event.type !== "lane_contract_evaluated" &&
+        event.type !== "lane_verification_recorded",
+    );
+    const sequences = new Map<string, number>();
+    return legacy.map((event) => {
+      const sequence = (sequences.get(event.runId) ?? 0) + 1;
+      sequences.set(event.runId, sequence);
+      return {
+        ...event,
+        eventId: `${event.runId}#${sequence}`,
+        sequence,
+      } as RunEvent;
+    });
+  }
 
   async commit(event: RunEvent): Promise<void> {
     if (event.type === this.rejectedType) {
       throw new Error(`fake: ${event.type} append rejected`);
     }
     await this.delegate.commit(event);
-    this.events.push(structuredClone(event));
+    this.committedEvents.push(structuredClone(event));
   }
 
   load(runId: string): Promise<RunView | null> {
@@ -157,7 +178,7 @@ describe("WorkflowRuntime event commits", () => {
 
     const freshLedger = new InMemoryLedger();
     const fresh = makeRuntime(freshLedger);
-    expect(fresh.attachRun(source.exportRun(handle.runId))).toEqual(handle);
+    expect(await fresh.attachRun(await source.exportRun(handle.runId))).toEqual(handle);
 
     expect(await freshLedger.load(handle.runId)).toEqual(
       await sourceLedger.load(handle.runId),
@@ -199,9 +220,9 @@ describe("WorkflowRuntime event commits", () => {
       sleep: async () => {},
     });
 
-    expect(() => fresh.attachRun(source.exportRun(handle.runId))).toThrow(
-      /synchronous smoke append rejected/,
-    );
+    await expect(
+      fresh.attachRun(await source.exportRun(handle.runId)),
+    ).rejects.toThrow(/synchronous smoke append rejected/);
     await expect(fresh.inspectWorkflow(handle.runId)).rejects.toThrow(
       /unknown runId/,
     );
@@ -230,11 +251,11 @@ describe("WorkflowRuntime event commits", () => {
     });
 
     runtime.markCheckpoint(handle.runId);
-    expect(() => runtime.exportRun(handle.runId)).toThrow(
+    await expect(runtime.exportRun(handle.runId)).rejects.toThrow(
       /pending transition.*await an async public operation/i,
     );
     await runtime.inspectWorkflow(handle.runId);
-    const history = JSON.parse(runtime.exportRun(handle.runId)) as {
+    const history = JSON.parse(await runtime.exportRun(handle.runId)) as {
       events: RunEvent[];
     };
     expect(history.events.some((event) => event.type === "checkpoint_announced")).toBe(

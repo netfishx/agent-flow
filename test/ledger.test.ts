@@ -20,6 +20,7 @@ const events: RunEvent[] = [
       splitDirection: "down",
       tabId: "w1:t1",
       controllerPaneId: "w1:p1",
+      fixedPoint: null,
     },
   },
   {

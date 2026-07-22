@@ -17,6 +17,10 @@ export interface Ledger {
 
 const histories = new WeakMap<InMemoryLedger, Map<string, RunEvent[]>>();
 const liveViews = new WeakMap<InMemoryLedger, Map<string, RunView>>();
+const committedEventReaders = new WeakMap<
+  Ledger,
+  (runId: string) => Promise<readonly RunEvent[]>
+>();
 const synchronousCommit = Symbol("InMemoryLedger.synchronousCommit");
 
 function historyFor(ledger: InMemoryLedger): Map<string, RunEvent[]> {
@@ -36,13 +40,16 @@ function cloneEvent(event: RunEvent): RunEvent {
 }
 
 /**
- * Explicitly ephemeral, single-process ledger for tests and the #4 smoke.
+ * Explicitly ephemeral, single-process ledger for tests.
  * It provides no durability and intentionally has only trivial lease behavior.
  */
 export class InMemoryLedger implements Ledger {
   constructor() {
     histories.set(this, new Map());
     liveViews.set(this, new Map());
+    internalRegisterCommittedEventReader(this, async (runId) =>
+      (historyFor(this).get(runId) ?? []).map(cloneEvent),
+    );
   }
 
   commit(event: RunEvent): Promise<void> {
@@ -80,24 +87,21 @@ export class InMemoryLedger implements Ledger {
 
 // Smoke-only implementation details. They are deliberately absent from the
 // package entry point and from Ledger: raw history/replay are not public ports.
-export function internalCommittedEvents(
+export async function internalCommittedEvents(
   ledger: Ledger,
   runId: string,
-): readonly RunEvent[] {
-  if (!(ledger instanceof InMemoryLedger)) {
-    throw new Error("smoke event export requires an InMemoryLedger");
-  }
-  return (historyFor(ledger).get(runId) ?? []).map(cloneEvent);
+): Promise<readonly RunEvent[]> {
+  const read = committedEventReaders.get(ledger);
+  if (read) return read(runId);
+  throw new Error("smoke event export requires a supported Ledger");
 }
 
-export function internalCommitSynchronously(
+/** Module-internal registration for smoke history; absent from src/index.ts. */
+export function internalRegisterCommittedEventReader(
   ledger: Ledger,
-  event: RunEvent,
+  read: (runId: string) => Promise<readonly RunEvent[]>,
 ): void {
-  if (!(ledger instanceof InMemoryLedger)) {
-    throw new Error("synchronous smoke attach requires an InMemoryLedger");
-  }
-  ledger[synchronousCommit](event);
+  committedEventReaders.set(ledger, read);
 }
 
 function commitSynchronously(ledger: InMemoryLedger, event: RunEvent): void {
