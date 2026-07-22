@@ -1,123 +1,56 @@
-// Smoke-internal controller-loss handoff. This is NOT part of the public
-// runtime interface (it is not re-exported from index.ts): it exists only so the
-// controller-loss smoke can hand a dispatched run from an exiting dispatcher to
-// a fresh controller. It is a one-shot static topology, deliberately NOT the #5
-// durable ledger, event stream, or work-resume model.
+// Smoke-internal controller-loss handoff. The blob is opaque to callers, but
+// its contents are now committed RunEvents and attach rebuilds through reduce.
 
-import { laneSentinelToken } from "../runtime/ids.ts";
+import type { RunEvent } from "../runtime/events.ts";
 import {
-  type LaneRecord,
-  type RunRecord,
-  WorkflowRuntime,
-} from "../runtime/runtime.ts";
+  InMemoryLedger,
+  internalCommitSynchronously,
+  internalCommittedEvents,
+} from "../runtime/ledger.ts";
+import { reduce, type RunView } from "../runtime/reducer.ts";
+import { WorkflowRuntime } from "../runtime/runtime.ts";
 import type { RunHandle } from "../runtime/types.ts";
 
-interface RunTopology {
+interface RunHistory {
   readonly v: 1;
-  readonly runId: string;
-  readonly workflow: string;
-  readonly workspace: string;
-  readonly cwd: string;
-  readonly splitDirection: "right" | "down";
-  readonly tabId: string;
-  readonly controllerPaneId: string;
-  readonly startedAt: number;
-  readonly dispatchedAt: number | null;
-  readonly lanes: readonly {
-    readonly laneId: string;
-    readonly paneId: string;
-    readonly logFile: string;
-    readonly steps: number;
-    readonly stepDelaySeconds: number;
-    readonly dispatchedAt: number | null;
-    readonly liveAt: number | null;
-  }[];
+  readonly events: readonly RunEvent[];
 }
 
 export class SmokeRuntime extends WorkflowRuntime {
-  /** Serialize a dispatched run so a fresh controller can adopt it after this
-   *  process exits. Opaque blob; callers never read the pane ids inside it. */
+  /** Serialize the committed event history for this run as an opaque blob. */
   exportRun(runId: string): string {
-    const run = this.runRecord(runId);
-    const topology: RunTopology = {
+    this.runView(runId);
+    if (this.hasPendingTransition(runId)) {
+      throw new Error(
+        `run "${runId}" has a pending transition; await an async public operation before exportRun`,
+      );
+    }
+    const history: RunHistory = {
       v: 1,
-      runId: run.runId,
-      workflow: run.config.workflow,
-      workspace: run.config.workspace,
-      cwd: run.config.cwd,
-      splitDirection: run.config.splitDirection ?? "down",
-      tabId: run.tab.id,
-      controllerPaneId: run.controllerPane.id,
-      startedAt: run.startedAt,
-      dispatchedAt: run.dispatchedAt,
-      lanes: run.laneOrder.map((laneId) => {
-        const lane = run.lanes.get(laneId)!;
-        return {
-          laneId: lane.laneId,
-          paneId: lane.pane.id,
-          logFile: lane.logFile,
-          steps: lane.steps,
-          stepDelaySeconds: lane.stepDelaySeconds,
-          dispatchedAt: lane.dispatchedAt,
-          liveAt: lane.liveAt,
-        };
-      }),
+      events: internalCommittedEvents(this.deps.ledger, runId),
     };
-    return JSON.stringify(topology);
+    return JSON.stringify(history);
   }
 
-  /** Attach to a run dispatched by another (now-exited) controller. The lanes
-   *  keep running because they are children of the Herdr server, not of the
-   *  controller that dispatched them. */
+  /** Commit and reduce the exported history into this ephemeral controller. */
   attachRun(serialized: string): RunHandle {
-    const topology = JSON.parse(serialized) as RunTopology;
-    if (topology.v !== 1) {
-      throw new Error(`unsupported run topology version ${topology.v}`);
+    const history = JSON.parse(serialized) as Partial<RunHistory>;
+    if (history.v !== 1) {
+      throw new Error(`unsupported run topology version ${history.v}`);
     }
-    const lanes = new Map<string, LaneRecord>();
-    const laneOrder: string[] = [];
-    for (const lane of topology.lanes) {
-      lanes.set(lane.laneId, {
-        laneId: lane.laneId,
-        pane: { id: lane.paneId },
-        logFile: lane.logFile,
-        sentinelToken: laneSentinelToken(topology.runId, lane.laneId),
-        steps: lane.steps,
-        stepDelaySeconds: lane.stepDelaySeconds,
-        // Attached lanes were already dispatched by the exited controller.
-        dispatchAccepted: true,
-        dispatchedAt: lane.dispatchedAt,
-        liveAt: lane.liveAt,
-        completedAt: null,
-        state: "running",
-        exitCode: null,
-        waitMatched: false,
-        humanCoordinationMs: null,
-      });
-      laneOrder.push(lane.laneId);
+    if (!Array.isArray(history.events) || history.events.length === 0) {
+      throw new Error("unsupported run topology: missing committed event history");
     }
-    const run: RunRecord = {
-      runId: topology.runId,
-      config: {
-        workflow: topology.workflow,
-        workspace: topology.workspace,
-        cwd: topology.cwd,
-        splitDirection: topology.splitDirection,
-        lanes: topology.lanes.map((l) => ({
-          laneId: l.laneId,
-          steps: l.steps,
-          stepDelaySeconds: l.stepDelaySeconds,
-        })),
-      },
-      tab: { id: topology.tabId },
-      controllerPane: { id: topology.controllerPaneId },
-      startedAt: topology.startedAt,
-      dispatchedAt: topology.dispatchedAt,
-      checkpointAnnouncedAt: null,
-      lanes,
-      laneOrder,
-    };
-    this.registerRun(run);
-    return { runId: run.runId, laneIds: [...laneOrder] };
+    if (!(this.deps.ledger instanceof InMemoryLedger)) {
+      throw new Error("synchronous smoke attach requires an InMemoryLedger");
+    }
+
+    let state: RunView | undefined;
+    for (const event of history.events) {
+      internalCommitSynchronously(this.deps.ledger, event);
+      state = reduce(state, event);
+    }
+    this.registerReducedView(state!);
+    return { runId: state!.runId, laneIds: [...state!.laneOrder] };
   }
 }
