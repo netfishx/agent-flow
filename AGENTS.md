@@ -24,9 +24,9 @@ Read [the runtime design](docs/design/observable-multi-agent-runtime.md) before 
 ## Sources of truth
 
 - Product intent and architecture: `docs/design/observable-multi-agent-runtime.md`
-- Work status and blocking edges: GitHub Issues in `netfishx/agent-flow`
+- Work status and blocking edges: GitHub Issues under tracking issue `#1`
 - Per-run execution state: the runtime ledger defined by the design
-- Repository tracker and domain conventions: `docs/agents/` once bootstrap is complete
+- Repository tracker and domain conventions: `docs/agents/`
 
 Do not maintain dynamic project progress in this file or duplicate it in long-lived prompts. Query GitHub Issues and the run ledger.
 
@@ -53,12 +53,12 @@ Role assignments may evolve through explicit owner decisions, but observable exe
 
 ### Issue tracker
 
-Issues are tracked in GitHub Issues. External pull requests are not a triage request surface. See `docs/agents/issue-tracker.md` after tracker bootstrap is complete.
+Issues are tracked in GitHub Issues. External pull requests are not a triage request surface. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
-Use the canonical `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix` labels. See `docs/agents/triage-labels.md` after tracker bootstrap is complete.
+Use the canonical `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix` labels. See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 
-This is a single-context repository. Read the root `CONTEXT.md` and applicable ADRs under `docs/adr/` when present. See `docs/agents/domain.md` after tracker bootstrap is complete.
+This is a single-context repository. Read the root `CONTEXT.md` and applicable ADRs under `docs/adr/` when present. See `docs/agents/domain.md`.

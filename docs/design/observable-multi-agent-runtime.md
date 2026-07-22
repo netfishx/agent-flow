@@ -1,8 +1,8 @@
 # Observable Multi-Agent Workflow Runtime
 
 > Status: design and tracer-bullet plan; not implemented.
-> Progress source: [GitHub Issues](https://github.com/netfishx/agent-flow/issues) after tracker bootstrap.
-> Temporary bootstrap state: repository goal and design entry point are being initialized; no runtime phase has started.
+> Progress source: [tracking issue #1](https://github.com/netfishx/agent-flow/issues/1) and its native blocking dependencies.
+> Do not maintain dynamic issue progress in this document.
 
 ## 1. Context
 

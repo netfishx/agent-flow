@@ -8,7 +8,7 @@ It does **not** aim to place every Agent silently inside one harness or add anot
 
 ## Current status
 
-Design and tracker bootstrap. No runtime has been implemented yet.
+Tracker initialized; no runtime has been implemented yet.
 
 The first tracer bullet will launch a read-only, multi-model cross-review in visible Herdr panes, persist run state and result artifacts, and compare it with the existing workflow before any Pi integration or implementation-workflow migration.
 
@@ -16,7 +16,7 @@ The first tracer bullet will launch a read-only, multi-model cross-review in vis
 
 - [Agent instructions](AGENTS.md)
 - [Observable multi-agent runtime design](docs/design/observable-multi-agent-runtime.md)
-- [GitHub Issues](https://github.com/netfishx/agent-flow/issues) for current work and blocking edges
+- [Tracking issue #1](https://github.com/netfishx/agent-flow/issues/1) for current work and blocking edges
 
 ## Core principle
 
