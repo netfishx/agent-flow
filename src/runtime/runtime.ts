@@ -30,7 +30,9 @@ import type {
   WorkflowStatus,
 } from "./types.ts";
 
-interface LaneRecord {
+// Internal records. Exported for the smoke's controller-loss handoff seam only;
+// NOT re-exported from index.ts, so they are not part of the public API.
+export interface LaneRecord {
   readonly laneId: string;
   readonly pane: PaneRef;
   readonly logFile: string;
@@ -46,7 +48,7 @@ interface LaneRecord {
   humanCoordinationMs: number | null;
 }
 
-interface RunRecord {
+export interface RunRecord {
   readonly runId: string;
   readonly config: StartWorkflowConfig;
   readonly tab: TabRef;
@@ -63,33 +65,6 @@ const TERMINAL: ReadonlySet<LaneState> = new Set([
   "interrupted",
   "failed",
 ]);
-
-// Opaque handoff of a dispatched run's topology. It carries only the static
-// facts a fresh controller needs to attach, inspect, and collect an in-flight
-// run — no lifecycle event log, no mutable snapshot, no work resume. Those
-// (the durable ledger and recovery) are #5. Callers treat the serialized form
-// as an opaque blob; pane ids live inside it, never in a public typed field.
-interface RunTopology {
-  readonly v: 1;
-  readonly runId: string;
-  readonly workflow: string;
-  readonly workspace: string;
-  readonly cwd: string;
-  readonly splitDirection: "right" | "down";
-  readonly tabId: string;
-  readonly controllerPaneId: string;
-  readonly startedAt: number;
-  readonly dispatchedAt: number | null;
-  readonly lanes: readonly {
-    readonly laneId: string;
-    readonly paneId: string;
-    readonly logFile: string;
-    readonly steps: number;
-    readonly stepDelaySeconds: number;
-    readonly dispatchedAt: number | null;
-    readonly liveAt: number | null;
-  }[];
-}
 
 function classifyExit(exitCode: number): LaneState {
   if (exitCode === 0) return "complete";
@@ -116,7 +91,7 @@ export class PartialDispatchError extends Error {
 }
 
 export class WorkflowRuntime {
-  private readonly runs = new Map<string, RunRecord>();
+  protected readonly runs = new Map<string, RunRecord>();
 
   constructor(private readonly deps: RuntimeDeps) {}
 
@@ -210,6 +185,13 @@ export class WorkflowRuntime {
         await this.deps.adapter.runInPane(lane.pane, command);
       } catch (cause) {
         lane.state = "failed";
+        // Lanes after the failure were never dispatched; give them a terminal
+        // state so the whole run is inspectable — an idle, never-run pane is not
+        // a completed process and must not be read as one.
+        for (const id of laneOrder) {
+          const other = lanes.get(id)!;
+          if (other.state === "starting") other.state = "failed";
+        }
         // The run stays registered with the lanes that did start, so the caller
         // can inspect and interrupt them via the runId carried on the error.
         throw new PartialDispatchError(runId, started, cause);
@@ -269,7 +251,9 @@ export class WorkflowRuntime {
   async inspectLaneResult(runId: string, laneId: string): Promise<LaneResult> {
     const run = this.getRun(runId);
     const lane = this.getLane(run, laneId);
-    const output = await this.readDurable(lane.logFile);
+    // A never-dispatched lane (e.g. after a partial dispatch) has no durable
+    // log; inspection must still return a result, not throw.
+    const output = await this.readDurable(lane.logFile).catch(() => "");
     const parsedExit = parseExitFromSentinel(runId, laneId, output);
     const tail = output
       .trim()
@@ -365,98 +349,23 @@ export class WorkflowRuntime {
     }
   }
 
-  /**
-   * Serialize a dispatched run so a fresh controller process can attach after
-   * this one exits — the basis of the controller-loss proof. Opaque to callers.
-   */
-  exportRun(runId: string): string {
-    const run = this.getRun(runId);
-    const topology: RunTopology = {
-      v: 1,
-      runId: run.runId,
-      workflow: run.config.workflow,
-      workspace: run.config.workspace,
-      cwd: run.config.cwd,
-      splitDirection: run.config.splitDirection ?? "down",
-      tabId: run.tab.id,
-      controllerPaneId: run.controllerPane.id,
-      startedAt: run.startedAt,
-      dispatchedAt: run.dispatchedAt,
-      lanes: run.laneOrder.map((laneId) => {
-        const lane = run.lanes.get(laneId)!;
-        return {
-          laneId: lane.laneId,
-          paneId: lane.pane.id,
-          logFile: lane.logFile,
-          steps: lane.steps,
-          stepDelaySeconds: lane.stepDelaySeconds,
-          dispatchedAt: lane.dispatchedAt,
-          liveAt: lane.liveAt,
-        };
-      }),
-    };
-    return JSON.stringify(topology);
-  }
-
-  /**
-   * Attach to a run dispatched by another (now-exited) controller, from its
-   * exported topology. The lanes keep running because they are children of the
-   * Herdr server, not of the controller that dispatched them.
-   */
-  attachRun(serialized: string): RunHandle {
-    const topology = JSON.parse(serialized) as RunTopology;
-    if (topology.v !== 1) {
-      throw new Error(`unsupported run topology version ${topology.v}`);
-    }
-    const lanes = new Map<string, LaneRecord>();
-    const laneOrder: string[] = [];
-    for (const lane of topology.lanes) {
-      lanes.set(lane.laneId, {
-        laneId: lane.laneId,
-        pane: { id: lane.paneId },
-        logFile: lane.logFile,
-        sentinelToken: laneSentinelToken(topology.runId, lane.laneId),
-        steps: lane.steps,
-        stepDelaySeconds: lane.stepDelaySeconds,
-        dispatchedAt: lane.dispatchedAt,
-        liveAt: lane.liveAt,
-        completedAt: null,
-        state: "running",
-        exitCode: null,
-        waitMatched: false,
-        humanCoordinationMs: null,
-      });
-      laneOrder.push(lane.laneId);
-    }
-    const run: RunRecord = {
-      runId: topology.runId,
-      config: {
-        workflow: topology.workflow,
-        workspace: topology.workspace,
-        cwd: topology.cwd,
-        splitDirection: topology.splitDirection,
-        lanes: topology.lanes.map((l) => ({
-          laneId: l.laneId,
-          steps: l.steps,
-          stepDelaySeconds: l.stepDelaySeconds,
-        })),
-      },
-      tab: { id: topology.tabId },
-      controllerPane: { id: topology.controllerPaneId },
-      startedAt: topology.startedAt,
-      dispatchedAt: topology.dispatchedAt,
-      checkpointAnnouncedAt: null,
-      lanes,
-      laneOrder,
-    };
-    this.runs.set(run.runId, run);
-    return { runId: run.runId, laneIds: [...laneOrder] };
-  }
-
   // ── Internals ─────────────────────────────────────────────────────────────
+
+  /** Register a run record. Used by the smoke's controller-loss handoff. */
+  protected registerRun(run: RunRecord): void {
+    this.runs.set(run.runId, run);
+  }
+
+  /** Read a run record for internal handoff. */
+  protected runRecord(runId: string): RunRecord {
+    return this.getRun(runId);
+  }
 
   private async refreshLane(run: RunRecord, lane: LaneRecord): Promise<void> {
     if (TERMINAL.has(lane.state)) return;
+    // A lane that was never dispatched has no process on its pane; its idle
+    // shell must not be mistaken for a completed process.
+    if (lane.dispatchedAt === null) return;
     const info = await this.deps.adapter.processInfo(lane.pane);
     if (info.foregroundProcessGroupId === info.shellPid) {
       await this.finalizeLane(run, lane);

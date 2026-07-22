@@ -24,8 +24,8 @@
 
 import { mkdir } from "node:fs/promises";
 import { RealHerdrAdapter } from "../herdr/real-adapter.ts";
-import { WorkflowRuntime } from "../runtime/runtime.ts";
 import type { LaneResult, LaneSpec, RuntimeDeps } from "../runtime/types.ts";
+import { SmokeRuntime } from "./smoke-runtime.ts";
 
 const env = (key: string, fallback: string): string =>
   process.env[key] && process.env[key]!.length > 0
@@ -75,7 +75,7 @@ function config() {
 async function dispatchPhase(): Promise<void> {
   const c = config();
   await mkdir(c.evidenceDir, { recursive: true });
-  const runtime = new WorkflowRuntime(makeDeps());
+  const runtime = new SmokeRuntime(makeDeps());
   const lanes: LaneSpec[] = Array.from({ length: c.laneCount }, (_, i) => ({
     laneId: `lane-${i + 1}`,
     role: "simulated",
@@ -156,7 +156,7 @@ async function collectPhase(): Promise<void> {
 
   // 2. Fresh controller (new pid, new runtime) attaches to the orphaned run.
   const handoff = await Bun.file(c.handoffFile).text();
-  const runtime = new WorkflowRuntime(makeDeps());
+  const runtime = new SmokeRuntime(makeDeps());
   const handle = runtime.attachRun(handoff);
   line(`attached runId=${handle.runId} lanes=${handle.laneIds.join(", ")}`);
 
