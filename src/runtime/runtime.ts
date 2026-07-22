@@ -181,35 +181,44 @@ export class WorkflowRuntime {
       try {
         await this.deps.adapter.runInPane(item.pane, command);
       } catch (cause) {
-        await this.commitEvent(runId, {
-          type: "lane_failed_to_start",
-          actor: "runtime",
-          laneId: item.spec.laneId,
-          data: { rejection: rejectionMessage(cause) },
-        });
-        for (const aborted of topology.slice(index + 1)) {
+        try {
           await this.commitEvent(runId, {
             type: "lane_failed_to_start",
             actor: "runtime",
-            laneId: aborted.spec.laneId,
-            data: {
-              rejection: "dispatch aborted after earlier lane failed",
-            },
+            laneId: item.spec.laneId,
+            data: { rejection: rejectionMessage(cause) },
           });
+          for (const aborted of topology.slice(index + 1)) {
+            await this.commitEvent(runId, {
+              type: "lane_failed_to_start",
+              actor: "runtime",
+              laneId: aborted.spec.laneId,
+              data: {
+                rejection: "dispatch aborted after earlier lane failed",
+              },
+            });
+          }
+          await this.finishIfTerminal(runId);
+        } catch (commitCause) {
+          throw new PartialDispatchError(runId, [...started], commitCause);
         }
-        await this.finishIfTerminal(runId);
         throw new PartialDispatchError(runId, started, cause);
       }
-      await this.commitEvent(
-        runId,
-        {
-          type: "lane_dispatched",
-          actor: "runtime",
-          laneId: item.spec.laneId,
-          data: {},
-        },
-        dispatchedAt,
-      );
+      const physicallyStarted = [...started, item.spec.laneId];
+      try {
+        await this.commitEvent(
+          runId,
+          {
+            type: "lane_dispatched",
+            actor: "runtime",
+            laneId: item.spec.laneId,
+            data: {},
+          },
+          dispatchedAt,
+        );
+      } catch (cause) {
+        throw new PartialDispatchError(runId, physicallyStarted, cause);
+      }
       started.push(item.spec.laneId);
     }
 
@@ -355,15 +364,17 @@ export class WorkflowRuntime {
     for (;;) {
       const info = await this.deps.adapter.processInfo({ id: lane.paneId });
       if (info.foregroundProcessGroupId !== info.shellPid) {
-        const current = this.getLane(this.getRun(runId), laneId);
-        if (current.runtimeState !== "running") {
-          await this.commitEvent(runId, {
+        await this.commitEventConditionally(runId, (current) => {
+          if (!current) throw new Error(`unknown runId "${runId}"`);
+          const currentLane = this.getLane(current, laneId);
+          if (currentLane.runtimeState !== "pending") return null;
+          return {
             type: "lane_live",
             actor: "runtime",
             laneId,
             data: {},
-          });
-        }
+          };
+        });
         return true;
       }
       if (this.deps.clock() >= deadline) return false;
@@ -388,9 +399,22 @@ export class WorkflowRuntime {
     input: NewRunEvent,
     at = this.deps.clock(),
   ): Promise<RunView> {
+    return this.commitEventConditionally(runId, () => input, at).then((next) => {
+      if (!next) throw new Error("unconditional event commit was skipped");
+      return next;
+    });
+  }
+
+  private commitEventConditionally(
+    runId: string,
+    selectEvent: (current: RunView | undefined) => NewRunEvent | null,
+    at = this.deps.clock(),
+  ): Promise<RunView | null> {
     const prior = this.commitTails.get(runId) ?? Promise.resolve();
     const transition = prior.then(async () => {
       const current = this.runs.get(runId);
+      const input = selectEvent(current);
+      if (input === null) return null;
       const sequence = (current?.lastAppliedSequence ?? 0) + 1;
       const event = {
         schemaVersion: 1,
@@ -444,12 +468,17 @@ export class WorkflowRuntime {
     const info = await this.deps.adapter.processInfo({ id: lane.paneId });
     if (info.foregroundProcessGroupId === info.shellPid) {
       await this.finalizeLane(runId, laneId, false);
-    } else if (lane.runtimeState !== "running") {
-      await this.commitEvent(runId, {
-        type: "lane_live",
-        actor: "runtime",
-        laneId,
-        data: {},
+    } else {
+      await this.commitEventConditionally(runId, (current) => {
+        if (!current) throw new Error(`unknown runId "${runId}"`);
+        const currentLane = this.getLane(current, laneId);
+        if (currentLane.runtimeState !== "pending") return null;
+        return {
+          type: "lane_live",
+          actor: "runtime",
+          laneId,
+          data: {},
+        };
       });
     }
   }
@@ -464,53 +493,87 @@ export class WorkflowRuntime {
     const output = await this.readDurable(lane.logFile);
     const exitCode = parseExitFromSentinel(runId, laneId, output);
     if (exitCode === null) {
-      await this.commitEvent(runId, {
-        type: "lane_crashed",
-        actor: "runtime",
-        laneId,
-        data: {},
-      });
+      await this.commitEventConditionally(
+        runId,
+        (current): NewRunEvent | null => {
+          if (!current) throw new Error(`unknown runId "${runId}"`);
+          const currentLane = this.getLane(current, laneId);
+          if (TERMINAL_RUNTIME.has(currentLane.runtimeState)) return null;
+          if (currentLane.liveAt === null && output.length === 0) {
+            return {
+              type: "lane_lost",
+              actor: "runtime",
+              laneId,
+              data: { cause: "dispatch-outcome-unknown" },
+            };
+          }
+          return {
+            type: "lane_crashed",
+            actor: "runtime",
+            laneId,
+            data: {},
+          };
+        },
+      );
       await this.finishIfTerminal(runId);
+      const finalizedLane = this.getLane(this.getRun(runId), laneId);
+      if (
+        finalizedLane.runtimeState === "lost" &&
+        finalizedLane.lostCause === "dispatch-outcome-unknown"
+      ) {
+        throw new Error(
+          `lane "${laneId}" was lost (dispatch-outcome-unknown): its process is gone without positive execution evidence or a sentinel`,
+        );
+      }
       throw new Error(
         `lane "${laneId}" produced no sentinel ${lane.sentinelToken} in its durable log`,
       );
     }
-    await this.commitEvent(runId, {
-      type: "lane_exited",
-      actor: "runtime",
-      laneId,
-      data: {
-        exitCode,
-        ...(exitCode === 130 ? { signal: "SIGINT" } : {}),
-        waitMatched,
-      },
+    await this.commitEventConditionally(runId, (current) => {
+      if (!current) throw new Error(`unknown runId "${runId}"`);
+      const currentLane = this.getLane(current, laneId);
+      if (TERMINAL_RUNTIME.has(currentLane.runtimeState)) return null;
+      return {
+        type: "lane_exited",
+        actor: "runtime",
+        laneId,
+        data: {
+          exitCode,
+          ...(exitCode === 130 ? { signal: "SIGINT" } : {}),
+          waitMatched,
+        },
+      };
     });
     await this.finishIfTerminal(runId);
   }
 
   private async finishIfTerminal(runId: string): Promise<void> {
-    const run = this.getRun(runId);
-    if (run.finishStatus !== null || run.laneOrder.length === 0) return;
-    const lanes = run.laneOrder.map((laneId) => this.getLane(run, laneId));
-    if (!lanes.every((lane) => TERMINAL_RUNTIME.has(lane.runtimeState))) return;
-    const breakdown: RunOutcomeBreakdown = {
-      exitedZero: lanes.filter(
-        (lane) => lane.runtimeState === "exited" && lane.exitCode === 0,
-      ).length,
-      exitedNonZero: lanes.filter(
-        (lane) => lane.runtimeState === "exited" && lane.exitCode !== 0,
-      ).length,
-      crashed: lanes.filter((lane) => lane.runtimeState === "crashed").length,
-      lost: lanes.filter((lane) => lane.runtimeState === "lost").length,
-      failedToStart: lanes.filter(
-        (lane) => lane.runtimeState === "failed_to_start",
-      ).length,
-    };
-    const clean = breakdown.exitedZero === lanes.length;
-    await this.commitEvent(runId, {
-      type: "run_finished",
-      actor: "runtime",
-      data: { status: clean ? "clean" : "degraded", breakdown },
+    await this.commitEventConditionally(runId, (run) => {
+      if (!run) throw new Error(`unknown runId "${runId}"`);
+      if (run.finishStatus !== null || run.laneOrder.length === 0) return null;
+      const lanes = run.laneOrder.map((laneId) => this.getLane(run, laneId));
+      if (!lanes.every((lane) => TERMINAL_RUNTIME.has(lane.runtimeState))) {
+        return null;
+      }
+      const breakdown: RunOutcomeBreakdown = {
+        exitedZero: lanes.filter(
+          (lane) => lane.runtimeState === "exited" && lane.exitCode === 0,
+        ).length,
+        exitedNonZero: lanes.filter(
+          (lane) => lane.runtimeState === "exited" && lane.exitCode !== 0,
+        ).length,
+        crashed: lanes.filter((lane) => lane.runtimeState === "crashed").length,
+        lost: lanes.filter((lane) => lane.runtimeState === "lost").length,
+        failedToStart: lanes.filter(
+          (lane) => lane.runtimeState === "failed_to_start",
+        ).length,
+      };
+      const clean = breakdown.exitedZero === lanes.length;
+      return {
+        type: "run_finished",
+        actor: "runtime",
+        data: { status: clean ? "clean" : "degraded", breakdown },
+      };
     });
   }
 

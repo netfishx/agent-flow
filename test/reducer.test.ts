@@ -206,6 +206,140 @@ describe("reduce", () => {
     ).toThrow(/eventId/);
   });
 
+  test("fails closed on duplicate or illegal lifecycle transitions", () => {
+    const started = reduce(
+      undefined,
+      event(1, "run_started", {
+        data: {
+          workflow: "wf",
+          workspace: "w1",
+          cwd: "/tmp/run-1",
+          splitDirection: "down",
+          tabId: "w1:t1",
+          controllerPaneId: "w1:p1",
+        },
+      }),
+    );
+    const registered = reduce(
+      started,
+      event(2, "lane_registered", {
+        laneId: "lane-1",
+        data: {
+          laneId: "lane-1",
+          paneId: "w1:p2",
+          logFile: "/tmp/lane-1.log",
+          sentinelToken: "FLOW_run-1_LANE_lane-1_EXIT",
+          steps: 1,
+          stepDelaySeconds: 0,
+        },
+      }),
+    );
+
+    const intended = reduce(
+      registered,
+      event(3, "lane_dispatch_intent", { laneId: "lane-1", data: {} }),
+    );
+    expect(() =>
+      reduce(
+        intended,
+        event(4, "lane_dispatch_intent", { laneId: "lane-1", data: {} }),
+      ),
+    ).toThrow(/lane_dispatch_intent/);
+
+    const dispatched = reduce(
+      registered,
+      event(3, "lane_dispatched", { laneId: "lane-1", data: {} }),
+    );
+    expect(() =>
+      reduce(
+        dispatched,
+        event(4, "lane_dispatched", { laneId: "lane-1", data: {} }),
+      ),
+    ).toThrow(/lane_dispatched/);
+
+    const live = reduce(
+      registered,
+      event(3, "lane_live", { laneId: "lane-1", data: {} }),
+    );
+    expect(() =>
+      reduce(live, event(4, "lane_live", { laneId: "lane-1", data: {} })),
+    ).toThrow(/lane_live/);
+
+    const terminal = reduce(
+      registered,
+      event(3, "lane_exited", {
+        laneId: "lane-1",
+        data: { exitCode: 0, waitMatched: true },
+      }),
+    );
+    expect(() =>
+      reduce(
+        terminal,
+        event(4, "lane_exited", {
+          laneId: "lane-1",
+          data: { exitCode: 0, waitMatched: true },
+        }),
+      ),
+    ).toThrow(/terminal/);
+    expect(() =>
+      reduce(
+        terminal,
+        event(4, "lane_crashed", { laneId: "lane-1", data: {} }),
+      ),
+    ).toThrow(/terminal/);
+    expect(() =>
+      reduce(
+        terminal,
+        event(4, "lane_lost", {
+          laneId: "lane-1",
+          data: { cause: "pane disappeared" },
+        }),
+      ),
+    ).toThrow(/terminal/);
+    expect(() =>
+      reduce(
+        terminal,
+        event(4, "lane_failed_to_start", {
+          laneId: "lane-1",
+          data: { rejection: "rejected" },
+        }),
+      ),
+    ).toThrow(/terminal/);
+
+    const finished = reduce(
+      started,
+      event(2, "run_finished", {
+        data: {
+          status: "clean",
+          breakdown: {
+            exitedZero: 0,
+            exitedNonZero: 0,
+            crashed: 0,
+            lost: 0,
+            failedToStart: 0,
+          },
+        },
+      }),
+    );
+    expect(() =>
+      reduce(
+        finished,
+        event(3, "run_finished", {
+          data: {
+            status: "clean",
+            breakdown: {
+              exitedZero: 0,
+              exitedNonZero: 0,
+              crashed: 0,
+              lost: 0,
+              failedToStart: 0,
+            },
+          },
+        }),
+      ),
+    ).toThrow(/run_finished/);
+  });
+
   test("retains human coordination from the first interrupt", () => {
     const events: RunEvent[] = [
       event(1, "run_started", {

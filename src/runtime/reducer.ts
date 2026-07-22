@@ -72,6 +72,21 @@ function assertNever(value: never): never {
   throw new Error(`unhandled run event ${JSON.stringify(value)}`);
 }
 
+const TERMINAL_RUNTIME: ReadonlySet<RuntimeState> = new Set([
+  "exited",
+  "crashed",
+  "lost",
+  "failed_to_start",
+]);
+
+function assertNonTerminal(lane: LaneView, eventType: RunEvent["type"]): void {
+  if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
+    throw new Error(
+      `${eventType} cannot follow terminal lane state "${lane.runtimeState}"`,
+    );
+  }
+}
+
 function laneFor(state: RunView, event: RunEvent): LaneView {
   if (event.laneId === undefined) {
     throw new Error(`event "${event.type}" requires laneId`);
@@ -190,23 +205,40 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       });
     }
     case "lane_dispatch_intent":
-      return withLane(state, event, (lane) => ({
-        ...lane,
-        runtimeState: "pending",
-        dispatchIntentAt: event.at,
-      }));
+      return withLane(state, event, (lane) => {
+        if (lane.dispatchIntentAt !== null) {
+          throw new Error("duplicate lane_dispatch_intent");
+        }
+        return {
+          ...lane,
+          runtimeState: "pending",
+          dispatchIntentAt: event.at,
+        };
+      });
     case "lane_dispatched":
-      return withLane(state, event, (lane) => ({
-        ...lane,
-        runtimeState: "pending",
-        dispatchedAt: event.at,
-      }));
+      return withLane(state, event, (lane) => {
+        if (lane.dispatchedAt !== null) {
+          throw new Error("duplicate lane_dispatched");
+        }
+        return {
+          ...lane,
+          runtimeState: "pending",
+          dispatchedAt: event.at,
+        };
+      });
     case "lane_live":
-      return withLane(state, event, (lane) => ({
-        ...lane,
-        runtimeState: "running",
-        liveAt: lane.liveAt ?? event.at,
-      }));
+      return withLane(state, event, (lane) => {
+        if (lane.runtimeState !== "pending") {
+          throw new Error(
+            `lane_live requires pending lane state, received "${lane.runtimeState}"`,
+          );
+        }
+        return {
+          ...lane,
+          runtimeState: "running",
+          liveAt: event.at,
+        };
+      });
     case "lane_checkpoint":
       return withLane(state, event, (lane) => ({
         ...lane,
@@ -215,35 +247,47 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         checkpointAt: event.at,
       }));
     case "lane_exited":
-      return withLane(state, event, (lane) => ({
-        ...lane,
-        runtimeState: "exited",
-        completedAt: event.at,
-        exitCode: event.data.exitCode,
-        signal: event.data.signal ?? null,
-        waitMatched: event.data.waitMatched ?? lane.waitMatched,
-      }));
+      return withLane(state, event, (lane) => {
+        assertNonTerminal(lane, event.type);
+        return {
+          ...lane,
+          runtimeState: "exited",
+          completedAt: event.at,
+          exitCode: event.data.exitCode,
+          signal: event.data.signal ?? null,
+          waitMatched: event.data.waitMatched ?? lane.waitMatched,
+        };
+      });
     case "lane_crashed":
-      return withLane(state, event, (lane) => ({
-        ...lane,
-        runtimeState: "crashed",
-        completedAt: event.at,
-        exitCode: null,
-      }));
+      return withLane(state, event, (lane) => {
+        assertNonTerminal(lane, event.type);
+        return {
+          ...lane,
+          runtimeState: "crashed",
+          completedAt: event.at,
+          exitCode: null,
+        };
+      });
     case "lane_lost":
-      return withLane(state, event, (lane) => ({
-        ...lane,
-        runtimeState: "lost",
-        completedAt: event.at,
-        lostCause: event.data.cause,
-      }));
+      return withLane(state, event, (lane) => {
+        assertNonTerminal(lane, event.type);
+        return {
+          ...lane,
+          runtimeState: "lost",
+          completedAt: event.at,
+          lostCause: event.data.cause,
+        };
+      });
     case "lane_failed_to_start":
-      return withLane(state, event, (lane) => ({
-        ...lane,
-        runtimeState: "failed_to_start",
-        completedAt: event.at,
-        startRejection: event.data.rejection,
-      }));
+      return withLane(state, event, (lane) => {
+        assertNonTerminal(lane, event.type);
+        return {
+          ...lane,
+          runtimeState: "failed_to_start",
+          completedAt: event.at,
+          startRejection: event.data.rejection,
+        };
+      });
     case "lane_contract_evaluated":
       return withLane(state, event, (lane) => ({
         ...lane,
@@ -297,6 +341,9 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         },
       });
     case "run_finished":
+      if (state.finishStatus !== null) {
+        throw new Error("duplicate run_finished");
+      }
       return withRun(state, event, {
         finishedAt: event.at,
         finishStatus: event.data.status,

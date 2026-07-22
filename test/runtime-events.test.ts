@@ -317,6 +317,78 @@ describe("WorkflowRuntime event commits", () => {
     );
   });
 
+  test("deduplicates concurrent live observations for the same lane", async () => {
+    const clock = createClock();
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "lane-1", exitCode: 0 }],
+    });
+    const ledger = new RecordingLedger();
+    const runtime = new SmokeRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run1",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await runtime.startWorkflow({
+      workflow: "wf",
+      workspace: "w1",
+      cwd: "/tmp/ev",
+      lanes: [{ laneId: "lane-1", steps: 1 }],
+    });
+
+    expect(
+      await Promise.all([
+        runtime.confirmLaneStarted(handle.runId, "lane-1"),
+        runtime.confirmLaneStarted(handle.runId, "lane-1"),
+      ]),
+    ).toEqual([true, true]);
+    expect(
+      ledger.events.filter((item) => item.type === "lane_live"),
+    ).toHaveLength(1);
+  });
+
+  test("deduplicates concurrent terminal observations for the same lane and run", async () => {
+    const clock = createClock();
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "lane-1", exitCode: 0 }],
+    });
+    const ledger = new RecordingLedger();
+    const runtime = new SmokeRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run1",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await runtime.startWorkflow({
+      workflow: "wf",
+      workspace: "w1",
+      cwd: "/tmp/ev",
+      lanes: [{ laneId: "lane-1", steps: 1 }],
+    });
+
+    const results = await Promise.all([
+      runtime.awaitLane(handle.runId, "lane-1", 1_000),
+      runtime.awaitLane(handle.runId, "lane-1", 1_000),
+    ]);
+
+    expect(results.map((result) => result.state)).toEqual([
+      "complete",
+      "complete",
+    ]);
+    expect(
+      ledger.events.filter((item) => item.type === "lane_exited"),
+    ).toHaveLength(1);
+    expect(
+      ledger.events.filter((item) => item.type === "run_finished"),
+    ).toHaveLength(1);
+  });
+
   test("projects a dispatched pending lane as publicly running", async () => {
     const clock = createClock();
     const adapter = new FakeHerdrAdapter({
@@ -493,6 +565,46 @@ describe("WorkflowRuntime event commits", () => {
     );
   });
 
+  test("records a gone lane without execution evidence as lost", async () => {
+    const clock = createClock();
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "lane-1", exitCode: 0, emitSentinel: false }],
+    });
+    const ledger = new RecordingLedger();
+    const runtime = new SmokeRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run1",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await runtime.startWorkflow({
+      workflow: "wf",
+      workspace: "w1",
+      cwd: "/tmp/ev",
+      lanes: [{ laneId: "lane-1", steps: 1 }],
+    });
+
+    await expect(runtime.awaitLane(handle.runId, "lane-1", 1000)).rejects.toThrow(
+      /lost.*dispatch-outcome-unknown/i,
+    );
+    expect(
+      ledger.events.filter((event) => event.type === "lane_lost"),
+    ).toHaveLength(1);
+    expect(
+      ledger.events.filter((event) => event.type === "lane_crashed"),
+    ).toHaveLength(0);
+    expect((await ledger.load(handle.runId))!.lanes["lane-1"]).toMatchObject({
+      runtimeState: "lost",
+      lostCause: "dispatch-outcome-unknown",
+    });
+    expect((await runtime.inspectLaneResult(handle.runId, "lane-1")).state).toBe(
+      "failed",
+    );
+  });
+
   test("does not record waitMatched when the matched process is still alive", async () => {
     const clock = createClock();
     const adapter = new FakeHerdrAdapter({
@@ -574,6 +686,94 @@ describe("WorkflowRuntime event commits", () => {
       kind: "unavailable",
       reason: "no human checkpoint touched this lane",
     });
+  });
+
+  test("wraps a dispatched append rejection with the physically started lane handle", async () => {
+    const clock = createClock();
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "lane-1", exitCode: 0 }],
+    });
+    const ledger = new RecordingLedger("lane_dispatched");
+    const runtime = new SmokeRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run1",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+
+    let caught: unknown;
+    try {
+      await runtime.startWorkflow({
+        workflow: "wf",
+        workspace: "w1",
+        cwd: "/tmp/ev",
+        lanes: [{ laneId: "lane-1", steps: 1 }],
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(PartialDispatchError);
+    const partial = caught as PartialDispatchError;
+    expect(partial.runId).toBe("run1");
+    expect(partial.startedLaneIds).toEqual(["lane-1"]);
+    expect(partial.cause).toEqual(
+      new Error("fake: lane_dispatched append rejected"),
+    );
+    expect((await runtime.inspectWorkflow("run1")).lanes[0]!.laneId).toBe(
+      "lane-1",
+    );
+    expect((await runtime.interruptLane("run1", "lane-1")).delivered).toBe(
+      true,
+    );
+  });
+
+  test("wraps a sibling rejection append failure without losing earlier lane handles", async () => {
+    const clock = createClock();
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      failRunInPaneAfter: 1,
+      lanes: [{ laneId: "lane-1", exitCode: 0 }],
+    });
+    const ledger = new RecordingLedger("lane_failed_to_start");
+    const runtime = new SmokeRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run1",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+
+    let caught: unknown;
+    try {
+      await runtime.startWorkflow({
+        workflow: "wf",
+        workspace: "w1",
+        cwd: "/tmp/ev",
+        lanes: [
+          { laneId: "lane-1", steps: 1 },
+          { laneId: "lane-2", steps: 1 },
+        ],
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(PartialDispatchError);
+    const partial = caught as PartialDispatchError;
+    expect(partial.runId).toBe("run1");
+    expect(partial.startedLaneIds).toEqual(["lane-1"]);
+    expect(partial.cause).toEqual(
+      new Error("fake: lane_failed_to_start append rejected"),
+    );
+    expect((await runtime.inspectWorkflow("run1")).lanes).toHaveLength(2);
+    expect((await runtime.interruptLane("run1", "lane-1")).delivered).toBe(
+      true,
+    );
   });
 
   test("records explicit rejection for the failed dispatch and aborted siblings", async () => {
