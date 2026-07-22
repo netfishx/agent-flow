@@ -261,18 +261,23 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       }));
     case "checkpoint_announced":
       return withRun(state, event, { checkpointAnnouncedAt: event.at });
-    case "human_interrupt":
+    case "human_interrupt": {
       if (event.data.laneId !== event.laneId) {
         throw new Error("human_interrupt laneId does not match its envelope");
       }
+      const firstCoordination =
+        state.checkpointAnnouncedAt === null
+          ? null
+          : event.at - state.checkpointAnnouncedAt;
       return withLane(state, event, (lane) => ({
         ...lane,
-        humanInterruptAt: event.at,
+        humanInterruptAt: lane.humanInterruptAt ?? event.at,
         humanCoordinationMs:
-          state.checkpointAnnouncedAt === null
-            ? null
-            : event.at - state.checkpointAnnouncedAt,
+          lane.humanInterruptAt !== null
+            ? lane.humanCoordinationMs
+            : firstCoordination,
       }));
+    }
     case "lane_takeover":
       return withLane(state, event, (lane) => ({
         ...lane,

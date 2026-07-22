@@ -69,6 +69,8 @@ export interface FakeHerdrAdapterOptions {
   readonly failRunInPane?: boolean;
   /** Throw on `runInPane` only after this many successful calls (partial dispatch). */
   readonly failRunInPaneAfter?: number;
+  /** Throw on `splitPane` only after this many successful calls. */
+  readonly failSplitPaneAfter?: number;
 }
 
 interface FakePaneState {
@@ -123,7 +125,9 @@ export class FakeHerdrAdapter implements HerdrAdapter {
   private readonly advances: FakeAdvances;
   private readonly failRunInPane: boolean;
   private readonly failRunInPaneAfter: number | null;
+  private readonly failSplitPaneAfter: number | null;
   private runInPaneCalls = 0;
+  private splitPaneCalls = 0;
   private readonly panes = new Map<string, FakePaneState>();
   private readonly paneByLane = new Map<string, string>();
   private tabSeq = 0;
@@ -140,6 +144,7 @@ export class FakeHerdrAdapter implements HerdrAdapter {
     this.advances = options.advances ?? {};
     this.failRunInPane = options.failRunInPane ?? false;
     this.failRunInPaneAfter = options.failRunInPaneAfter ?? null;
+    this.failSplitPaneAfter = options.failSplitPaneAfter ?? null;
     for (const lane of options.lanes ?? []) this.programs.set(lane.laneId, lane);
   }
 
@@ -166,6 +171,14 @@ export class FakeHerdrAdapter implements HerdrAdapter {
 
   async splitPane(_opts: SplitPaneOptions): Promise<PaneRef> {
     this.tick(this.advances.splitPane);
+    if (
+      this.failSplitPaneAfter !== null &&
+      this.splitPaneCalls >= this.failSplitPaneAfter
+    ) {
+      this.splitPaneCalls++;
+      throw new Error("fake: splitPane failed");
+    }
+    this.splitPaneCalls++;
     const paneId = `wf:p${++this.paneSeq}`;
     this.panes.set(paneId, {
       paneId,

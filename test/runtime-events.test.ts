@@ -12,6 +12,12 @@ class InspectableSmokeRuntime extends SmokeRuntime {
   }
 }
 
+class RejectingInMemoryLedger extends InMemoryLedger {
+  protected override beforeCommit(_event: RunEvent): void {
+    throw new Error("fake: synchronous smoke append rejected");
+  }
+}
+
 class RejectingLedger implements Ledger {
   async commit(_event: RunEvent): Promise<void> {
     throw new Error("fake: event append rejected");
@@ -89,6 +95,38 @@ describe("WorkflowRuntime event commits", () => {
     expect(await ledger.load("run1")).toBeNull();
   });
 
+  test("a mid-topology split failure leaves no committed run", async () => {
+    const clock = createClock();
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      failSplitPaneAfter: 1,
+    });
+    const ledger = new RecordingLedger();
+    const runtime = new SmokeRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run1",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+
+    await expect(
+      runtime.startWorkflow({
+        workflow: "wf",
+        workspace: "w1",
+        cwd: "/tmp/ev",
+        lanes: [
+          { laneId: "lane-1", steps: 1 },
+          { laneId: "lane-2", steps: 1 },
+        ],
+      }),
+    ).rejects.toThrow(/splitPane failed/);
+    await expect(runtime.inspectWorkflow("run1")).rejects.toThrow(/unknown runId/);
+    expect(await ledger.load("run1")).toBeNull();
+    expect(ledger.events).toHaveLength(0);
+  });
+
   test("smoke export and attach rebuild the run by committing event history", async () => {
     const clock = createClock();
     const adapter = new FakeHerdrAdapter({
@@ -129,6 +167,81 @@ describe("WorkflowRuntime event commits", () => {
     );
   });
 
+  test("smoke attach rejects a failed append without registering a live view", async () => {
+    const clock = createClock();
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "lane-1", exitCode: 0 }],
+    });
+    const sourceLedger = new InMemoryLedger();
+    const source = new SmokeRuntime({
+      adapter,
+      ledger: sourceLedger,
+      clock: clock.now,
+      idgen: () => "run1",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await source.startWorkflow({
+      workflow: "wf",
+      workspace: "w1",
+      cwd: "/tmp/ev",
+      lanes: [{ laneId: "lane-1", steps: 1 }],
+    });
+
+    const rejectingLedger = new RejectingInMemoryLedger();
+    const fresh = new SmokeRuntime({
+      adapter,
+      ledger: rejectingLedger,
+      clock: clock.now,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+
+    expect(() => fresh.attachRun(source.exportRun(handle.runId))).toThrow(
+      /synchronous smoke append rejected/,
+    );
+    await expect(fresh.inspectWorkflow(handle.runId)).rejects.toThrow(
+      /unknown runId/,
+    );
+    expect(await rejectingLedger.load(handle.runId)).toBeNull();
+  });
+
+  test("smoke export refuses a pending checkpoint until an async operation flushes it", async () => {
+    const clock = createClock();
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "lane-1", exitCode: 0 }],
+    });
+    const runtime = new SmokeRuntime({
+      adapter,
+      ledger: new InMemoryLedger(),
+      clock: clock.now,
+      idgen: () => "run1",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await runtime.startWorkflow({
+      workflow: "wf",
+      workspace: "w1",
+      cwd: "/tmp/ev",
+      lanes: [{ laneId: "lane-1", steps: 1 }],
+    });
+
+    runtime.markCheckpoint(handle.runId);
+    expect(() => runtime.exportRun(handle.runId)).toThrow(
+      /pending transition.*await an async public operation/i,
+    );
+    await runtime.inspectWorkflow(handle.runId);
+    const history = JSON.parse(runtime.exportRun(handle.runId)) as {
+      events: RunEvent[];
+    };
+    expect(history.events.some((event) => event.type === "checkpoint_announced")).toBe(
+      true,
+    );
+  });
+
   test("a rejected lane transition is absent from both live and replayed views", async () => {
     const clock = createClock();
     const adapter = new FakeHerdrAdapter({
@@ -155,11 +268,108 @@ describe("WorkflowRuntime event commits", () => {
       runtime.confirmLaneStarted(handle.runId, "lane-1"),
     ).rejects.toThrow(/lane_live append rejected/);
     expect((await runtime.inspectLaneResult(handle.runId, "lane-1")).state).toBe(
-      "starting",
+      "running",
     );
     expect((await ledger.load(handle.runId))!.lanes["lane-1"]!.runtimeState).toBe(
       "pending",
     );
+  });
+
+  test("serializes concurrent lane transitions into consecutive events", async () => {
+    const clock = createClock();
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [
+        { laneId: "lane-1", exitCode: 0 },
+        { laneId: "lane-2", exitCode: 0 },
+      ],
+    });
+    const ledger = new RecordingLedger();
+    const runtime = new InspectableSmokeRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run1",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await runtime.startWorkflow({
+      workflow: "wf",
+      workspace: "w1",
+      cwd: "/tmp/ev",
+      lanes: [
+        { laneId: "lane-1", steps: 1 },
+        { laneId: "lane-2", steps: 1 },
+      ],
+    });
+
+    expect(
+      await Promise.all(
+        handle.laneIds.map((laneId) =>
+          runtime.confirmLaneStarted(handle.runId, laneId),
+        ),
+      ),
+    ).toEqual([true, true]);
+    const liveEvents = ledger.events.filter((event) => event.type === "lane_live");
+    expect(liveEvents.map((event) => event.sequence)).toEqual([6, 7]);
+    expect(await ledger.load(handle.runId)).toEqual(
+      runtime.reducedView(handle.runId),
+    );
+  });
+
+  test("projects a dispatched pending lane as publicly running", async () => {
+    const clock = createClock();
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "lane-1", exitCode: 0 }],
+    });
+    const runtime = new SmokeRuntime({
+      adapter,
+      ledger: new InMemoryLedger(),
+      clock: clock.now,
+      idgen: () => "run1",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await runtime.startWorkflow({
+      workflow: "wf",
+      workspace: "w1",
+      cwd: "/tmp/ev",
+      lanes: [{ laneId: "lane-1", steps: 1 }],
+    });
+
+    expect((await runtime.inspectLaneResult(handle.runId, "lane-1")).state).toBe(
+      "running",
+    );
+  });
+
+  test("measures process startup from before dispatch call latency", async () => {
+    const clock = createClock();
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      advances: { runInPane: 10, processInfo: 5 },
+      lanes: [{ laneId: "lane-1", exitCode: 0 }],
+    });
+    const runtime = new SmokeRuntime({
+      adapter,
+      ledger: new InMemoryLedger(),
+      clock: clock.now,
+      idgen: () => "run1",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await runtime.startWorkflow({
+      workflow: "wf",
+      workspace: "w1",
+      cwd: "/tmp/ev",
+      lanes: [{ laneId: "lane-1", steps: 1 }],
+    });
+    await runtime.confirmLaneStarted(handle.runId, "lane-1");
+
+    expect(
+      (await runtime.inspectWorkflow(handle.runId)).metrics.perLane["lane-1"]!
+        .processStartup,
+    ).toEqual({ kind: "measured", ms: 15 });
   });
 
   test("a synchronous checkpoint surfaces append failure at the next async boundary", async () => {
@@ -189,7 +399,7 @@ describe("WorkflowRuntime event commits", () => {
       runtime.inspectLaneResult(handle.runId, "lane-1"),
     ).rejects.toThrow(/checkpoint_announced append rejected/);
     expect((await runtime.inspectLaneResult(handle.runId, "lane-1")).state).toBe(
-      "starting",
+      "running",
     );
     expect((await ledger.load(handle.runId))!.checkpointAnnouncedAt).toBeNull();
   });
@@ -283,6 +493,45 @@ describe("WorkflowRuntime event commits", () => {
     );
   });
 
+  test("does not record waitMatched when the matched process is still alive", async () => {
+    const clock = createClock();
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [
+        {
+          laneId: "lane-1",
+          exitCode: 0,
+          waitMatches: true,
+          staysRunningAfterMatch: true,
+        },
+      ],
+    });
+    const runtime = new SmokeRuntime({
+      adapter,
+      ledger: new InMemoryLedger(),
+      clock: clock.now,
+      idgen: () => "run1",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      processGoneTimeoutMs: 1,
+      processGoneIntervalMs: 1,
+    });
+    const handle = await runtime.startWorkflow({
+      workflow: "wf",
+      workspace: "w1",
+      cwd: "/tmp/ev",
+      lanes: [{ laneId: "lane-1", steps: 1 }],
+    });
+    await runtime.confirmLaneStarted(handle.runId, "lane-1");
+
+    await expect(runtime.awaitLane(handle.runId, "lane-1", 1000)).rejects.toThrow(
+      /still running/,
+    );
+    expect(
+      (await runtime.inspectLaneResult(handle.runId, "lane-1")).waitMatched,
+    ).toBe(false);
+  });
+
   test("finishes cleanly and emits nothing for an undelivered interrupt", async () => {
     const clock = createClock();
     const adapter = new FakeHerdrAdapter({
@@ -307,12 +556,24 @@ describe("WorkflowRuntime event commits", () => {
     await runtime.confirmLaneStarted(handle.runId, "lane-1");
     await runtime.awaitLane(handle.runId, "lane-1", 1000);
     expect((await ledger.load(handle.runId))!.finishStatus).toBe("clean");
+    runtime.markCheckpoint(handle.runId);
+    await runtime.inspectWorkflow(handle.runId);
 
     const eventCount = ledger.events.length;
     expect((await runtime.interruptLane(handle.runId, "lane-1")).delivered).toBe(
       false,
     );
     expect(ledger.events).toHaveLength(eventCount);
+    expect(ledger.events.some((event) => event.type === "human_interrupt")).toBe(
+      false,
+    );
+    expect(
+      (await runtime.inspectWorkflow(handle.runId)).metrics.perLane["lane-1"]!
+        .humanCoordination,
+    ).toEqual({
+      kind: "unavailable",
+      reason: "no human checkpoint touched this lane",
+    });
   });
 
   test("records explicit rejection for the failed dispatch and aborted siblings", async () => {

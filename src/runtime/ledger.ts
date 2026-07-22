@@ -17,6 +17,7 @@ export interface Ledger {
 
 const histories = new WeakMap<InMemoryLedger, Map<string, RunEvent[]>>();
 const liveViews = new WeakMap<InMemoryLedger, Map<string, RunView>>();
+const synchronousCommit = Symbol("InMemoryLedger.synchronousCommit");
 
 function historyFor(ledger: InMemoryLedger): Map<string, RunEvent[]> {
   const history = histories.get(ledger);
@@ -46,7 +47,7 @@ export class InMemoryLedger implements Ledger {
 
   commit(event: RunEvent): Promise<void> {
     try {
-      commitSynchronously(this, event);
+      this[synchronousCommit](event);
       return Promise.resolve();
     } catch (error) {
       return Promise.reject(error);
@@ -67,6 +68,14 @@ export class InMemoryLedger implements Ledger {
   ): Promise<LeaseHandle> {
     return { release: async () => {} };
   }
+
+  /** Test/smoke failure-injection hook; not part of the Ledger capability port. */
+  protected beforeCommit(_event: RunEvent): void {}
+
+  [synchronousCommit](event: RunEvent): void {
+    this.beforeCommit(event);
+    commitSynchronously(this, event);
+  }
 }
 
 // Smoke-only implementation details. They are deliberately absent from the
@@ -79,6 +88,16 @@ export function internalCommittedEvents(
     throw new Error("smoke event export requires an InMemoryLedger");
   }
   return (historyFor(ledger).get(runId) ?? []).map(cloneEvent);
+}
+
+export function internalCommitSynchronously(
+  ledger: Ledger,
+  event: RunEvent,
+): void {
+  if (!(ledger instanceof InMemoryLedger)) {
+    throw new Error("synchronous smoke attach requires an InMemoryLedger");
+  }
+  ledger[synchronousCommit](event);
 }
 
 function commitSynchronously(ledger: InMemoryLedger, event: RunEvent): void {

@@ -41,7 +41,7 @@ const TERMINAL_RUNTIME: ReadonlySet<RuntimeState> = new Set([
 function laneState(lane: LaneView): LaneState {
   switch (lane.runtimeState) {
     case "pending":
-      return "starting";
+      return lane.dispatchedAt === null ? "starting" : "running";
     case "running":
       return "running";
     case "exited":
@@ -79,6 +79,7 @@ export class PartialDispatchError extends Error {
 export class WorkflowRuntime {
   protected readonly runs = new Map<string, RunView>();
   private readonly pendingTransitions = new Map<string, Promise<void>>();
+  private readonly commitTails = new Map<string, Promise<void>>();
 
   constructor(protected readonly deps: RuntimeDeps) {}
 
@@ -105,23 +106,6 @@ export class WorkflowRuntime {
     });
 
     const direction = config.splitDirection ?? "down";
-    await this.commitEvent(
-      runId,
-      {
-        type: "run_started",
-        actor: "runtime",
-        data: {
-          workflow: config.workflow,
-          workspace: config.workspace,
-          cwd: config.cwd,
-          splitDirection: direction,
-          tabId: tab.id,
-          controllerPaneId: controllerPane.id,
-        },
-      },
-      startedAt,
-    );
-
     const topology: Array<{
       spec: StartWorkflowConfig["lanes"][number];
       pane: PaneRef;
@@ -145,6 +129,26 @@ export class WorkflowRuntime {
         stepDelaySeconds: spec.stepDelaySeconds ?? 0.2,
       };
       topology.push(item);
+    }
+
+    await this.commitEvent(
+      runId,
+      {
+        type: "run_started",
+        actor: "runtime",
+        data: {
+          workflow: config.workflow,
+          workspace: config.workspace,
+          cwd: config.cwd,
+          splitDirection: direction,
+          tabId: tab.id,
+          controllerPaneId: controllerPane.id,
+        },
+      },
+      startedAt,
+    );
+    for (const item of topology) {
+      const { spec } = item;
       await this.commitEvent(runId, {
         type: "lane_registered",
         actor: "runtime",
@@ -173,6 +177,7 @@ export class WorkflowRuntime {
         steps: item.spec.steps,
         stepDelaySeconds: item.stepDelaySeconds,
       });
+      const dispatchedAt = this.deps.clock();
       try {
         await this.deps.adapter.runInPane(item.pane, command);
       } catch (cause) {
@@ -195,12 +200,16 @@ export class WorkflowRuntime {
         await this.finishIfTerminal(runId);
         throw new PartialDispatchError(runId, started, cause);
       }
-      await this.commitEvent(runId, {
-        type: "lane_dispatched",
-        actor: "runtime",
-        laneId: item.spec.laneId,
-        data: {},
-      });
+      await this.commitEvent(
+        runId,
+        {
+          type: "lane_dispatched",
+          actor: "runtime",
+          laneId: item.spec.laneId,
+          data: {},
+        },
+        dispatchedAt,
+      );
       started.push(item.spec.laneId);
     }
 
@@ -366,30 +375,46 @@ export class WorkflowRuntime {
     return this.getRun(runId);
   }
 
+  protected hasPendingTransition(runId: string): boolean {
+    return this.pendingTransitions.has(runId) || this.commitTails.has(runId);
+  }
+
   protected registerReducedView(view: RunView): void {
     this.runs.set(view.runId, view);
   }
 
-  private async commitEvent(
+  private commitEvent(
     runId: string,
     input: NewRunEvent,
     at = this.deps.clock(),
   ): Promise<RunView> {
-    const current = this.runs.get(runId);
-    const sequence = (current?.lastAppliedSequence ?? 0) + 1;
-    const event = {
-      schemaVersion: 1,
-      eventId: `${runId}#${sequence}`,
-      runId,
-      sequence,
-      at,
-      controllerEpoch: current?.controllerEpoch ?? 0,
-      ...input,
-    } as RunEvent;
-    await this.deps.ledger.commit(event);
-    const next = reduce(current, event);
-    this.runs.set(runId, next);
-    return next;
+    const prior = this.commitTails.get(runId) ?? Promise.resolve();
+    const transition = prior.then(async () => {
+      const current = this.runs.get(runId);
+      const sequence = (current?.lastAppliedSequence ?? 0) + 1;
+      const event = {
+        schemaVersion: 1,
+        eventId: `${runId}#${sequence}`,
+        runId,
+        sequence,
+        at,
+        controllerEpoch: current?.controllerEpoch ?? 0,
+        ...input,
+      } as RunEvent;
+      await this.deps.ledger.commit(event);
+      const next = reduce(current, event);
+      this.runs.set(runId, next);
+      return next;
+    });
+    const tail = transition.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.commitTails.set(runId, tail);
+    void tail.then(() => {
+      if (this.commitTails.get(runId) === tail) this.commitTails.delete(runId);
+    });
+    return transition;
   }
 
   private async flushPending(runId: string): Promise<void> {

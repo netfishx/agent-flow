@@ -4,6 +4,7 @@
 import type { RunEvent } from "../runtime/events.ts";
 import {
   InMemoryLedger,
+  internalCommitSynchronously,
   internalCommittedEvents,
 } from "../runtime/ledger.ts";
 import { reduce, type RunView } from "../runtime/reducer.ts";
@@ -19,6 +20,11 @@ export class SmokeRuntime extends WorkflowRuntime {
   /** Serialize the committed event history for this run as an opaque blob. */
   exportRun(runId: string): string {
     this.runView(runId);
+    if (this.hasPendingTransition(runId)) {
+      throw new Error(
+        `run "${runId}" has a pending transition; await an async public operation before exportRun`,
+      );
+    }
     const history: RunHistory = {
       v: 1,
       events: internalCommittedEvents(this.deps.ledger, runId),
@@ -41,10 +47,7 @@ export class SmokeRuntime extends WorkflowRuntime {
 
     let state: RunView | undefined;
     for (const event of history.events) {
-      // InMemoryLedger performs its ephemeral append synchronously before
-      // returning the already-resolved Promise, preserving attachRun's #4 API.
-      const committed = this.deps.ledger.commit(event);
-      void committed.catch(() => {});
+      internalCommitSynchronously(this.deps.ledger, event);
       state = reduce(state, event);
     }
     this.registerReducedView(state!);

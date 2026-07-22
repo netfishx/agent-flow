@@ -201,5 +201,49 @@ describe("reduce", () => {
 
     expect(() => reduce(state, registered(1))).toThrow(/sequence/);
     expect(() => reduce(state, registered(3))).toThrow(/sequence/);
+    expect(() =>
+      reduce(state, { ...registered(2), eventId: "wrong-event-id" }),
+    ).toThrow(/eventId/);
+  });
+
+  test("retains human coordination from the first interrupt", () => {
+    const events: RunEvent[] = [
+      event(1, "run_started", {
+        data: {
+          workflow: "wf",
+          workspace: "w1",
+          cwd: "/tmp/run-1",
+          splitDirection: "down",
+          tabId: "w1:t1",
+          controllerPaneId: "w1:p1",
+        },
+      }),
+      event(2, "lane_registered", {
+        laneId: "lane-1",
+        data: {
+          laneId: "lane-1",
+          paneId: "w1:p2",
+          logFile: "/tmp/lane-1.log",
+          sentinelToken: "FLOW_run-1_LANE_lane-1_EXIT",
+          steps: 1,
+          stepDelaySeconds: 0,
+        },
+      }),
+      event(3, "checkpoint_announced", { data: {} }),
+      event(4, "human_interrupt", {
+        actor: "human",
+        laneId: "lane-1",
+        data: { laneId: "lane-1" },
+      }),
+      event(5, "human_interrupt", {
+        actor: "human",
+        laneId: "lane-1",
+        data: { laneId: "lane-1" },
+      }),
+    ];
+    let state: RunView | undefined;
+    for (const item of events) state = reduce(state, item);
+
+    expect(state!.lanes["lane-1"]!.humanCoordinationMs).toBe(10);
   });
 });
