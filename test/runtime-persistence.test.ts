@@ -389,4 +389,60 @@ describe("persisted terminal lane facts", () => {
     });
     expect((await durable.load(handle.runId))!.finishStatus).toBe("clean");
   });
+
+  test("a terminal sibling cannot finish the run while another lane lacks a durable fact", async () => {
+    const { ledgerRoot, cwd } = await directories();
+    const clock = createClock(7_000);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [
+        { laneId: "missing-fact", exitCode: 0 },
+        { laneId: "complete", exitCode: 0 },
+      ],
+    });
+    const durable = new FsLedger(ledgerRoot);
+    const runtime = new InspectableWorkflowRuntime({
+      adapter,
+      ledger: new RejectFactOnceLedger(durable),
+      clock: clock.now,
+      idgen: () => "run-fact-gate",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await runtime.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd,
+      lanes: [
+        { laneId: "missing-fact", steps: 1 },
+        { laneId: "complete", steps: 1 },
+      ],
+    });
+    for (const laneId of handle.laneIds) {
+      await runtime.confirmLaneStarted(handle.runId, laneId);
+    }
+
+    await expect(
+      runtime.awaitLane(handle.runId, "missing-fact", 1_000),
+    ).rejects.toThrow(/contract append failure/);
+    await runtime.awaitLane(handle.runId, "complete", 1_000);
+
+    const eventFile = join(ledgerRoot, "runs", handle.runId, "events.jsonl");
+    const committedTypes = (await readFile(eventFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => (JSON.parse(line) as RunEvent).type);
+    expect(committedTypes).not.toContain("run_finished");
+    expect((await durable.load(handle.runId))!.finishStatus).toBeNull();
+    expect(runtime.currentView(handle.runId).finishStatus).toBeNull();
+
+    await runtime.awaitLane(handle.runId, "missing-fact", 1_000);
+
+    const completedTypes = (await readFile(eventFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => (JSON.parse(line) as RunEvent).type);
+    expect(completedTypes.filter((type) => type === "run_finished")).toHaveLength(1);
+    expect((await durable.load(handle.runId))!.finishStatus).toBe("clean");
+  });
 });

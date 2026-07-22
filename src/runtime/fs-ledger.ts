@@ -256,11 +256,19 @@ export class FsLedger implements Ledger {
     await handle.close();
 
     let released = false;
+    let releaseInFlight: Promise<void> | null = null;
     return {
-      release: async () => {
-        if (released) return;
-        await unlink(lockFile);
-        released = true;
+      release: () => {
+        if (released) return Promise.resolve();
+        if (releaseInFlight) return releaseInFlight;
+        releaseInFlight = unlink(lockFile)
+          .then(() => {
+            released = true;
+          })
+          .finally(() => {
+            releaseInFlight = null;
+          });
+        return releaseInFlight;
       },
     };
   }
