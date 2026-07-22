@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FsLedger } from "../src/runtime/fs-ledger.ts";
@@ -217,5 +217,27 @@ describe("flow CLI external behavior", () => {
 
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr.length).toBeGreaterThan(0);
+  });
+
+  test("a nonexistent ledger root fails loudly for status and inspect", async () => {
+    const parent = await tempRoot();
+    const missing = join(parent, "missing-ledger");
+
+    for (const args of [["status"], ["inspect", "run-missing"]]) {
+      const result = await flow(missing, ...args);
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("ledger root");
+    }
+  });
+
+  test("an existing ledger root with an empty runs directory lists normally", async () => {
+    const root = await tempRoot();
+    await mkdir(join(root, "runs"));
+
+    const result = await flow(root, "status");
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).not.toContain("flow:");
   });
 });

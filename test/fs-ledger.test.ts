@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  rm,
+  unlink,
+  writeFile,
+  type FileHandle,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FsLedger } from "../src/runtime/fs-ledger.ts";
@@ -66,6 +74,33 @@ async function seedEventFile(root: string, lines: readonly string[]): Promise<vo
   const runDir = join(root, "runs", "run-fs");
   await mkdir(runDir, { recursive: true });
   await writeFile(join(runDir, "events.jsonl"), lines.join(""), "utf8");
+}
+
+class DoubleAppendFailureLedger extends FsLedger {
+  protected override async appendAndSync(
+    handle: FileHandle,
+    contents: string,
+  ): Promise<void> {
+    await handle.writeFile(contents, "utf8");
+    throw new Error("injected append fsync failure");
+  }
+
+  protected override async rollbackAppend(
+    _handle: FileHandle,
+    _originalSize: number,
+  ): Promise<void> {
+    throw new Error("injected truncate rollback failure");
+  }
+}
+
+class SnapshotWriteFailureLedger extends FsLedger {
+  protected override async writeSnapshotFile(
+    path: string,
+    _contents: string,
+  ): Promise<void> {
+    await writeFile(path, "partial snapshot", "utf8");
+    throw new Error("injected snapshot write failure");
+  }
 }
 
 describe("FsLedger public capabilities", () => {
@@ -169,5 +204,34 @@ describe("FsLedger public capabilities", () => {
       pid: 202,
     });
     await expect(second.release()).resolves.toBeUndefined();
+  });
+
+  test("poisons the run when append failure rollback also fails", async () => {
+    const root = await tempRoot();
+    const ledger = new DoubleAppendFailureLedger(root);
+
+    await expect(ledger.commit(started())).rejects.toThrow(
+      /append fsync failure.*truncate rollback failure/,
+    );
+    expect((await new FsLedger(root).load("run-fs"))!.lastAppliedSequence).toBe(1);
+
+    await expect(ledger.commit(registered())).rejects.toThrow(
+      /run "run-fs" is poisoned/,
+    );
+  });
+
+  test("removes a partially written snapshot temp when its write fails", async () => {
+    const root = await tempRoot();
+    const ledger = new SnapshotWriteFailureLedger(root);
+
+    await expect(ledger.commit(started())).rejects.toThrow(
+      /snapshot write failure/,
+    );
+
+    const runDir = join(root, "runs", "run-fs");
+    expect((await readdir(runDir)).filter((name) => name.includes(".tmp-"))).toEqual(
+      [],
+    );
+    expect(await ledger.load("run-fs")).toBeNull();
   });
 });

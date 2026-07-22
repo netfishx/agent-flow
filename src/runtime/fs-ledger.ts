@@ -6,6 +6,7 @@ import {
   rename,
   unlink,
   writeFile,
+  type FileHandle,
 } from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
 import { homedir } from "node:os";
@@ -42,6 +43,10 @@ export function resolveLedgerRoot(environment = process.env): string {
 function corruption(path: string, line: number, cause: unknown): Error {
   const detail = cause instanceof Error ? cause.message : String(cause);
   return new Error(`corrupt event stream "${path}" at line ${line}: ${detail}`);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function replayFile(path: string): Promise<ReplayResult> {
@@ -119,6 +124,7 @@ async function replayFile(path: string): Promise<ReplayResult> {
 
 export class FsLedger implements Ledger {
   private readonly commitTails = new Map<string, Promise<void>>();
+  private readonly poisonedRuns = new Map<string, Error>();
 
   constructor(private readonly root: string) {
     if (root.length === 0) throw new Error("FsLedger root must not be empty");
@@ -131,8 +137,16 @@ export class FsLedger implements Ledger {
 
   commit(event: RunEvent): Promise<void> {
     assertHandleId("runId", event.runId);
+    const poisoned = this.poisonedRuns.get(event.runId);
+    if (poisoned) {
+      return Promise.reject(this.poisonedRunError(event.runId, poisoned));
+    }
     const prior = this.commitTails.get(event.runId) ?? Promise.resolve();
     const commit = prior.then(async () => {
+      const queuedPoison = this.poisonedRuns.get(event.runId);
+      if (queuedPoison) {
+        throw this.poisonedRunError(event.runId, queuedPoison);
+      }
       const runDir = this.runDir(event.runId);
       const eventFile = join(runDir, "events.jsonl");
       const replayed = await replayFile(eventFile);
@@ -164,19 +178,25 @@ export class FsLedger implements Ledger {
         const originalSize = replayed.validByteLength;
         try {
           const separator = replayed.needsLeadingNewline ? "\n" : "";
-          await handle.writeFile(
+          await this.appendAndSync(
+            handle,
             `${separator}${JSON.stringify(event)}\n`,
-            "utf8",
           );
-          await handle.sync();
-        } catch (error) {
+        } catch (appendError) {
           try {
-            await handle.truncate(originalSize);
-            await handle.sync();
-          } catch {
-            // The rejected append remains fail-closed on authoritative replay.
+            await this.rollbackAppend(handle, originalSize);
+          } catch (rollbackError) {
+            const compound = new Error(
+              `event append failed: ${errorMessage(appendError)}; rollback failed: ${errorMessage(rollbackError)}`,
+              { cause: appendError },
+            );
+            // This poison is intentionally instance-local. Another process may
+            // still replay the orphan line; #15 recovery owns that
+            // cross-process window.
+            this.poisonedRuns.set(event.runId, compound);
+            throw compound;
           }
-          throw error;
+          throw appendError;
         }
       } catch (error) {
         await unlink(snapshotTemp).catch(() => {});
@@ -277,6 +297,29 @@ export class FsLedger implements Ledger {
     return join(this.root, "runs", runId);
   }
 
+  protected async appendAndSync(
+    handle: FileHandle,
+    contents: string,
+  ): Promise<void> {
+    await handle.writeFile(contents, "utf8");
+    await handle.sync();
+  }
+
+  protected async rollbackAppend(
+    handle: FileHandle,
+    originalSize: number,
+  ): Promise<void> {
+    await handle.truncate(originalSize);
+    await handle.sync();
+  }
+
+  protected async writeSnapshotFile(
+    path: string,
+    contents: string,
+  ): Promise<void> {
+    await writeFile(path, contents, "utf8");
+  }
+
   private async truncateTrailingPartial(
     eventFile: string,
     replayed: ReplayResult,
@@ -299,7 +342,22 @@ export class FsLedger implements Ledger {
       runDir,
       `.run.json.tmp-${process.pid}-${++snapshotSequence}`,
     );
-    await writeFile(temp, `${JSON.stringify(view, null, 2)}\n`, "utf8");
+    try {
+      await this.writeSnapshotFile(
+        temp,
+        `${JSON.stringify(view, null, 2)}\n`,
+      );
+    } catch (error) {
+      await unlink(temp).catch(() => {});
+      throw error;
+    }
     return temp;
+  }
+
+  private poisonedRunError(runId: string, cause: Error): Error {
+    return new Error(
+      `run "${runId}" is poisoned after an unrecoverable append rollback failure`,
+      { cause },
+    );
   }
 }

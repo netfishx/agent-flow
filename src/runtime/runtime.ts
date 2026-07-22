@@ -48,11 +48,15 @@ interface LaneArtifactPaths {
   readonly evidenceFile: string;
 }
 
-function laneArtifactPaths(cwd: string, laneId: string): LaneArtifactPaths {
+function laneArtifactPaths(
+  cwd: string,
+  runId: string,
+  laneId: string,
+): LaneArtifactPaths {
   return {
-    checkpointFile: `${cwd}/checkpoints/${laneId}.md`,
-    resultFile: `${cwd}/results/${laneId}-result.txt`,
-    evidenceFile: `${cwd}/evidence/${laneId}-evidence.json`,
+    checkpointFile: `${cwd}/checkpoints/${runId}-${laneId}.md`,
+    resultFile: `${cwd}/results/${runId}-${laneId}-result.txt`,
+    evidenceFile: `${cwd}/evidence/${runId}-${laneId}-evidence.json`,
   };
 }
 
@@ -75,6 +79,30 @@ function laneState(lane: LaneView): LaneState {
 
 function rejectionMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+function runnerTermination(lane: LaneView): Pick<
+  RunnerEvidence,
+  "termination" | "failure"
+> {
+  switch (lane.runtimeState) {
+    case "exited":
+      return { termination: "sentinel-exit", failure: null };
+    case "crashed":
+      return { termination: "crashed", failure: null };
+    case "lost":
+      return { termination: "lost", failure: lane.lostCause };
+    case "failed_to_start":
+      return {
+        termination: "failed_to_start",
+        failure: lane.startRejection,
+      };
+    case "pending":
+    case "running":
+      throw new Error(
+        `runner evidence requires a terminal lane, got "${lane.runtimeState}"`,
+      );
+  }
 }
 
 /**
@@ -147,7 +175,7 @@ export class WorkflowRuntime {
         logFile: `${config.cwd}/lane-${runId}-${spec.laneId}.log`,
         sentinelToken: laneSentinelToken(runId, spec.laneId),
         stepDelaySeconds: spec.stepDelaySeconds ?? 0.2,
-        artifacts: laneArtifactPaths(config.cwd, spec.laneId),
+        artifacts: laneArtifactPaths(config.cwd, runId, spec.laneId),
       };
       topology.push(item);
     }
@@ -361,10 +389,8 @@ export class WorkflowRuntime {
     await this.flushPending(runId);
     let lane = this.getLane(this.getRun(runId), laneId);
     if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
-      if (lane.runtimeState !== "failed_to_start") {
-        await this.recordTerminalFacts(runId, laneId, lane.exitCode);
-        await this.finishIfTerminal(runId);
-      }
+      await this.recordTerminalFacts(runId, laneId, lane.exitCode);
+      await this.finishIfTerminal(runId);
       return this.inspectLaneResult(runId, laneId);
     }
 
@@ -514,7 +540,6 @@ export class WorkflowRuntime {
     const lane = this.getLane(this.getRun(runId), laneId);
     if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
       if (
-        lane.runtimeState !== "failed_to_start" &&
         (lane.contractEvaluatedAt === null || lane.verificationRecordedAt === null)
       ) {
         await this.recordTerminalFacts(runId, laneId, lane.exitCode);
@@ -618,6 +643,7 @@ export class WorkflowRuntime {
     if (!TERMINAL_RUNTIME.has(lane.runtimeState)) return;
     const { checkpointFile, resultFile, evidenceFile } = laneArtifactPaths(
       run.cwd,
+      runId,
       laneId,
     );
 
@@ -643,6 +669,9 @@ export class WorkflowRuntime {
     }
 
     const contractErrors: string[] = [];
+    if (lane.runtimeState === "failed_to_start") {
+      contractErrors.push("lane never started");
+    }
     if (parsedExitCode === null) contractErrors.push("completion sentinel missing");
     let result = "";
     try {
@@ -681,12 +710,7 @@ export class WorkflowRuntime {
       steps: terminalLane.steps,
       stepDelaySeconds: terminalLane.stepDelaySeconds,
     });
-    const termination =
-      terminalLane.runtimeState === "lost"
-        ? "lost"
-        : terminalLane.runtimeState === "crashed"
-          ? "crashed"
-          : "sentinel-exit";
+    const termination = runnerTermination(terminalLane);
     const evidence: RunnerEvidence = {
       schemaVersion: 1,
       runId,
@@ -697,7 +721,8 @@ export class WorkflowRuntime {
       liveAt: terminalLane.liveAt,
       completedAt: terminalLane.completedAt,
       exitCode: parsedExitCode,
-      termination,
+      signal: terminalLane.signal,
+      ...termination,
     };
     await mkdir(dirname(evidenceFile), { recursive: true });
     await writeFile(evidenceFile, `${JSON.stringify(evidence, null, 2)}\n`, "utf8");
@@ -736,7 +761,6 @@ export class WorkflowRuntime {
       if (
         lanes.some(
           (lane) =>
-            lane.runtimeState !== "failed_to_start" &&
             (lane.contractEvaluatedAt === null ||
               lane.verificationRecordedAt === null),
         )

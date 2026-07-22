@@ -1,5 +1,6 @@
 import { FsLedger, resolveLedgerRoot } from "../runtime/fs-ledger.ts";
 import type { RunView } from "../runtime/reducer.ts";
+import { stat } from "node:fs/promises";
 
 const USAGE = "usage: flow status | flow inspect <runId>";
 
@@ -26,6 +27,21 @@ function value(input: string | number | null): string {
   return input === null ? "null" : String(input);
 }
 
+async function requireLedgerRoot(root: string): Promise<void> {
+  let info;
+  try {
+    info = await stat(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error(`ledger root "${root}" does not exist`);
+    }
+    throw error;
+  }
+  if (!info.isDirectory()) {
+    throw new Error(`ledger root "${root}" is not a directory`);
+  }
+}
+
 export async function runFlowCli(
   args: readonly string[],
   stdout: TextSink = process.stdout,
@@ -42,7 +58,9 @@ export async function runFlowCli(
   }
 
   try {
-    const ledger = new FsLedger(resolveLedgerRoot());
+    const root = resolveLedgerRoot();
+    await requireLedgerRoot(root);
+    const ledger = new FsLedger(root);
     if (command === "status") {
       for (const { runId: listedRunId } of await ledger.list()) {
         const run = await ledger.load(listedRunId);

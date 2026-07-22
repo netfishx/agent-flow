@@ -7,7 +7,7 @@ import { FsLedger } from "../src/runtime/fs-ledger.ts";
 import type { FixedPoint, RunEvent } from "../src/runtime/events.ts";
 import type { LeaseHandle, Ledger } from "../src/runtime/ledger.ts";
 import type { RunView } from "../src/runtime/reducer.ts";
-import { WorkflowRuntime } from "../src/runtime/runtime.ts";
+import { PartialDispatchError, WorkflowRuntime } from "../src/runtime/runtime.ts";
 import { SmokeRuntime } from "../src/smoke/smoke-runtime.ts";
 
 const roots: string[] = [];
@@ -117,9 +117,15 @@ describe("persisted terminal lane facts", () => {
       exitCode: 0,
     });
     const lane = loaded!.lanes["lane-1"]!;
-    expect(lane.checkpointFile).toBe(join(cwd, "checkpoints", "lane-1.md"));
-    expect(lane.resultFile).toBe(join(cwd, "results", "lane-1-result.txt"));
-    expect(lane.evidenceFile).toBe(join(cwd, "evidence", "lane-1-evidence.json"));
+    expect(lane.checkpointFile).toBe(
+      join(cwd, "checkpoints", "run-persist-lane-1.md"),
+    );
+    expect(lane.resultFile).toBe(
+      join(cwd, "results", "run-persist-lane-1-result.txt"),
+    );
+    expect(lane.evidenceFile).toBe(
+      join(cwd, "evidence", "run-persist-lane-1-evidence.json"),
+    );
     expect(lane.logFile).not.toBe(lane.checkpointFile);
     expect(lane.checkpointFile).not.toBe(lane.resultFile);
     expect(lane.resultFile).not.toBe(lane.evidenceFile);
@@ -139,6 +145,8 @@ describe("persisted terminal lane facts", () => {
       completedAt: 1_000,
       exitCode: 0,
       termination: "sentinel-exit",
+      signal: null,
+      failure: null,
     });
     const reacquired = await new FsLedger(ledgerRoot).acquireLease(handle.runId, {
       controllerId: "next-controller",
@@ -173,13 +181,19 @@ describe("persisted terminal lane facts", () => {
     await runtime.interruptLane(handle.runId, "lane-1");
     await runtime.awaitLane(handle.runId, "lane-1", 1_000);
 
-    expect((await ledger.load(handle.runId))!.lanes["lane-1"]).toMatchObject({
+    const loaded = await ledger.load(handle.runId);
+    expect(loaded!.lanes["lane-1"]).toMatchObject({
       runtimeState: "exited",
       semanticState: "partial",
       contractState: "satisfied",
       verificationState: "verified",
       exitCode: 130,
     });
+    expect(
+      JSON.parse(
+        await readFile(loaded!.lanes["lane-1"]!.evidenceFile!, "utf8"),
+      ),
+    ).toMatchObject({ signal: "SIGINT", failure: null });
   });
 
   test("crashed and lost lanes skip checkpoints but still record failed facts", async () => {
@@ -251,10 +265,20 @@ describe("persisted terminal lane facts", () => {
       JSON.parse(
         await readFile(loaded!.lanes.crashed!.evidenceFile!, "utf8"),
       ),
-    ).toMatchObject({ termination: "crashed", exitCode: null });
+    ).toMatchObject({
+      termination: "crashed",
+      exitCode: null,
+      signal: null,
+      failure: null,
+    });
     expect(
       JSON.parse(await readFile(loaded!.lanes.lost!.evidenceFile!, "utf8")),
-    ).toMatchObject({ termination: "lost", exitCode: null });
+    ).toMatchObject({
+      termination: "lost",
+      exitCode: null,
+      signal: null,
+      failure: "dispatch-outcome-unknown",
+    });
   });
 
   test("concurrent awaitLane calls emit each terminal fact exactly once", async () => {
@@ -444,5 +468,142 @@ describe("persisted terminal lane facts", () => {
       .map((line) => (JSON.parse(line) as RunEvent).type);
     expect(completedTypes.filter((type) => type === "run_finished")).toHaveLength(1);
     expect((await durable.load(handle.runId))!.finishStatus).toBe("clean");
+  });
+
+  test("inspect records failed-to-start facts after a partial dispatch", async () => {
+    const { ledgerRoot, cwd } = await directories();
+    const clock = createClock(8_000);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      failRunInPaneAfter: 1,
+      lanes: [
+        { laneId: "started", exitCode: 0 },
+        { laneId: "rejected", exitCode: 0 },
+      ],
+    });
+    const ledger = new FsLedger(ledgerRoot);
+    const runtime = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run-partial-facts",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    let dispatchError: PartialDispatchError | null = null;
+    try {
+      await runtime.startWorkflow({
+        workflow: "cross-review",
+        workspace: "w1",
+        cwd,
+        lanes: [
+          { laneId: "started", steps: 1 },
+          { laneId: "rejected", steps: 1 },
+        ],
+      });
+    } catch (error) {
+      dispatchError = error as PartialDispatchError;
+    }
+    expect(dispatchError).toBeInstanceOf(PartialDispatchError);
+    expect(dispatchError!.startedLaneIds).toEqual(["started"]);
+    expect((await ledger.load(dispatchError!.runId))!.finishStatus).toBeNull();
+
+    await runtime.awaitLane(dispatchError!.runId, "started", 1_000);
+    const status = await runtime.inspectWorkflow(dispatchError!.runId);
+
+    expect(status.state).toBe("partial");
+    const loaded = await ledger.load(dispatchError!.runId);
+    expect(loaded!.finishStatus).toBe("degraded");
+    expect(loaded!.lanes.rejected).toMatchObject({
+      runtimeState: "failed_to_start",
+      semanticState: "unknown",
+      checkpointFile: null,
+      contractState: "violated",
+      verificationState: "failed",
+    });
+    expect(loaded!.lanes.rejected!.contractErrors).toContain("lane never started");
+    expect(
+      JSON.parse(
+        await readFile(loaded!.lanes.rejected!.evidenceFile!, "utf8"),
+      ),
+    ).toMatchObject({
+      termination: "failed_to_start",
+      signal: null,
+      failure: "fake: runInPane failed",
+      exitCode: null,
+    });
+    const events = (
+      await readFile(
+        join(ledgerRoot, "runs", dispatchError!.runId, "events.jsonl"),
+        "utf8",
+      )
+    )
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as RunEvent);
+    expect(
+      events.some(
+        (event) =>
+          event.type === "lane_checkpoint" && event.laneId === "rejected",
+      ),
+    ).toBe(false);
+    expect(
+      events.some(
+        (event) =>
+          event.type === "lane_contract_evaluated" &&
+          event.laneId === "rejected",
+      ),
+    ).toBe(true);
+    expect(
+      events.some(
+        (event) =>
+          event.type === "lane_verification_recorded" &&
+          event.laneId === "rejected",
+      ),
+    ).toBe(true);
+    expect(events.at(-1)?.type).toBe("run_finished");
+  });
+
+  test("two runs sharing cwd and laneId keep all artifact facts isolated", async () => {
+    const { ledgerRoot, cwd } = await directories();
+    const clock = createClock(9_000);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "lane-1", exitCode: 0 }],
+    });
+    const runIds = ["run-artifact-1", "run-artifact-2"];
+    const ledger = new FsLedger(ledgerRoot);
+    const runtime = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => runIds.shift()!,
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const config = {
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd,
+      lanes: [{ laneId: "lane-1", steps: 1 }],
+    } as const;
+    const first = await runtime.startWorkflow(config);
+    await runtime.confirmLaneStarted(first.runId, "lane-1");
+    const second = await runtime.startWorkflow(config);
+    await runtime.confirmLaneStarted(second.runId, "lane-1");
+    await runtime.interruptLane(first.runId, "lane-1");
+
+    await runtime.awaitLane(first.runId, "lane-1", 1_000);
+    await runtime.awaitLane(second.runId, "lane-1", 1_000);
+
+    const firstLane = (await ledger.load(first.runId))!.lanes["lane-1"]!;
+    const secondLane = (await ledger.load(second.runId))!.lanes["lane-1"]!;
+    expect(firstLane.semanticState).toBe("partial");
+    expect(secondLane.semanticState).toBe("complete");
+    for (const field of ["checkpointFile", "resultFile", "evidenceFile"] as const) {
+      expect(firstLane[field]).not.toBe(secondLane[field]);
+      expect(firstLane[field]).toContain(first.runId);
+      expect(secondLane[field]).toContain(second.runId);
+    }
   });
 });

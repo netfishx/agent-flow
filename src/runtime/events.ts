@@ -59,12 +59,19 @@ export interface RunnerEvidence {
   readonly runId: string;
   readonly laneId: string;
   readonly command: string;
+  /** Durable stdout/stderr artifact; the lane tees all process output here. */
   readonly logFile: string;
   readonly dispatchedAt: number | null;
   readonly liveAt: number | null;
   readonly completedAt: number | null;
   readonly exitCode: number | null;
-  readonly termination: "sentinel-exit" | "crashed" | "lost";
+  readonly signal: string | null;
+  readonly failure: string | null;
+  readonly termination:
+    | "sentinel-exit"
+    | "crashed"
+    | "lost"
+    | "failed_to_start";
 }
 
 export type EmptyEventData = Readonly<Record<string, never>>;

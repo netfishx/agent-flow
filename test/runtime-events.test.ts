@@ -48,22 +48,14 @@ class RecordingLedger implements Ledger {
   // Keep the #13 assertions focused on their original envelope vocabulary;
   // #14 fact-event behavior is covered through the public durable ledger seam.
   get events(): RunEvent[] {
-    const legacy = this.committedEvents.filter(
-      (event) =>
-        event.type !== "lane_checkpoint" &&
-        event.type !== "lane_contract_evaluated" &&
-        event.type !== "lane_verification_recorded",
-    );
-    const sequences = new Map<string, number>();
-    return legacy.map((event) => {
-      const sequence = (sequences.get(event.runId) ?? 0) + 1;
-      sequences.set(event.runId, sequence);
-      return {
-        ...event,
-        eventId: `${event.runId}#${sequence}`,
-        sequence,
-      } as RunEvent;
-    });
+    return this.committedEvents
+      .filter(
+        (event) =>
+          event.type !== "lane_checkpoint" &&
+          event.type !== "lane_contract_evaluated" &&
+          event.type !== "lane_verification_recorded",
+      )
+      .map((event) => structuredClone(event));
   }
 
   async commit(event: RunEvent): Promise<void> {
@@ -538,14 +530,24 @@ describe("WorkflowRuntime event commits", () => {
       "lane_exited",
       "run_finished",
     ]);
-    expect(ledger.events.map((event) => event.eventId)).toEqual(
-      ledger.events.map((_, index) => `run1#${index + 1}`),
-    );
+    expect(ledger.events.map((event) => event.eventId)).toEqual([
+      "run1#1",
+      "run1#2",
+      "run1#3",
+      "run1#4",
+      "run1#5",
+      "run1#6",
+      "run1#7",
+      "run1#11",
+    ]);
+    expect(ledger.events.map((event) => event.sequence)).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 11,
+    ]);
     expect(
       ledger.events.every(
-        (event, index) =>
+        (event) =>
           event.schemaVersion === 1 &&
-          event.sequence === index + 1 &&
+          event.eventId === `${event.runId}#${event.sequence}` &&
           event.controllerEpoch === 0,
       ),
     ).toBe(true);
