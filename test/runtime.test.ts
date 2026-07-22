@@ -319,6 +319,18 @@ describe("error paths", () => {
     ).rejects.toThrow(/no sentinel/);
   });
 
+  test("a dispatched lane's durable read error propagates (no fail-open)", async () => {
+    const { runtime } = setup({
+      lanes: [{ laneId: "lane-1", exitCode: 0, readErrors: true }],
+    });
+    const handle = await startAndConfirm(runtime, ["lane-1"]);
+    // lane-1 was accepted, so a broken durable read must throw, not return an
+    // empty result that disguises the evidence failure.
+    await expect(
+      runtime.inspectLaneResult(handle.runId, "lane-1"),
+    ).rejects.toThrow(/durable read failed/);
+  });
+
   test("a failed dispatch command surfaces as PartialDispatchError", async () => {
     const { runtime } = setup({ failRunInPane: true });
     await expect(
@@ -352,6 +364,9 @@ describe("error paths", () => {
     expect(status.lanes.find((l) => l.laneId === "lane-2")?.state).toBe("failed");
     // lane-3 was never dispatched — a clear terminal state, not "starting".
     expect(status.lanes.find((l) => l.laneId === "lane-3")?.state).toBe("failed");
+    // A run with a running lane aggregates to "running", even though dispatch
+    // aborted before run.dispatchedAt was stamped.
+    expect(status.state).toBe("running");
 
     // inspectLaneResult on the never-dispatched lane must not throw either.
     const r3 = await runtime.inspectLaneResult(error!.runId, "lane-3");
