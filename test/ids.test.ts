@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
   assertHandleId,
-  controllerSentinelToken,
   laneSentinelRegex,
   laneSentinelToken,
   parseExitFromSentinel,
@@ -17,10 +16,6 @@ describe("sentinel tokens", () => {
     // distinct run
     expect(laneSentinelToken("run1", "lane-2")).not.toBe(
       laneSentinelToken("run2", "lane-2"),
-    );
-    // distinct from the controller sentinel
-    expect(laneSentinelToken("run1", "lane-2")).not.toBe(
-      controllerSentinelToken("run1"),
     );
   });
 

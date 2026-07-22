@@ -5,13 +5,20 @@ import {
   type FakeAdvances,
   type FakeLaneProgram,
 } from "../src/herdr/fake-adapter.ts";
-import { WorkflowRuntime } from "../src/runtime/runtime.ts";
+import {
+  PartialDispatchError,
+  WorkflowRuntime,
+} from "../src/runtime/runtime.ts";
 import type { LaneSpec } from "../src/runtime/types.ts";
+import { scanSingleQuoted } from "../src/herdr/fake-adapter.ts";
 
 interface SetupOptions {
   lanes?: FakeLaneProgram[];
   advances?: FakeAdvances;
   failRunInPane?: boolean;
+  failRunInPaneAfter?: number;
+  processGoneTimeoutMs?: number;
+  processGoneIntervalMs?: number;
   clockStart?: number;
 }
 
@@ -22,6 +29,7 @@ function setup(opts: SetupOptions = {}) {
     lanes: opts.lanes,
     advances: opts.advances,
     failRunInPane: opts.failRunInPane,
+    failRunInPaneAfter: opts.failRunInPaneAfter,
   });
   let n = 0;
   const runtime = new WorkflowRuntime({
@@ -30,6 +38,8 @@ function setup(opts: SetupOptions = {}) {
     idgen: () => `run${++n}`,
     readResultFile: fake.readResultFile,
     sleep: async () => {},
+    processGoneTimeoutMs: opts.processGoneTimeoutMs,
+    processGoneIntervalMs: opts.processGoneIntervalMs,
   });
   return { runtime, fake, clock };
 }
@@ -81,6 +91,15 @@ describe("workflow creation", () => {
     await expect(
       runtime.startWorkflow(config([{ laneId: "lane_1", steps: 1 }])),
     ).rejects.toThrow(/invalid laneId/);
+  });
+
+  test("rejects duplicate lane ids (no double dispatch, no lost handle)", async () => {
+    const { runtime, fake } = setup();
+    await expect(
+      runtime.startWorkflow(config(laneSpecs("lane-1", "lane-1"))),
+    ).rejects.toThrow(/duplicate laneId/);
+    // Nothing was dispatched — the run is rejected before any lane runs.
+    expect(fake.dispatched).toHaveLength(0);
   });
 });
 
@@ -213,29 +232,51 @@ describe("interrupt isolation", () => {
   });
 });
 
-describe("controller loss", () => {
-  test("the launcher leaving does not tear down lanes", async () => {
-    const { runtime } = setup({
+describe("controller loss (export / attach)", () => {
+  test("a fresh controller attaches, sees the lanes alive, and collects them", async () => {
+    const { runtime, fake, clock } = setup({
       lanes: [
         { laneId: "lane-1", exitCode: 0 },
         { laneId: "lane-2", exitCode: 0 },
       ],
     });
     const handle = await startAndConfirm(runtime, ["lane-1", "lane-2"]);
+    const topology = runtime.exportRun(handle.runId);
 
-    const loss = await runtime.runControllerMarker(handle.runId, 1000);
-    expect(loss.markerMatched).toBe(true);
-    expect(loss.controllerBackAtShell).toBe(true);
+    // A fresh controller (new runtime) over the SAME adapter — as if the
+    // dispatching controller had exited and the lanes kept running under Herdr.
+    const fresh = new WorkflowRuntime({
+      adapter: fake,
+      clock: clock.now,
+      idgen: () => "unused",
+      readResultFile: fake.readResultFile,
+      sleep: async () => {},
+    });
+    const attached = fresh.attachRun(topology);
+    expect(attached.runId).toBe(handle.runId);
+    expect(attached.laneIds).toEqual(["lane-1", "lane-2"]);
 
-    // Lanes are still alive right after the controller left.
-    const mid = await runtime.inspectWorkflow(handle.runId);
-    expect(mid.lanes.every((l) => l.state === "running")).toBe(true);
+    // The fresh controller sees the lanes still running.
+    const status = await fresh.inspectWorkflow(handle.runId);
+    expect(status.lanes.every((l) => l.state === "running")).toBe(true);
 
-    // And they still complete afterward.
-    const r1 = await runtime.awaitLane(handle.runId, "lane-1", 1000);
-    const r2 = await runtime.awaitLane(handle.runId, "lane-2", 1000);
+    // ...and can drive them to completion through logical handles.
+    const r1 = await fresh.awaitLane(handle.runId, "lane-1", 1000);
+    const r2 = await fresh.awaitLane(handle.runId, "lane-2", 1000);
     expect(r1.state).toBe("complete");
     expect(r2.state).toBe("complete");
+  });
+
+  test("attach rejects an unsupported topology version", () => {
+    const { runtime } = setup();
+    expect(() => runtime.attachRun(JSON.stringify({ v: 2 }))).toThrow(
+      /unsupported run topology/,
+    );
+  });
+
+  test("exportRun rejects an unknown run", () => {
+    const { runtime } = setup();
+    expect(() => runtime.exportRun("nope")).toThrow(/unknown runId/);
   });
 });
 
@@ -274,11 +315,74 @@ describe("error paths", () => {
     ).rejects.toThrow(/no sentinel/);
   });
 
-  test("a failed dispatch command surfaces", async () => {
+  test("a failed dispatch command surfaces as PartialDispatchError", async () => {
     const { runtime } = setup({ failRunInPane: true });
     await expect(
       runtime.startWorkflow(config(laneSpecs("lane-1"))),
-    ).rejects.toThrow(/runInPane failed/);
+    ).rejects.toBeInstanceOf(PartialDispatchError);
+  });
+
+  test("a partial dispatch leaves the started lanes controllable", async () => {
+    // lane-1 dispatches; lane-2's dispatch throws.
+    const { runtime } = setup({
+      failRunInPaneAfter: 1,
+      lanes: [
+        { laneId: "lane-1", exitCode: 0 },
+        { laneId: "lane-2", exitCode: 0 },
+      ],
+    });
+    let error: PartialDispatchError | null = null;
+    try {
+      await runtime.startWorkflow(config(laneSpecs("lane-1", "lane-2")));
+    } catch (caught) {
+      error = caught as PartialDispatchError;
+    }
+    expect(error).toBeInstanceOf(PartialDispatchError);
+    expect(error!.startedLaneIds).toEqual(["lane-1"]);
+
+    // The run is registered under its runId — inspect/interrupt do NOT report
+    // "unknown runId", and the started lane is controllable.
+    const status = await runtime.inspectWorkflow(error!.runId);
+    expect(status.lanes.find((l) => l.laneId === "lane-1")?.state).toBe(
+      "running",
+    );
+    expect(status.lanes.find((l) => l.laneId === "lane-2")?.state).toBe(
+      "failed",
+    );
+    const outcome = await runtime.interruptLane(error!.runId, "lane-1");
+    expect(outcome.delivered).toBe(true);
+  });
+});
+
+describe("durable log isolation", () => {
+  test("the durable log path is scoped by runId (no cross-run truncation)", async () => {
+    const { runtime, fake } = setup({ lanes: [{ laneId: "lane-1", exitCode: 0 }] });
+    const h1 = await startAndConfirm(runtime, ["lane-1"]);
+    const h2 = await startAndConfirm(runtime, ["lane-1"]);
+    // Recover each dispatched command's logFile argument (token index 3).
+    const logs = fake.dispatched.map((d) => scanSingleQuoted(d.command)[3]);
+    expect(logs[0]).toContain(h1.runId);
+    expect(logs[1]).toContain(h2.runId);
+    expect(logs[0]).not.toBe(logs[1]);
+  });
+});
+
+describe("process-info gated completion", () => {
+  test("a matched sentinel over a still-running process is not completion", async () => {
+    const { runtime, fake } = setup({
+      processGoneTimeoutMs: 3,
+      processGoneIntervalMs: 1,
+      lanes: [
+        { laneId: "lane-1", exitCode: 0, waitMatches: true, staysRunningAfterMatch: true },
+      ],
+    });
+    const handle = await startAndConfirm(runtime, ["lane-1"]);
+    const before = fake.processInfoCalls;
+    await expect(
+      runtime.awaitLane(handle.runId, "lane-1", 1000),
+    ).rejects.toThrow(/still running/);
+    // process-info was actually consulted (the gate is load-bearing).
+    expect(fake.processInfoCalls).toBeGreaterThan(before);
   });
 });
 
@@ -319,10 +423,12 @@ describe("measured / unavailable metrics", () => {
     const lane = metrics.perLane["lane-1"]!;
 
     // processStartup = the single live-confirming process-info advance (5ms).
-    // executionWait = the wait-output advance (11ms). inspectWorkflow refreshes
-    // a terminal lane without re-timing, so the deltas stay exact.
+    // executionWait = the wait-output advance (11ms) plus the one process-info
+    // call that confirms the process has exited before finalizing (5ms) = 16ms.
+    // inspectWorkflow refreshes a terminal lane without re-timing, so the deltas
+    // stay exact.
     expect(lane.processStartup).toEqual({ kind: "measured", ms: 5 });
-    expect(lane.executionWait).toEqual({ kind: "measured", ms: 11 });
+    expect(lane.executionWait).toEqual({ kind: "measured", ms: 16 });
   });
 
   test("human coordination is measured from checkpoint to interrupt", async () => {
