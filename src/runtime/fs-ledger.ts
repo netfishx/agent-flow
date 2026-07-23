@@ -1,4 +1,5 @@
 import {
+  link,
   mkdir,
   open,
   readdir,
@@ -56,6 +57,7 @@ const COMMIT_STATE_FILE = "commit-state.json";
 const COMMIT_LOCK_FILE = "commit.lock";
 const COMMIT_LOCK_RECLAIM_FILE = "commit.lock.reclaim";
 const COMMIT_LOCK_BACKOFF_MS = [25, 50, 100, 200, 400] as const;
+const COMMIT_LOCK_RECLAIM_GUARD_ATTEMPTS = 4;
 const TAKEOVER_ATTEMPTS = 4;
 const TAKEOVER_GUARD_ACQUIRE_ATTEMPTS = 4;
 const STABLE_READ_ATTEMPTS = 3;
@@ -191,7 +193,6 @@ export class FsLedger implements Ledger {
         const next = duplicate
           ? replayed.view
           : reduce(replayed.view ?? undefined, event);
-        await mkdir(runDir, { recursive: true });
         const writingState = await this.enterCommitState(runDir, event.runId);
         if (duplicate) {
           try {
@@ -777,7 +778,7 @@ export class FsLedger implements Ledger {
       attempt <= COMMIT_LOCK_BACKOFF_MS.length;
       attempt++
     ) {
-      if (await this.createCommitLock(runDir, lockFile, record)) return;
+      if (await this.createCommitLock(runDir, lockFile, runId, record)) return;
       const holder = await this.readCommitLock(lockFile, runId);
       if (
         holder &&
@@ -803,25 +804,56 @@ export class FsLedger implements Ledger {
   private async createCommitLock(
     runDir: string,
     lockFile: string,
+    runId: string,
     record: CommitLockRecord,
   ): Promise<boolean> {
+    return this.installCommitLockRecord(
+      runDir,
+      lockFile,
+      runId,
+      "lock",
+      record,
+    );
+  }
+
+  private async installCommitLockRecord(
+    runDir: string,
+    targetFile: string,
+    runId: string,
+    target: "lock" | "reclaim-guard",
+    record: CommitLockRecord,
+  ): Promise<boolean> {
+    const temp = join(
+      runDir,
+      `.${COMMIT_LOCK_FILE}.tmp-${process.pid}-${++commitLockSequence}`,
+    );
     let handle: FileHandle | undefined;
-    let created = false;
+    let installed = false;
+    let tempExists = false;
     try {
-      handle = await open(lockFile, "wx");
-      created = true;
+      handle = await open(temp, "wx");
+      tempExists = true;
       await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
       await handle.sync();
       await handle.close();
       handle = undefined;
+      await this.afterCommitLockTempPhase(runId, target);
+      try {
+        // A hardlink publishes the already-synced inode without exposing an
+        // empty target between exclusive creation and record initialization.
+        await link(temp, targetFile);
+        installed = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      await unlink(temp);
+      tempExists = false;
       await this.syncDirectory(runDir);
-      return true;
+      return installed;
     } catch (error) {
       await handle?.close().catch(() => {});
-      if (!created && (error as NodeJS.ErrnoException).code === "EEXIST") {
-        return false;
-      }
-      if (created) await unlink(lockFile).catch(() => {});
+      if (tempExists) await unlink(temp).catch(() => {});
+      if (installed) await unlink(targetFile).catch(() => {});
       throw error;
     }
   }
@@ -867,21 +899,20 @@ export class FsLedger implements Ledger {
     replacement: CommitLockRecord,
   ): Promise<boolean> {
     const guardFile = join(runDir, COMMIT_LOCK_RECLAIM_FILE);
-    let guardHandle: FileHandle | undefined;
-    try {
-      guardHandle = await open(guardFile, "wx");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
-      throw error;
+    if (
+      !(await this.acquireCommitLockReclaimGuard(
+        runDir,
+        guardFile,
+        runId,
+        replacement,
+      ))
+    ) {
+      return false;
     }
 
     let result = false;
     let reclaimError: unknown;
     try {
-      await guardHandle.writeFile(`${JSON.stringify(replacement)}\n`, "utf8");
-      await guardHandle.sync();
-      await guardHandle.close();
-      guardHandle = undefined;
       const current = await this.readCommitLock(lockFile, runId);
       if (
         !current ||
@@ -897,7 +928,6 @@ export class FsLedger implements Ledger {
       reclaimError = error;
       throw error;
     } finally {
-      await guardHandle?.close().catch(() => {});
       try {
         await unlink(guardFile);
       } catch (guardError) {
@@ -911,6 +941,58 @@ export class FsLedger implements Ledger {
         throw guardError;
       }
     }
+  }
+
+  private async acquireCommitLockReclaimGuard(
+    runDir: string,
+    guardFile: string,
+    runId: string,
+    record: CommitLockRecord,
+  ): Promise<boolean> {
+    for (
+      let attempt = 0;
+      attempt < COMMIT_LOCK_RECLAIM_GUARD_ATTEMPTS;
+      attempt++
+    ) {
+      if (
+        await this.installCommitLockRecord(
+          runDir,
+          guardFile,
+          runId,
+          "reclaim-guard",
+          record,
+        )
+      ) {
+        return true;
+      }
+
+      let holder: CommitLockRecord | null;
+      try {
+        holder = await this.readCommitLock(guardFile, runId);
+      } catch {
+        // Atomic creators never publish partial records. A malformed guard is
+        // therefore an orphaned legacy/crash artifact and is safe to reclaim.
+        await this.removeOrphanedCommitLockReclaimGuard(runDir, guardFile);
+        continue;
+      }
+      if (!holder) continue;
+      if (this.isPidAlive(holder.pid)) return false;
+      await this.removeOrphanedCommitLockReclaimGuard(runDir, guardFile);
+    }
+    return false;
+  }
+
+  private async removeOrphanedCommitLockReclaimGuard(
+    runDir: string,
+    guardFile: string,
+  ): Promise<void> {
+    try {
+      await unlink(guardFile);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    await this.syncDirectory(runDir);
   }
 
   private async replaceCommitLock(
@@ -1025,6 +1107,12 @@ export class FsLedger implements Ledger {
   protected async afterCommitLockPhase(
     _runId: string,
     _phase: "acquired" | "before-release",
+  ): Promise<void> {}
+
+  /** Test seam for observing a durable temp before its atomic hardlink. */
+  protected async afterCommitLockTempPhase(
+    _runId: string,
+    _target: "lock" | "reclaim-guard",
   ): Promise<void> {}
 
   /** Test seam for deterministically interleaving controller takeovers. */
