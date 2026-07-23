@@ -69,6 +69,26 @@ class ObservedLedger implements Ledger {
   }
 }
 
+class LeaseFreeLedger implements Ledger {
+  constructor(private readonly delegate: Ledger) {}
+
+  commit(event: RunEvent): Promise<void> {
+    return this.delegate.commit(event);
+  }
+
+  load(runId: string): Promise<RunView | null> {
+    return this.delegate.load(runId);
+  }
+
+  list(): Promise<{ runId: string }[]> {
+    return this.delegate.list();
+  }
+
+  async acquireLease(): Promise<LeaseHandle> {
+    return { release: async () => {} };
+  }
+}
+
 describe("WorkflowRuntime resume", () => {
   test("reconciles the unobserved window, reattaches live lanes, and finishes runtime outcomes", async () => {
     const cwd = await tempWork();
@@ -344,5 +364,52 @@ describe("WorkflowRuntime resume", () => {
     expect(
       (await resumeLedger.load("run-live-controller"))!.controllerEpoch,
     ).toBe(0);
+  });
+
+  test("rejects when a reattached live lane does not terminate before timeout", async () => {
+    const root = await tempWork();
+    const clock = createClock(50_000);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [
+        {
+          laneId: "slow-lane",
+          exitCode: 0,
+          emitSentinel: false,
+          waitMatches: false,
+        },
+      ],
+    });
+    const ledger = new LeaseFreeLedger(
+      new FsLedger(join(root, "ledger")),
+    );
+    const deps = () => ({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run-resume-timeout",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    await new WorkflowRuntime(deps()).startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd: join(root, "work"),
+      lanes: [{ laneId: "slow-lane", steps: 1 }],
+    });
+
+    await expect(
+      new WorkflowRuntime(deps()).resumeWorkflow("run-resume-timeout", 1),
+    ).rejects.toThrow(/did not terminate.*slow-lane/);
+    expect(await ledger.load("run-resume-timeout")).toMatchObject({
+      controllerEpoch: 1,
+      finishStatus: null,
+      lanes: {
+        "slow-lane": {
+          runtimeState: "running",
+          liveAt: 50_000,
+        },
+      },
+    });
   });
 });

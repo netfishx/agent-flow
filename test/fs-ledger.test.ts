@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FsLedger } from "../src/runtime/fs-ledger.ts";
 import type { RunEvent } from "../src/runtime/events.ts";
+import type { LeaseHandle } from "../src/runtime/ledger.ts";
 import { reduce } from "../src/runtime/reducer.ts";
 
 const roots: string[] = [];
@@ -491,6 +492,48 @@ describe("FsLedger public capabilities", () => {
       }),
     ).rejects.toThrow('controller lease for run "run-fs" is already held');
     await takeover.release();
+  });
+
+  test("admits exactly one concurrent takeover of the same dead holder", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root, () => false).acquireLease("run-fs", {
+      controllerId: "dead-controller",
+      pid: 101,
+    });
+    const contenders = [
+      { controllerId: "controller-2", pid: 202 },
+      { controllerId: "controller-3", pid: 303 },
+    ] as const;
+
+    const results = await Promise.allSettled(
+      contenders.map((controller) =>
+        new FsLedger(root, () => false).acquireLease("run-fs", controller),
+      ),
+    );
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(
+      1,
+    );
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(
+      1,
+    );
+    const winner = JSON.parse(
+      await readFile(
+        join(root, "runs", "run-fs", "controller.lock"),
+        "utf8",
+      ),
+    ) as { pid: number };
+    await expect(
+      new FsLedger(root, (pid) => pid === winner.pid).acquireLease("run-fs", {
+        controllerId: "controller-4",
+        pid: 404,
+      }),
+    ).rejects.toThrow('controller lease for run "run-fs" is already held');
+    const winningResult = results.find(
+      (result): result is PromiseFulfilledResult<LeaseHandle> =>
+        result.status === "fulfilled",
+    );
+    await winningResult!.value.release();
   });
 
   test("fails closed on a corrupt existing controller lock", async () => {

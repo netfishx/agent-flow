@@ -9,7 +9,11 @@ import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { RealHerdrAdapter } from "../herdr/real-adapter.ts";
 import type { RunEvent, RuntimeState } from "../runtime/events.ts";
-import { FsLedger, resolveLedgerRoot } from "../runtime/fs-ledger.ts";
+import {
+  FsLedger,
+  realPidIsAlive,
+  resolveLedgerRoot,
+} from "../runtime/fs-ledger.ts";
 import type { Ledger } from "../runtime/ledger.ts";
 import { WorkflowRuntime } from "../runtime/runtime.ts";
 import type { LaneSpec, RuntimeDeps } from "../runtime/types.ts";
@@ -152,15 +156,6 @@ async function waitForReady(path: string, timeoutMs: number): Promise<void> {
   }
 }
 
-function pidIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
 async function parentPhase(): Promise<void> {
   const c = config();
   await mkdir(c.evidenceDir, { recursive: true });
@@ -209,7 +204,7 @@ async function parentPhase(): Promise<void> {
     const controllerExit = await controller.exited;
     controllerReaped = true;
     await sleep(100);
-    if (pidIsAlive(controllerPid)) {
+    if (realPidIsAlive(controllerPid)) {
       throw new Error(`SIGKILLed controller pid ${controllerPid} is still alive`);
     }
     line(`controller SIGKILLed and reaped (exit=${controllerExit})`);
@@ -334,7 +329,7 @@ async function parentPhase(): Promise<void> {
     );
     line(`FLOW_SMOKE_DONE=0`);
   } finally {
-    if (!controllerReaped && pidIsAlive(controllerPid)) {
+    if (!controllerReaped && realPidIsAlive(controllerPid)) {
       controller.kill("SIGKILL");
       await controller.exited;
     }

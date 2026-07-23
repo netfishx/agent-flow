@@ -438,7 +438,17 @@ export class WorkflowRuntime {
         await this.recordTerminalFacts(runId, laneId, lane.exitCode);
       }
     }
-    return this.workflowStatus(this.getRun(runId));
+    const completed = this.getRun(runId);
+    if (completed.finishStatus === null) {
+      const incompleteLaneIds = completed.laneOrder.filter(
+        (laneId) =>
+          !TERMINAL_RUNTIME.has(this.getLane(completed, laneId).runtimeState),
+      );
+      throw new Error(
+        `resume did not reach run_finished; lanes did not terminate: ${incompleteLaneIds.join(", ")}`,
+      );
+    }
+    return this.workflowStatus(completed);
   }
 
   private workflowStatus(run: RunView): WorkflowStatus {

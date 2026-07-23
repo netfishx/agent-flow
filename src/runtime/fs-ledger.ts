@@ -42,9 +42,10 @@ let commitStateSequence = 0;
 let leaseSequence = 0;
 const COMMIT_INTENT_FILE = "commit-intent.json";
 const COMMIT_STATE_FILE = "commit-state.json";
+const CONTROLLER_TAKEOVER_FILE = "controller.takeover";
 const STABLE_READ_ATTEMPTS = 3;
 
-function realPidIsAlive(pid: number): boolean {
+export function realPidIsAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
@@ -362,9 +363,11 @@ export class FsLedger implements Ledger {
       if (this.isPidAlive(holder.pid)) {
         throw new Error(`controller lease for run "${runId}" is already held`);
       }
-      await this.replaceControllerLease(
+      await this.takeOverControllerLease(
         runDir,
         lockFile,
+        runId,
+        holder,
         record(holder.epoch + 1),
       );
     }
@@ -453,6 +456,50 @@ export class FsLedger implements Ledger {
       await handle?.close().catch(() => {});
       await unlink(temp).catch(() => {});
       throw error;
+    }
+  }
+
+  private async takeOverControllerLease(
+    runDir: string,
+    lockFile: string,
+    runId: string,
+    observed: ControllerLeaseRecord,
+    replacement: ControllerLeaseRecord,
+  ): Promise<void> {
+    const claimFile = join(runDir, CONTROLLER_TAKEOVER_FILE);
+    let claim: FileHandle | undefined;
+    try {
+      try {
+        claim = await open(claimFile, "wx");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          throw new Error(`controller lease for run "${runId}" is already held`);
+        }
+        throw error;
+      }
+      await claim.writeFile(
+        `${JSON.stringify({ schemaVersion: 1, pid: process.pid })}\n`,
+        "utf8",
+      );
+      await claim.sync();
+      await claim.close();
+      claim = undefined;
+
+      const current = await this.readControllerLease(lockFile, runId);
+      if (
+        !isDeepStrictEqual(current, observed) ||
+        this.isPidAlive(current.pid)
+      ) {
+        throw new Error(`controller lease for run "${runId}" is already held`);
+      }
+      await this.replaceControllerLease(
+        runDir,
+        lockFile,
+        replacement,
+      );
+    } finally {
+      await claim?.close().catch(() => {});
+      await unlink(claimFile).catch(() => {});
     }
   }
 
