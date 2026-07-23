@@ -8,7 +8,6 @@ import { FsLedger } from "../src/runtime/fs-ledger.ts";
 import type {
   FixedPoint,
   RunEvent,
-  RunnerEvidence,
 } from "../src/runtime/events.ts";
 import type { LeaseHandle, Ledger } from "../src/runtime/ledger.ts";
 import type { RunView } from "../src/runtime/reducer.ts";
@@ -127,102 +126,6 @@ class TimeoutOnceFakeAdapter extends FakeHerdrAdapter {
     this.waitCalls++;
     if (this.waitCalls === 1) return { matched: false, timedOut: true };
     return super.waitForOutput(pane, regex, timeoutMs);
-  }
-}
-
-class LateTimeoutFakeAdapter extends FakeHerdrAdapter {
-  private firstWait = true;
-  private resolveStarted!: () => void;
-  private resolveTimeout!: (outcome: WaitOutcome) => void;
-  readonly timeoutWaitStarted = new Promise<void>((resolve) => {
-    this.resolveStarted = resolve;
-  });
-
-  override async waitForOutput(
-    pane: PaneRef,
-    regex: string,
-    timeoutMs: number,
-  ): Promise<WaitOutcome> {
-    if (!this.firstWait) return super.waitForOutput(pane, regex, timeoutMs);
-    this.firstWait = false;
-    this.resolveStarted();
-    return new Promise<WaitOutcome>((resolve) => {
-      this.resolveTimeout = resolve;
-    });
-  }
-
-  releaseTimeout(): void {
-    this.resolveTimeout({ matched: false, timedOut: true });
-  }
-}
-
-class TwoLateTimeoutsFakeAdapter extends FakeHerdrAdapter {
-  private waitCalls = 0;
-  private readonly timeoutResolvers: Array<
-    (outcome: WaitOutcome) => void
-  > = [];
-  private resolveBothStarted!: () => void;
-  readonly bothTimeoutWaitsStarted = new Promise<void>((resolve) => {
-    this.resolveBothStarted = resolve;
-  });
-
-  override async waitForOutput(
-    pane: PaneRef,
-    regex: string,
-    timeoutMs: number,
-  ): Promise<WaitOutcome> {
-    this.waitCalls++;
-    if (this.waitCalls > 2) {
-      return super.waitForOutput(pane, regex, timeoutMs);
-    }
-    if (this.waitCalls === 2) this.resolveBothStarted();
-    return new Promise<WaitOutcome>((resolve) => {
-      this.timeoutResolvers.push(resolve);
-    });
-  }
-
-  releaseTimeout(index: number): void {
-    this.timeoutResolvers[index]!({ matched: false, timedOut: true });
-  }
-}
-
-class BlockingEvidenceSyncRuntime extends WorkflowRuntime {
-  private resolveFirstUpdateStarted!: () => void;
-  private releaseFirstUpdate!: () => void;
-  readonly firstUpdateStarted = new Promise<void>((resolve) => {
-    this.resolveFirstUpdateStarted = resolve;
-  });
-  private readonly firstUpdateRelease = new Promise<void>((resolve) => {
-    this.releaseFirstUpdate = resolve;
-  });
-
-  override async writeRunnerEvidenceFile(
-    path: string,
-    evidence: RunnerEvidence,
-  ): Promise<void> {
-    if (evidence.observationTimeouts === 1) {
-      this.resolveFirstUpdateStarted();
-      await this.firstUpdateRelease;
-    }
-    await super.writeRunnerEvidenceFile(path, evidence);
-  }
-
-  continueFirstUpdate(): void {
-    this.releaseFirstUpdate();
-  }
-}
-
-class FailingEvidenceSyncRuntime extends WorkflowRuntime {
-  failUpdates = true;
-
-  override async writeRunnerEvidenceFile(
-    path: string,
-    evidence: RunnerEvidence,
-  ): Promise<void> {
-    if (this.failUpdates && evidence.observationTimeouts > 0) {
-      throw new Error("injected evidence sync failure");
-    }
-    await super.writeRunnerEvidenceFile(path, evidence);
   }
 }
 
@@ -443,7 +346,7 @@ describe("persisted terminal lane facts", () => {
       signal: null,
       failure: null,
       environmentFailure: null,
-      observationTimeouts: 0,
+      executionTimeout: null,
     });
     const reacquired = await new FsLedger(ledgerRoot).acquireLease(handle.runId, {
       controllerId: "next-controller",
@@ -452,7 +355,7 @@ describe("persisted terminal lane facts", () => {
     await reacquired.release();
   });
 
-  test("eventual runner evidence records prior wait observation timeouts", async () => {
+  test("awaitLane reports an observation timeout without expanding lifecycle history", async () => {
     const { ledgerRoot, cwd } = await directories();
     const clock = createClock(1_500);
     const adapter = new TimeoutOnceFakeAdapter({
@@ -477,184 +380,33 @@ describe("persisted terminal lane facts", () => {
     await runtime.confirmLaneStarted(handle.runId, "lane-1");
 
     const timedOut = await runtime.awaitLane(handle.runId, "lane-1", 1);
-    expect(timedOut.state).toBe("running");
-    expect((await ledger.load(handle.runId))!.lanes["lane-1"]!).toMatchObject({
-      runtimeState: "running",
-      observationTimeouts: 1,
+    expect(timedOut).toMatchObject({
+      state: "running",
+      waitMatched: false,
+      timedOut: true,
     });
+    const afterTimeout = (await ledger.load(handle.runId))!;
+    expect("observationTimeouts" in afterTimeout.lanes["lane-1"]!).toBe(false);
+    const eventTypesAfterTimeout = (
+      await readFile(
+        join(ledgerRoot, "runs", handle.runId, "events.jsonl"),
+        "utf8",
+      )
+    )
+      .trim()
+      .split("\n")
+      .map((line) => (JSON.parse(line) as RunEvent).type);
+    expect(eventTypesAfterTimeout).not.toContain("lane_wait_timed_out");
 
-    await runtime.awaitLane(handle.runId, "lane-1", 1_000);
+    const completed = await runtime.awaitLane(handle.runId, "lane-1", 1_000);
+    expect(completed.timedOut).toBe(false);
     const loaded = await ledger.load(handle.runId);
     const evidence = JSON.parse(
       await readFile(loaded!.lanes["lane-1"]!.evidenceFile!, "utf8"),
     );
-    expect(evidence.observationTimeouts).toBe(1);
+    expect(evidence.executionTimeout).toBeNull();
+    expect("observationTimeouts" in evidence).toBe(false);
     expect(evidence.termination).toBe("sentinel-exit");
-  });
-
-  test("a concurrent late timeout is durable and holds the lease until recorded", async () => {
-    const { ledgerRoot, cwd } = await directories();
-    const clock = createClock(1_600);
-    const adapter = new LateTimeoutFakeAdapter({
-      clock,
-      lanes: [{ laneId: "lane-1", exitCode: 0 }],
-    });
-    const ledger = new FsLedger(ledgerRoot);
-    const runtime = new WorkflowRuntime({
-      adapter,
-      ledger,
-      clock: clock.now,
-      idgen: () => "run-late-timeout",
-      readResultFile: adapter.readResultFile,
-      sleep: async () => {},
-    });
-    const handle = await runtime.startWorkflow({
-      workflow: "cross-review",
-      workspace: "w1",
-      cwd,
-      lanes: [{ laneId: "lane-1", steps: 1 }],
-    });
-    await runtime.confirmLaneStarted(handle.runId, "lane-1");
-
-    const lateTimeout = runtime.awaitLane(handle.runId, "lane-1", 1);
-    await adapter.timeoutWaitStarted;
-    await runtime.awaitLane(handle.runId, "lane-1", 1_000);
-    await expect(
-      new FsLedger(ledgerRoot).acquireLease(handle.runId, {
-        controllerId: "before-late-timeout",
-        pid: 1_601,
-      }),
-    ).rejects.toThrow(/already held/);
-
-    adapter.releaseTimeout();
-    await lateTimeout;
-    const loaded = await ledger.load(handle.runId);
-    expect(loaded!.lanes["lane-1"]!.observationTimeouts).toBe(1);
-    expect(
-      JSON.parse(
-        await readFile(loaded!.lanes["lane-1"]!.evidenceFile!, "utf8"),
-      ).observationTimeouts,
-    ).toBe(1);
-    const reacquired = await new FsLedger(ledgerRoot).acquireLease(handle.runId, {
-      controllerId: "after-late-timeout",
-      pid: 1_602,
-    });
-    await reacquired.release();
-  });
-
-  test("concurrent late timeout evidence updates serialize before lease release", async () => {
-    const { ledgerRoot, cwd } = await directories();
-    const clock = createClock(1_650);
-    const adapter = new TwoLateTimeoutsFakeAdapter({
-      clock,
-      lanes: [{ laneId: "lane-1", exitCode: 0 }],
-    });
-    const ledger = new FsLedger(ledgerRoot);
-    const runtime = new BlockingEvidenceSyncRuntime({
-      adapter,
-      ledger,
-      clock: clock.now,
-      idgen: () => "run-two-late-timeouts",
-      readResultFile: adapter.readResultFile,
-      sleep: async () => {},
-    });
-    const handle = await runtime.startWorkflow({
-      workflow: "cross-review",
-      workspace: "w1",
-      cwd,
-      lanes: [{ laneId: "lane-1", steps: 1 }],
-    });
-    await runtime.confirmLaneStarted(handle.runId, "lane-1");
-
-    const firstTimeout = runtime.awaitLane(handle.runId, "lane-1", 1);
-    const secondTimeout = runtime.awaitLane(handle.runId, "lane-1", 1);
-    await adapter.bothTimeoutWaitsStarted;
-    await runtime.awaitLane(handle.runId, "lane-1", 1_000);
-
-    adapter.releaseTimeout(0);
-    await Promise.race([
-      runtime.firstUpdateStarted,
-      Bun.sleep(100).then(() => {
-        throw new Error("first evidence update was not intercepted");
-      }),
-    ]);
-    adapter.releaseTimeout(1);
-    while (
-      (await ledger.load(handle.runId))!.lanes["lane-1"]!
-        .observationTimeouts !== 2
-    ) {
-      await Bun.sleep(1);
-    }
-    await expect(
-      new FsLedger(ledgerRoot).acquireLease(handle.runId, {
-        controllerId: "during-evidence-sync",
-        pid: 1_651,
-      }),
-    ).rejects.toThrow(/already held/);
-
-    runtime.continueFirstUpdate();
-    await Promise.all([firstTimeout, secondTimeout]);
-    const lane = (await ledger.load(handle.runId))!.lanes["lane-1"]!;
-    expect(
-      JSON.parse(await readFile(lane.evidenceFile!, "utf8")).observationTimeouts,
-    ).toBe(2);
-    const reacquired = await new FsLedger(ledgerRoot).acquireLease(handle.runId, {
-      controllerId: "after-evidence-sync",
-      pid: 1_652,
-    });
-    await reacquired.release();
-  });
-
-  test("an evidence timeout sync failure retains the lease until retry", async () => {
-    const { ledgerRoot, cwd } = await directories();
-    const clock = createClock(1_675);
-    const adapter = new LateTimeoutFakeAdapter({
-      clock,
-      lanes: [{ laneId: "lane-1", exitCode: 0 }],
-    });
-    const ledger = new FsLedger(ledgerRoot);
-    const runtime = new FailingEvidenceSyncRuntime({
-      adapter,
-      ledger,
-      clock: clock.now,
-      idgen: () => "run-timeout-sync-failure",
-      readResultFile: adapter.readResultFile,
-      sleep: async () => {},
-    });
-    const handle = await runtime.startWorkflow({
-      workflow: "cross-review",
-      workspace: "w1",
-      cwd,
-      lanes: [{ laneId: "lane-1", steps: 1 }],
-    });
-    await runtime.confirmLaneStarted(handle.runId, "lane-1");
-    const lateTimeout = runtime.awaitLane(handle.runId, "lane-1", 1);
-    await adapter.timeoutWaitStarted;
-    await runtime.awaitLane(handle.runId, "lane-1", 1_000);
-
-    adapter.releaseTimeout();
-    await expect(lateTimeout).rejects.toThrow(/evidence sync failure/);
-    await expect(
-      new FsLedger(ledgerRoot).acquireLease(handle.runId, {
-        controllerId: "after-sync-failure",
-        pid: 1_676,
-      }),
-    ).rejects.toThrow(/already held/);
-
-    runtime.failUpdates = false;
-    await runtime.awaitLane(handle.runId, "lane-1", 1_000);
-    const evidence = JSON.parse(
-      await readFile(
-        (await ledger.load(handle.runId))!.lanes["lane-1"]!.evidenceFile!,
-        "utf8",
-      ),
-    );
-    expect(evidence.observationTimeouts).toBe(1);
-    const reacquired = await new FsLedger(ledgerRoot).acquireLease(handle.runId, {
-      controllerId: "after-sync-retry",
-      pid: 1_677,
-    });
-    await reacquired.release();
   });
 
   test("arbitrary extra stdout does not become an environment failure", async () => {
@@ -738,7 +490,7 @@ describe("persisted terminal lane facts", () => {
     });
   });
 
-  test("foreign stderr is durable execution evidence and fails verification", async () => {
+  test("ordinary stderr stays auditable without becoming an environment failure", async () => {
     const { ledgerRoot, cwd } = await directories();
     const clock = createClock(2_500);
     const adapter = new ShellExecutingFakeAdapter({
@@ -789,9 +541,7 @@ describe("persisted terminal lane facts", () => {
 
     expect(durableStdout).not.toContain("sleep");
     expect(durableStderr).toContain("sleep");
-    expect(evidence.environmentFailure).toBeString();
-    expect(String(evidence.environmentFailure)).toContain("sleep");
-    expect(durableStderr).toContain(String(evidence.environmentFailure));
+    expect(evidence.environmentFailure).toBeNull();
     expect(evidence).toMatchObject({
       command: adapter.dispatched[0]!.command,
       stdoutArtifact: lane.logFile,
@@ -804,6 +554,47 @@ describe("persisted terminal lane facts", () => {
     expect(dispatched?.data).toEqual({
       command: adapter.dispatched[0]!.command,
     });
+    expect(lane.verificationState).toBe("verified");
+  });
+
+  test("a structured runner environment failure fails verification", async () => {
+    const { ledgerRoot, cwd } = await directories();
+    const clock = createClock(2_750);
+    const adapter = new ShellExecutingFakeAdapter({
+      clock,
+      lanes: [{ laneId: "structured-env", exitCode: 0 }],
+    });
+    const ledger = new FsLedger(ledgerRoot);
+    const runtime = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run-structured-env",
+      readResultFile: (path) => readFile(path, "utf8"),
+      sleep: async () => {},
+      runnerEnvironmentFailure: async (runId, laneId) =>
+        runId === "run-structured-env" && laneId === "structured-env"
+          ? "runner setup rejected the environment"
+          : null,
+    });
+    const handle = await runtime.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd,
+      lanes: [
+        { laneId: "structured-env", steps: 1, stepDelaySeconds: -1 },
+      ],
+    });
+    await runtime.confirmLaneStarted(handle.runId, "structured-env");
+    await runtime.awaitLane(handle.runId, "structured-env", 1_000);
+
+    const lane = (await ledger.load(handle.runId))!.lanes["structured-env"]!;
+    const evidence = JSON.parse(await readFile(lane.evidenceFile!, "utf8"));
+    expect(await readFile(lane.stderrFile, "utf8")).toContain("sleep");
+    expect(evidence.environmentFailure).toBe(
+      "runner setup rejected the environment",
+    );
+    expect(evidence.executionTimeout).toBeNull();
     expect(lane.verificationState).toBe("failed");
   });
 
@@ -1176,7 +967,8 @@ describe("persisted terminal lane facts", () => {
       termination: "failed_to_start",
       signal: null,
       failure: "fake: runInPane failed",
-      environmentFailure: null,
+      environmentFailure: "fake: runInPane failed",
+      executionTimeout: null,
       exitCode: null,
     });
     const events = (

@@ -114,13 +114,6 @@ function runnerTermination(lane: LaneView): Pick<
   }
 }
 
-function firstNonEmptyLine(output: string): string | null {
-  for (const line of output.split("\n")) {
-    if (line.trim().length > 0) return line;
-  }
-  return null;
-}
-
 /**
  * Raised after durable run creation when pre-dispatch registration or physical
  * dispatch fails. Any lanes that did start remain controllable via `runId`.
@@ -143,9 +136,6 @@ export class WorkflowRuntime {
   private readonly pendingTransitions = new Map<string, Promise<void>>();
   private readonly commitTails = new Map<string, Promise<void>>();
   private readonly leases = new Map<string, LeaseHandle>();
-  private readonly activeLaneWaits = new Map<string, number>();
-  private readonly evidenceSyncTails = new Map<string, Promise<void>>();
-  private readonly evidenceSyncFailures = new Set<string>();
 
   constructor(protected readonly deps: RuntimeDeps) {}
 
@@ -410,6 +400,7 @@ export class WorkflowRuntime {
       state: laneState(lane),
       exitCode: lane.exitCode ?? parsedExit,
       waitMatched: lane.waitMatched,
+      timedOut: false,
       sentinelToken: lane.sentinelToken,
       outputTail: tail,
     };
@@ -440,27 +431,8 @@ export class WorkflowRuntime {
     laneId: string,
     timeoutMs: number,
   ): Promise<LaneResult> {
-    this.activeLaneWaits.set(
-      runId,
-      (this.activeLaneWaits.get(runId) ?? 0) + 1,
-    );
-    try {
-      return await this.awaitLaneObserved(runId, laneId, timeoutMs);
-    } finally {
-      const remaining = (this.activeLaneWaits.get(runId) ?? 1) - 1;
-      if (remaining === 0) this.activeLaneWaits.delete(runId);
-      else this.activeLaneWaits.set(runId, remaining);
-      await this.releaseControllerLeaseIfFactsComplete(runId);
-    }
-  }
-
-  private async awaitLaneObserved(
-    runId: string,
-    laneId: string,
-    timeoutMs: number,
-  ): Promise<LaneResult> {
     await this.flushPending(runId);
-    let lane = this.getLane(this.getRun(runId), laneId);
+    const lane = this.getLane(this.getRun(runId), laneId);
     if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
       await this.finishIfTerminal(runId);
       await this.recordTerminalFacts(runId, laneId, lane.exitCode);
@@ -480,23 +452,9 @@ export class WorkflowRuntime {
         );
       }
       await this.finalizeLane(runId, laneId, outcome.matched);
-      lane = this.getLane(this.getRun(runId), laneId);
-    } else if (outcome.timedOut) {
-      const updated = await this.commitEventConditionally(runId, (current) => {
-        if (!current) throw new Error(`unknown runId "${runId}"`);
-        this.getLane(current, laneId);
-        return {
-          type: "lane_wait_timed_out",
-          actor: "runtime",
-          laneId,
-          data: { timeoutMs },
-        };
-      });
-      if (updated) {
-        await this.syncEvidenceObservationTimeouts(runId, laneId);
-      }
     }
-    return this.inspectLaneResult(runId, laneId);
+    const result = await this.inspectLaneResult(runId, laneId);
+    return { ...result, timedOut: outcome.timedOut };
   }
 
   async confirmLaneStarted(
@@ -788,8 +746,14 @@ export class WorkflowRuntime {
     });
 
     const terminalLane = this.getLane(this.getRun(runId), laneId);
-    const stderrOutput = await readFile(terminalLane.stderrFile, "utf8");
     const termination = runnerTermination(terminalLane);
+    const reportedEnvironmentFailure =
+      (await this.deps.runnerEnvironmentFailure?.(runId, laneId)) ?? null;
+    const environmentFailure =
+      reportedEnvironmentFailure ??
+      (terminalLane.runtimeState === "failed_to_start"
+        ? terminalLane.startRejection
+        : null);
     const evidence: RunnerEvidence = {
       schemaVersion: 1,
       runId,
@@ -802,8 +766,8 @@ export class WorkflowRuntime {
       completedAt: terminalLane.completedAt,
       exitCode: parsedExitCode,
       signal: terminalLane.signal,
-      environmentFailure: firstNonEmptyLine(stderrOutput),
-      observationTimeouts: terminalLane.observationTimeouts,
+      environmentFailure,
+      executionTimeout: null,
       ...termination,
     };
     await mkdir(dirname(evidenceFile), { recursive: true });
@@ -833,44 +797,7 @@ export class WorkflowRuntime {
         },
       };
     });
-    await this.syncEvidenceObservationTimeouts(runId, laneId);
     await this.releaseControllerLeaseIfFactsComplete(runId);
-  }
-
-  private async syncEvidenceObservationTimeouts(
-    runId: string,
-    laneId: string,
-  ): Promise<void> {
-    const key = `${runId}:${laneId}`;
-    const prior = this.evidenceSyncTails.get(key) ?? Promise.resolve();
-    const sync = prior.then(async () => {
-      const lane = this.getLane(this.getRun(runId), laneId);
-      if (lane.evidenceFile === null) return;
-      const evidence = JSON.parse(
-        await readFile(lane.evidenceFile, "utf8"),
-      ) as RunnerEvidence;
-      if (evidence.observationTimeouts === lane.observationTimeouts) return;
-      await this.writeRunnerEvidenceFile(lane.evidenceFile, {
-        ...evidence,
-        observationTimeouts: lane.observationTimeouts,
-      });
-    });
-    const tail = sync.then(
-      () => undefined,
-      () => undefined,
-    );
-    this.evidenceSyncTails.set(key, tail);
-    try {
-      await sync;
-      this.evidenceSyncFailures.delete(key);
-    } catch (error) {
-      this.evidenceSyncFailures.add(key);
-      throw error;
-    } finally {
-      if (this.evidenceSyncTails.get(key) === tail) {
-        this.evidenceSyncTails.delete(key);
-      }
-    }
   }
 
   protected async writeRunnerEvidenceFile(
@@ -903,18 +830,6 @@ export class WorkflowRuntime {
   ): Promise<void> {
     const run = this.getRun(runId);
     if (run.finishStatus === null) return;
-    if ((this.activeLaneWaits.get(runId) ?? 0) > 0) return;
-    const evidenceKeyPrefix = `${runId}:`;
-    if (
-      [...this.evidenceSyncTails.keys()].some((key) =>
-        key.startsWith(evidenceKeyPrefix),
-      ) ||
-      [...this.evidenceSyncFailures].some((key) =>
-        key.startsWith(evidenceKeyPrefix),
-      )
-    ) {
-      return;
-    }
     const factsComplete = run.laneOrder.every((laneId) => {
       const lane = this.getLane(run, laneId);
       return (

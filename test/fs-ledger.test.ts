@@ -179,6 +179,79 @@ class SnapshotWriteFailureLedger extends FsLedger {
   }
 }
 
+class BlockingAppendLedger extends FsLedger {
+  private resolveExposed!: () => void;
+  private releaseAppend!: () => void;
+  readonly exposed = new Promise<void>((resolve) => {
+    this.resolveExposed = resolve;
+  });
+  private readonly appendRelease = new Promise<void>((resolve) => {
+    this.releaseAppend = resolve;
+  });
+
+  protected override async appendAndSync(
+    handle: FileHandle,
+    contents: string,
+  ): Promise<void> {
+    await handle.writeFile(contents, "utf8");
+    this.resolveExposed();
+    await this.appendRelease;
+    await handle.sync();
+  }
+
+  release(): void {
+    this.releaseAppend();
+  }
+}
+
+class RollbackAfterReplayLedger extends FsLedger {
+  private resolveExposed!: () => void;
+  private allowRollback!: () => void;
+  readonly exposed = new Promise<void>((resolve) => {
+    this.resolveExposed = resolve;
+  });
+  private readonly rollbackAllowed = new Promise<void>((resolve) => {
+    this.allowRollback = resolve;
+  });
+
+  protected override async appendAndSync(
+    handle: FileHandle,
+    contents: string,
+  ): Promise<void> {
+    await handle.writeFile(contents, "utf8");
+    this.resolveExposed();
+    await this.rollbackAllowed;
+    throw new Error("injected append failure after reader replay");
+  }
+
+  finishRejectedAppend(): void {
+    this.allowRollback();
+  }
+}
+
+class InterleavedReaderLedger extends FsLedger {
+  private beforeReplaySeen = false;
+
+  constructor(
+    root: string,
+    private readonly beforeReplay: () => Promise<void>,
+    private readonly afterReplay: () => Promise<void> = async () => {},
+  ) {
+    super(root);
+  }
+
+  protected override async afterStableReadPhase(
+    _runId: string,
+    phase: "before-replay" | "after-replay",
+  ): Promise<void> {
+    if (phase === "before-replay" && !this.beforeReplaySeen) {
+      this.beforeReplaySeen = true;
+      await this.beforeReplay();
+    }
+    if (phase === "after-replay") await this.afterReplay();
+  }
+}
+
 describe("FsLedger public capabilities", () => {
   test("append, load, and list round-trip through the shared reducer", async () => {
     const ledger = new FsLedger(await tempRoot());
@@ -383,6 +456,65 @@ describe("FsLedger public capabilities", () => {
       pid: 202,
     });
     await expect(second.release()).resolves.toBeUndefined();
+  });
+
+  test("load never returns an event exposed inside an active commit", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root).commit(started());
+    const writer = new BlockingAppendLedger(root);
+    let commit!: Promise<void>;
+    const reader = new InterleavedReaderLedger(root, async () => {
+      commit = writer.commit(registered());
+      await writer.exposed;
+    });
+
+    await expect(reader.load("run-fs")).rejects.toThrow(
+      /stable committed view/,
+    );
+    writer.release();
+    await commit;
+
+    expect((await new FsLedger(root).load("run-fs"))!.lastAppliedSequence).toBe(
+      2,
+    );
+  });
+
+  test("load detects marker ABA and never returns a rolled-back event", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root).commit(started());
+    const writer = new RollbackAfterReplayLedger(root);
+    let commit!: Promise<void>;
+    let commitSettled!: Promise<void>;
+    const reader = new InterleavedReaderLedger(
+      root,
+      async () => {
+        commit = writer.commit(registered());
+        commitSettled = commit.catch(() => {});
+        await writer.exposed;
+      },
+      async () => {
+        writer.finishRejectedAppend();
+        await commitSettled;
+      },
+    );
+
+    const loaded = await reader.load("run-fs");
+    await expect(commit).rejects.toThrow(/failure after reader replay/);
+    expect(loaded!.lastAppliedSequence).toBe(1);
+    expect((await new FsLedger(root).load("run-fs"))!.lastAppliedSequence).toBe(
+      1,
+    );
+  });
+
+  test("a normal commit is loadable through a fresh stable reader", async () => {
+    const root = await tempRoot();
+    const writer = new FsLedger(root);
+    await writer.commit(started());
+    await writer.commit(registered());
+
+    expect((await new FsLedger(root).load("run-fs"))!.lastAppliedSequence).toBe(
+      2,
+    );
   });
 
   test("write-ahead intent failure forbids the event append", async () => {

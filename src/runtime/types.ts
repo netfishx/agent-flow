@@ -71,6 +71,8 @@ export interface LaneResult {
    * separately from the durable log.
    */
   readonly waitMatched: boolean;
+  /** Whether this await call exhausted its observation window. */
+  readonly timedOut: boolean;
   /** The run+lane-specific completion token (logical; contains no pane id). */
   readonly sentinelToken: string;
   readonly outputTail: readonly string[];
@@ -131,6 +133,11 @@ export interface RuntimeDeps {
   readonly readResultFile: (path: string) => Promise<string>;
   /** Builds the exact command persisted at the physical dispatch boundary. */
   readonly laneCommandBuilder?: (input: LaneCommandInput) => string;
+  /** Structured environment/setup failure reported by the runner, if any. */
+  readonly runnerEnvironmentFailure?: (
+    runId: string,
+    laneId: string,
+  ) => string | null | Promise<string | null>;
   /** Real delay for settle/poll waits; a no-op in deterministic tests. */
   readonly sleep?: (ms: number) => Promise<void>;
   /** How long to confirm a lane's process has exited after its sentinel (default 2000ms). */

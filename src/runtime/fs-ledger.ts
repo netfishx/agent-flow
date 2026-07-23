@@ -28,8 +28,17 @@ interface ReplayResult {
   readonly needsLeadingNewline: boolean;
 }
 
+interface CommitState {
+  readonly schemaVersion: 1;
+  readonly generation: number;
+  readonly state: "idle" | "writing";
+}
+
 let snapshotSequence = 0;
+let commitStateSequence = 0;
 const COMMIT_INTENT_FILE = "commit-intent.json";
+const COMMIT_STATE_FILE = "commit-state.json";
+const STABLE_READ_ATTEMPTS = 3;
 
 export function resolveLedgerRoot(environment = process.env): string {
   const configured = environment.FLOW_LEDGER_ROOT;
@@ -130,8 +139,7 @@ export class FsLedger implements Ledger {
     if (root.length === 0) throw new Error("FsLedger root must not be empty");
     internalRegisterCommittedEventReader(this, async (runId) => {
       assertHandleId("runId", runId);
-      await this.assertNoCommitIntent(runId);
-      const replayed = await replayFile(join(this.runDir(runId), "events.jsonl"));
+      const replayed = await this.readStableReplay(runId);
       return replayed.events.map((event) => structuredClone(event));
     });
   }
@@ -140,24 +148,46 @@ export class FsLedger implements Ledger {
     assertHandleId("runId", event.runId);
     const prior = this.commitTails.get(event.runId) ?? Promise.resolve();
     const commit = prior.then(async () => {
-      await this.assertNoCommitIntent(event.runId);
       const runDir = this.runDir(event.runId);
       const eventFile = join(runDir, "events.jsonl");
-      const replayed = await replayFile(eventFile);
+      const replayed = await this.readStableReplay(event.runId);
       const duplicate = replayed.byEventId.get(event.eventId);
       if (duplicate) {
-        if (isDeepStrictEqual(duplicate, event)) {
-          await this.truncateTrailingPartial(eventFile, replayed);
-          return;
+        if (!isDeepStrictEqual(duplicate, event)) {
+          throw new Error(
+            `eventId "${event.eventId}" already exists with a different payload`,
+          );
         }
-        throw new Error(
-          `eventId "${event.eventId}" already exists with a different payload`,
-        );
       }
 
-      const next = reduce(replayed.view ?? undefined, event);
+      const next = duplicate
+        ? replayed.view
+        : reduce(replayed.view ?? undefined, event);
       await mkdir(runDir, { recursive: true });
-      const snapshotTemp = await this.writeSnapshotTemp(runDir, next);
+      const writingState = await this.enterCommitState(runDir, event.runId);
+      if (duplicate) {
+        try {
+          await this.truncateTrailingPartial(eventFile, replayed);
+        } finally {
+          await this.leaveCommitState(runDir, writingState);
+        }
+        return;
+      }
+      if (!next) throw new Error("commit reducer produced no run view");
+      let snapshotTemp: string;
+      try {
+        snapshotTemp = await this.writeSnapshotTemp(runDir, next);
+      } catch (snapshotError) {
+        try {
+          await this.leaveCommitState(runDir, writingState);
+        } catch (stateError) {
+          throw new Error(
+            `snapshot write failed: ${errorMessage(snapshotError)}; commit state cleanup failed: ${errorMessage(stateError)}`,
+            { cause: snapshotError },
+          );
+        }
+        throw snapshotError;
+      }
       try {
         await this.writeCommitIntent(runDir, {
           eventId: event.eventId,
@@ -165,6 +195,17 @@ export class FsLedger implements Ledger {
         });
       } catch (error) {
         await unlink(snapshotTemp).catch(() => {});
+        try {
+          await this.clearCommitIntent(runDir);
+        } catch (cleanupError) {
+          if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") {
+            throw new Error(
+              `commit intent write failed: ${errorMessage(error)}; marker cleanup failed: ${errorMessage(cleanupError)}`,
+              { cause: error },
+            );
+          }
+        }
+        await this.leaveCommitState(runDir, writingState);
         throw error;
       }
 
@@ -182,6 +223,7 @@ export class FsLedger implements Ledger {
               { cause: openError },
             );
           }
+          await this.leaveCommitState(runDir, writingState);
           throw openError;
         }
         const currentSize = (await handle.stat()).size;
@@ -220,6 +262,7 @@ export class FsLedger implements Ledger {
               { cause: appendError },
             );
           }
+          await this.leaveCommitState(runDir, writingState);
           throw appendError;
         }
       } catch (error) {
@@ -241,6 +284,14 @@ export class FsLedger implements Ledger {
         // The durable append is already the commit point. Resolving here keeps
         // the event from becoming rejected-but-readable; if the marker still
         // exists, later readers conservatively refuse the run.
+        return;
+      }
+      try {
+        await this.leaveCommitState(runDir, writingState);
+      } catch {
+        // The event is durably committed and the persisted state remains
+        // "writing". Readers fail closed until repair rather than allowing a
+        // rejected event to become visible after this promise settles.
       }
     });
     const tail = commit.then(
@@ -258,8 +309,7 @@ export class FsLedger implements Ledger {
 
   async load(runId: string): Promise<RunView | null> {
     assertHandleId("runId", runId);
-    await this.assertNoCommitIntent(runId);
-    return (await replayFile(join(this.runDir(runId), "events.jsonl"))).view;
+    return (await this.readStableReplay(runId)).view;
   }
 
   async list(): Promise<{ runId: string }[]> {
@@ -350,6 +400,153 @@ export class FsLedger implements Ledger {
     contents: string,
   ): Promise<void> {
     await writeFile(path, contents, "utf8");
+  }
+
+  private async readStableReplay(runId: string): Promise<ReplayResult> {
+    const eventFile = join(this.runDir(runId), "events.jsonl");
+    let lastReason = "commit state changed during replay";
+    for (let attempt = 0; attempt < STABLE_READ_ATTEMPTS; attempt++) {
+      const before = await this.readCommitState(runId);
+      if (before.state !== "idle") {
+        lastReason = `generation ${before.generation} is writing`;
+        continue;
+      }
+      try {
+        await this.assertNoCommitIntent(runId);
+      } catch (error) {
+        lastReason = errorMessage(error);
+        continue;
+      }
+      await this.afterStableReadPhase(runId, "before-replay");
+      const replayed = await replayFile(eventFile);
+      await this.afterStableReadPhase(runId, "after-replay");
+      const after = await this.readCommitState(runId);
+      try {
+        await this.assertNoCommitIntent(runId);
+      } catch (error) {
+        lastReason = errorMessage(error);
+        continue;
+      }
+      if (
+        after.state === "idle" &&
+        after.generation === before.generation
+      ) {
+        return replayed;
+      }
+      lastReason = `generation changed from ${before.generation}/${before.state} to ${after.generation}/${after.state}`;
+    }
+    throw new Error(
+      `run "${runId}" has an ambiguous commit: cannot obtain a stable committed view; ${lastReason}`,
+    );
+  }
+
+  /** Test seam for deterministically interleaving a public load with a commit. */
+  protected async afterStableReadPhase(
+    _runId: string,
+    _phase: "before-replay" | "after-replay",
+  ): Promise<void> {}
+
+  private async readCommitState(runId: string): Promise<CommitState> {
+    const path = join(this.runDir(runId), COMMIT_STATE_FILE);
+    let contents: string;
+    try {
+      contents = await readFile(path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return { schemaVersion: 1, generation: 0, state: "idle" };
+      }
+      throw new Error(`cannot read commit state for run "${runId}"`, {
+        cause: error,
+      });
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(contents);
+    } catch (error) {
+      throw new Error(`corrupt commit state for run "${runId}"`, {
+        cause: error,
+      });
+    }
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      (parsed as { schemaVersion?: unknown }).schemaVersion !== 1 ||
+      !Number.isSafeInteger((parsed as { generation?: unknown }).generation) ||
+      ((parsed as { generation: number }).generation < 0) ||
+      ((parsed as { state?: unknown }).state !== "idle" &&
+        (parsed as { state?: unknown }).state !== "writing")
+    ) {
+      throw new Error(`corrupt commit state for run "${runId}"`);
+    }
+    const state = parsed as CommitState;
+    if (
+      (state.state === "idle" && state.generation % 2 !== 0) ||
+      (state.state === "writing" && state.generation % 2 !== 1)
+    ) {
+      throw new Error(`corrupt commit state for run "${runId}"`);
+    }
+    return state;
+  }
+
+  private async enterCommitState(
+    runDir: string,
+    runId: string,
+  ): Promise<CommitState> {
+    const current = await this.readCommitState(runId);
+    if (current.state !== "idle") {
+      throw new Error(
+        `run "${runId}" has an ambiguous commit at generation ${current.generation}`,
+      );
+    }
+    await this.assertNoCommitIntent(runId);
+    const writing: CommitState = {
+      schemaVersion: 1,
+      generation: current.generation + 1,
+      state: "writing",
+    };
+    await this.writeCommitState(runDir, writing);
+    return writing;
+  }
+
+  private async leaveCommitState(
+    runDir: string,
+    writing: CommitState,
+  ): Promise<void> {
+    await this.writeCommitState(runDir, {
+      schemaVersion: 1,
+      generation: writing.generation + 1,
+      state: "idle",
+    });
+  }
+
+  protected async writeCommitState(
+    runDir: string,
+    state: CommitState,
+  ): Promise<void> {
+    const target = join(runDir, COMMIT_STATE_FILE);
+    const temp = join(
+      runDir,
+      `.${COMMIT_STATE_FILE}.tmp-${process.pid}-${++commitStateSequence}`,
+    );
+    let handle: FileHandle | undefined;
+    try {
+      handle = await open(temp, "wx");
+      await handle.writeFile(`${JSON.stringify(state, null, 2)}\n`, "utf8");
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      await rename(temp, target);
+      const directory = await open(runDir, "r");
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
+    } catch (error) {
+      await handle?.close().catch(() => {});
+      await unlink(temp).catch(() => {});
+      throw error;
+    }
   }
 
   private async assertNoCommitIntent(runId: string): Promise<void> {

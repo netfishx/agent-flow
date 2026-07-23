@@ -38,7 +38,6 @@ export interface LaneView {
   readonly exitCode: number | null;
   readonly signal: string | null;
   readonly waitMatched: boolean;
-  readonly observationTimeouts: number;
   readonly checkpointFile: string | null;
   readonly resultFile: string | null;
   readonly contractErrors: readonly string[];
@@ -271,7 +270,6 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         exitCode: null,
         signal: null,
         waitMatched: false,
-        observationTimeouts: 0,
         checkpointFile: null,
         resultFile: null,
         contractErrors: [],
@@ -320,16 +318,6 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
           ...lane,
           runtimeState: "running",
           liveAt: event.at,
-        };
-      });
-    case "lane_wait_timed_out":
-      return withLane(state, event, (lane) => {
-        if (lane.dispatchedAt === null) {
-          throw new Error("lane_wait_timed_out requires a dispatched lane");
-        }
-        return {
-          ...lane,
-          observationTimeouts: lane.observationTimeouts + 1,
         };
       });
     case "lane_checkpoint":
