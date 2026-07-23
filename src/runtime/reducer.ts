@@ -14,6 +14,7 @@ export interface LaneView {
   readonly laneId: string;
   readonly paneId: string;
   readonly logFile: string;
+  readonly stderrFile: string;
   readonly sentinelToken: string;
   readonly steps: number;
   readonly stepDelaySeconds: number;
@@ -37,6 +38,7 @@ export interface LaneView {
   readonly exitCode: number | null;
   readonly signal: string | null;
   readonly waitMatched: boolean;
+  readonly observationTimeouts: number;
   readonly checkpointFile: string | null;
   readonly resultFile: string | null;
   readonly contractErrors: readonly string[];
@@ -154,6 +156,48 @@ function withRun(state: RunView, event: RunEvent, patch: Partial<RunView>): RunV
   };
 }
 
+export function projectRunOutcomeBreakdown(
+  state: RunView,
+): RunOutcomeBreakdown {
+  const lanes = state.laneOrder.map((laneId) => state.lanes[laneId]!);
+  return {
+    exitedZero: lanes.filter(
+      (lane) => lane.runtimeState === "exited" && lane.exitCode === 0,
+    ).length,
+    exitedNonZero: lanes.filter(
+      (lane) => lane.runtimeState === "exited" && lane.exitCode !== 0,
+    ).length,
+    crashed: lanes.filter((lane) => lane.runtimeState === "crashed").length,
+    lost: lanes.filter((lane) => lane.runtimeState === "lost").length,
+    failedToStart: lanes.filter(
+      (lane) => lane.runtimeState === "failed_to_start",
+    ).length,
+  };
+}
+
+function sameBreakdown(
+  left: RunOutcomeBreakdown,
+  right: RunOutcomeBreakdown,
+): boolean {
+  const keys = [
+    "exitedZero",
+    "exitedNonZero",
+    "crashed",
+    "lost",
+    "failedToStart",
+  ] as const;
+  const actualKeys = Object.keys(left);
+  return (
+    actualKeys.length === keys.length &&
+    keys.every((key) => actualKeys.includes(key)) &&
+    left.exitedZero === right.exitedZero &&
+    left.exitedNonZero === right.exitedNonZero &&
+    left.crashed === right.crashed &&
+    left.lost === right.lost &&
+    left.failedToStart === right.failedToStart
+  );
+}
+
 export function reduce(state: RunView | undefined, event: RunEvent): RunView {
   const expectedSequence = (state?.lastAppliedSequence ?? 0) + 1;
   if (event.sequence !== expectedSequence) {
@@ -227,6 +271,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         exitCode: null,
         signal: null,
         waitMatched: false,
+        observationTimeouts: 0,
         checkpointFile: null,
         resultFile: null,
         contractErrors: [],
@@ -275,6 +320,16 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
           ...lane,
           runtimeState: "running",
           liveAt: event.at,
+        };
+      });
+    case "lane_wait_timed_out":
+      return withLane(state, event, (lane) => {
+        if (lane.dispatchedAt === null) {
+          throw new Error("lane_wait_timed_out requires a dispatched lane");
+        }
+        return {
+          ...lane,
+          observationTimeouts: lane.observationTimeouts + 1,
         };
       });
     case "lane_checkpoint":
@@ -379,15 +434,34 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
           pid: event.data.pid,
         },
       });
-    case "run_finished":
+    case "run_finished": {
       if (state.finishStatus !== null) {
         throw new Error("duplicate run_finished");
+      }
+      if (state.laneOrder.length === 0) {
+        throw new Error("run_finished requires at least one lane");
+      }
+      const lanes = state.laneOrder.map((laneId) => state.lanes[laneId]!);
+      if (!lanes.every((lane) => TERMINAL_RUNTIME.has(lane.runtimeState))) {
+        throw new Error("run_finished requires every lane to be runtime-terminal");
+      }
+      const breakdown = projectRunOutcomeBreakdown(state);
+      if (!sameBreakdown(event.data.breakdown, breakdown)) {
+        throw new Error("run_finished breakdown does not match current lane states");
+      }
+      const expectedStatus =
+        breakdown.exitedZero === lanes.length ? "clean" : "degraded";
+      if (event.data.status !== expectedStatus) {
+        throw new Error(
+          `run_finished status must be "${expectedStatus}" for current lane states`,
+        );
       }
       return withRun(state, event, {
         finishedAt: event.at,
         finishStatus: event.data.status,
         breakdown: { ...event.data.breakdown },
       });
+    }
     default:
       return assertNever(event);
   }

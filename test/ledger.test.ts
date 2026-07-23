@@ -37,6 +37,7 @@ const events: RunEvent[] = [
       laneId: "lane-1",
       paneId: "w1:p2",
       logFile: "/tmp/lane-1.log",
+      stderrFile: "/tmp/lane-1.stderr.log",
       sentinelToken: "FLOW_run-ledger_LANE_lane-1_EXIT",
       steps: 1,
       stepDelaySeconds: 0,

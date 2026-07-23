@@ -29,7 +29,7 @@ interface ReplayResult {
 }
 
 let snapshotSequence = 0;
-const POISON_FILE = "poison.json";
+const COMMIT_INTENT_FILE = "commit-intent.json";
 
 export function resolveLedgerRoot(environment = process.env): string {
   const configured = environment.FLOW_LEDGER_ROOT;
@@ -125,13 +125,12 @@ async function replayFile(path: string): Promise<ReplayResult> {
 
 export class FsLedger implements Ledger {
   private readonly commitTails = new Map<string, Promise<void>>();
-  private readonly poisonedRuns = new Map<string, Error>();
 
   constructor(private readonly root: string) {
     if (root.length === 0) throw new Error("FsLedger root must not be empty");
     internalRegisterCommittedEventReader(this, async (runId) => {
       assertHandleId("runId", runId);
-      await this.assertRunNotPoisoned(runId);
+      await this.assertNoCommitIntent(runId);
       const replayed = await replayFile(join(this.runDir(runId), "events.jsonl"));
       return replayed.events.map((event) => structuredClone(event));
     });
@@ -139,17 +138,9 @@ export class FsLedger implements Ledger {
 
   commit(event: RunEvent): Promise<void> {
     assertHandleId("runId", event.runId);
-    const poisoned = this.poisonedRuns.get(event.runId);
-    if (poisoned) {
-      return Promise.reject(this.poisonedRunError(event.runId, poisoned));
-    }
     const prior = this.commitTails.get(event.runId) ?? Promise.resolve();
     const commit = prior.then(async () => {
-      const queuedPoison = this.poisonedRuns.get(event.runId);
-      if (queuedPoison) {
-        throw this.poisonedRunError(event.runId, queuedPoison);
-      }
-      await this.assertRunNotPoisoned(event.runId);
+      await this.assertNoCommitIntent(event.runId);
       const runDir = this.runDir(event.runId);
       const eventFile = join(runDir, "events.jsonl");
       const replayed = await replayFile(eventFile);
@@ -167,19 +158,42 @@ export class FsLedger implements Ledger {
       const next = reduce(replayed.view ?? undefined, event);
       await mkdir(runDir, { recursive: true });
       const snapshotTemp = await this.writeSnapshotTemp(runDir, next);
-      let handle;
       try {
-        handle = await open(eventFile, "a+");
+        await this.writeCommitIntent(runDir, {
+          eventId: event.eventId,
+          lastValidByteLength: replayed.validByteLength,
+        });
+      } catch (error) {
+        await unlink(snapshotTemp).catch(() => {});
+        throw error;
+      }
+
+      let handle: FileHandle | undefined;
+      try {
+        try {
+          handle = await open(eventFile, "a+");
+        } catch (openError) {
+          await unlink(snapshotTemp).catch(() => {});
+          try {
+            await this.clearCommitIntent(runDir);
+          } catch (cleanupError) {
+            throw new Error(
+              `event file open failed: ${errorMessage(openError)}; marker cleanup failed: ${errorMessage(cleanupError)}`,
+              { cause: openError },
+            );
+          }
+          throw openError;
+        }
         const currentSize = (await handle.stat()).size;
         if (currentSize < replayed.validByteLength) {
           throw new Error(`event stream "${eventFile}" changed during commit`);
         }
-        if (currentSize > replayed.validByteLength) {
-          await handle.truncate(replayed.validByteLength);
-          await handle.sync();
-        }
         const originalSize = replayed.validByteLength;
         try {
+          if (currentSize > originalSize) {
+            await handle.truncate(originalSize);
+            await handle.sync();
+          }
           const separator = replayed.needsLeadingNewline ? "\n" : "";
           await this.appendAndSync(
             handle,
@@ -193,19 +207,18 @@ export class FsLedger implements Ledger {
               `event append failed: ${errorMessage(appendError)}; rollback failed: ${errorMessage(rollbackError)}`,
               { cause: appendError },
             );
-            this.poisonedRuns.set(event.runId, compound);
-            try {
-              await this.writePoisonMarker(runDir, {
-                appendFailure: errorMessage(appendError),
-                rollbackFailure: errorMessage(rollbackError),
-                lastValidByteLength: originalSize,
-              });
-            } catch {
-              // If even the poison marker cannot be persisted (for example, a
-              // total disk failure), another process can still see the orphan
-              // line. #15 recovery owns that residual cross-process window.
-            }
+            // The write-ahead marker is intentionally retained. A fresh
+            // process will refuse the run rather than replay the orphan.
             throw compound;
+          }
+          await unlink(snapshotTemp).catch(() => {});
+          try {
+            await this.clearCommitIntent(runDir);
+          } catch (cleanupError) {
+            throw new Error(
+              `event append failed: ${errorMessage(appendError)}; marker cleanup failed: ${errorMessage(cleanupError)}`,
+              { cause: appendError },
+            );
           }
           throw appendError;
         }
@@ -221,6 +234,13 @@ export class FsLedger implements Ledger {
         await rename(snapshotTemp, join(runDir, "run.json"));
       } catch {
         await unlink(snapshotTemp).catch(() => {});
+      }
+      try {
+        await this.clearCommitIntent(runDir);
+      } catch {
+        // The durable append is already the commit point. Resolving here keeps
+        // the event from becoming rejected-but-readable; if the marker still
+        // exists, later readers conservatively refuse the run.
       }
     });
     const tail = commit.then(
@@ -238,7 +258,7 @@ export class FsLedger implements Ledger {
 
   async load(runId: string): Promise<RunView | null> {
     assertHandleId("runId", runId);
-    await this.assertRunNotPoisoned(runId);
+    await this.assertNoCommitIntent(runId);
     return (await replayFile(join(this.runDir(runId), "events.jsonl"))).view;
   }
 
@@ -332,46 +352,51 @@ export class FsLedger implements Ledger {
     await writeFile(path, contents, "utf8");
   }
 
-  private async assertRunNotPoisoned(runId: string): Promise<void> {
-    const instancePoison = this.poisonedRuns.get(runId);
-    if (instancePoison) throw this.poisonedRunError(runId, instancePoison);
-    const path = join(this.runDir(runId), POISON_FILE);
+  private async assertNoCommitIntent(runId: string): Promise<void> {
+    const path = join(this.runDir(runId), COMMIT_INTENT_FILE);
     let marker: string;
     try {
       marker = await readFile(path, "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-      throw new Error(`cannot verify poison state for run "${runId}"`, {
+      throw new Error(`cannot verify commit intent for run "${runId}"`, {
         cause: error,
       });
     }
     throw new Error(
-      `run "${runId}" is poisoned after an unrecoverable append rollback failure: ${marker.trim() || "poison marker present"}`,
+      `run "${runId}" has an ambiguous commit: ${marker.trim() || "commit intent marker present"}`,
     );
   }
 
-  private async writePoisonMarker(
+  protected async writeCommitIntent(
     runDir: string,
-    failure: {
-      appendFailure: string;
-      rollbackFailure: string;
+    intent: {
+      eventId: string;
       lastValidByteLength: number;
     },
   ): Promise<void> {
-    const path = join(runDir, POISON_FILE);
+    const path = join(runDir, COMMIT_INTENT_FILE);
     let handle: FileHandle | undefined;
     try {
       handle = await open(path, "wx");
       await handle.writeFile(
-        `${JSON.stringify({ schemaVersion: 1, ...failure }, null, 2)}\n`,
+        `${JSON.stringify({ schemaVersion: 1, ...intent }, null, 2)}\n`,
         "utf8",
       );
       await handle.sync();
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     } finally {
       await handle?.close().catch(() => {});
     }
+    const directory = await open(runDir, "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
+  }
+
+  protected async clearCommitIntent(runDir: string): Promise<void> {
+    await unlink(join(runDir, COMMIT_INTENT_FILE));
     const directory = await open(runDir, "r");
     try {
       await directory.sync();
@@ -412,12 +437,5 @@ export class FsLedger implements Ledger {
       throw error;
     }
     return temp;
-  }
-
-  private poisonedRunError(runId: string, cause: Error): Error {
-    return new Error(
-      `run "${runId}" is poisoned after an unrecoverable append rollback failure`,
-      { cause },
-    );
   }
 }

@@ -8,7 +8,6 @@ import { dirname, join } from "node:path";
 import type {
   NewRunEvent,
   RunEvent,
-  RunOutcomeBreakdown,
   RunnerEvidence,
   RuntimeState,
 } from "./events.ts";
@@ -21,6 +20,7 @@ import {
 import { measured, REASONS, tokensUnavailable, unavailable } from "./metrics.ts";
 import {
   projectRunState,
+  projectRunOutcomeBreakdown,
   reduce,
   type LaneView,
   type RunView,
@@ -48,6 +48,7 @@ const TERMINAL_RUNTIME: ReadonlySet<RuntimeState> = new Set([
 
 interface LaneArtifactPaths {
   readonly logFile: string;
+  readonly stderrFile: string;
   readonly checkpointFile: string;
   readonly resultFile: string;
   readonly evidenceFile: string;
@@ -61,6 +62,7 @@ function laneArtifactPaths(
   const runDirectory = join(cwd, runId);
   return {
     logFile: join(runDirectory, "logs", `${laneId}.log`),
+    stderrFile: join(runDirectory, "logs", `${laneId}.stderr.log`),
     checkpointFile: join(runDirectory, "checkpoints", `${laneId}.md`),
     resultFile: join(runDirectory, "results", `${laneId}-result.txt`),
     evidenceFile: join(runDirectory, "evidence", `${laneId}-evidence.json`),
@@ -112,17 +114,9 @@ function runnerTermination(lane: LaneView): Pick<
   }
 }
 
-function firstEnvironmentFailure(output: string): string | null {
-  const knownLaneOutput = [
-    /^START run=[A-Za-z0-9-]+ lane=[A-Za-z0-9-]+ pid=\d+$/,
-    /^STEP=\d+\/\d+ lane=[A-Za-z0-9-]+$/,
-    /^STEP=\d+ EVENT=\S+$/,
-    /^FLOW_[A-Za-z0-9-]+_LANE_[A-Za-z0-9-]+_EXIT=-?\d+$/,
-    /^RESULT:.*$/,
-  ];
+function firstNonEmptyLine(output: string): string | null {
   for (const line of output.split("\n")) {
-    if (line.length === 0) continue;
-    if (!knownLaneOutput.some((format) => format.test(line))) return line;
+    if (line.trim().length > 0) return line;
   }
   return null;
 }
@@ -149,6 +143,9 @@ export class WorkflowRuntime {
   private readonly pendingTransitions = new Map<string, Promise<void>>();
   private readonly commitTails = new Map<string, Promise<void>>();
   private readonly leases = new Map<string, LeaseHandle>();
+  private readonly activeLaneWaits = new Map<string, number>();
+  private readonly evidenceSyncTails = new Map<string, Promise<void>>();
+  private readonly evidenceSyncFailures = new Set<string>();
 
   constructor(protected readonly deps: RuntimeDeps) {}
 
@@ -182,6 +179,10 @@ export class WorkflowRuntime {
       sentinelToken: string;
       stepDelaySeconds: number;
       artifacts: LaneArtifactPaths;
+    }> = [];
+    const dispatchPlan: Array<{
+      item: (typeof topology)[number];
+      command: string;
     }> = [];
     let previous = controllerPane;
     for (const spec of config.lanes) {
@@ -237,6 +238,7 @@ export class WorkflowRuntime {
             laneId: spec.laneId,
             paneId: item.pane.id,
             logFile: item.logFile,
+            stderrFile: item.artifacts.stderrFile,
             sentinelToken: item.sentinelToken,
             steps: spec.steps,
             stepDelaySeconds: item.stepDelaySeconds,
@@ -247,9 +249,25 @@ export class WorkflowRuntime {
       for (const item of topology) {
         await mkdir(dirname(item.logFile), { recursive: true });
         await writeFile(item.logFile, "", "utf8");
+        await writeFile(item.artifacts.stderrFile, "", "utf8");
       }
 
       await this.settle(config.startupSettleMs ?? 0);
+      for (const item of topology) {
+        dispatchPlan.push({
+          item,
+          command: (this.deps.laneCommandBuilder ?? buildLaneCommand)({
+            runId,
+            laneId: item.spec.laneId,
+            logFile: item.logFile,
+            stderrFile: item.artifacts.stderrFile,
+            checkpointFile: item.artifacts.checkpointFile,
+            resultFile: item.artifacts.resultFile,
+            steps: item.spec.steps,
+            stepDelaySeconds: item.stepDelaySeconds,
+          }),
+        });
+      }
     } catch (cause) {
       try {
         await this.releaseControllerLease(runId);
@@ -267,17 +285,8 @@ export class WorkflowRuntime {
     }
 
     const started: string[] = [];
-    for (let index = 0; index < topology.length; index++) {
-      const item = topology[index]!;
-      const command = (this.deps.laneCommandBuilder ?? buildLaneCommand)({
-        runId,
-        laneId: item.spec.laneId,
-        logFile: item.logFile,
-        checkpointFile: item.artifacts.checkpointFile,
-        resultFile: item.artifacts.resultFile,
-        steps: item.spec.steps,
-        stepDelaySeconds: item.stepDelaySeconds,
-      });
+    for (let index = 0; index < dispatchPlan.length; index++) {
+      const { item, command } = dispatchPlan[index]!;
       const dispatchedAt = this.deps.clock();
       try {
         await this.deps.adapter.runInPane(item.pane, command);
@@ -431,6 +440,25 @@ export class WorkflowRuntime {
     laneId: string,
     timeoutMs: number,
   ): Promise<LaneResult> {
+    this.activeLaneWaits.set(
+      runId,
+      (this.activeLaneWaits.get(runId) ?? 0) + 1,
+    );
+    try {
+      return await this.awaitLaneObserved(runId, laneId, timeoutMs);
+    } finally {
+      const remaining = (this.activeLaneWaits.get(runId) ?? 1) - 1;
+      if (remaining === 0) this.activeLaneWaits.delete(runId);
+      else this.activeLaneWaits.set(runId, remaining);
+      await this.releaseControllerLeaseIfFactsComplete(runId);
+    }
+  }
+
+  private async awaitLaneObserved(
+    runId: string,
+    laneId: string,
+    timeoutMs: number,
+  ): Promise<LaneResult> {
     await this.flushPending(runId);
     let lane = this.getLane(this.getRun(runId), laneId);
     if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
@@ -453,6 +481,20 @@ export class WorkflowRuntime {
       }
       await this.finalizeLane(runId, laneId, outcome.matched);
       lane = this.getLane(this.getRun(runId), laneId);
+    } else if (outcome.timedOut) {
+      const updated = await this.commitEventConditionally(runId, (current) => {
+        if (!current) throw new Error(`unknown runId "${runId}"`);
+        this.getLane(current, laneId);
+        return {
+          type: "lane_wait_timed_out",
+          actor: "runtime",
+          laneId,
+          data: { timeoutMs },
+        };
+      });
+      if (updated) {
+        await this.syncEvidenceObservationTimeouts(runId, laneId);
+      }
     }
     return this.inspectLaneResult(runId, laneId);
   }
@@ -746,31 +788,31 @@ export class WorkflowRuntime {
     });
 
     const terminalLane = this.getLane(this.getRun(runId), laneId);
-    const output =
-      terminalLane.dispatchedAt === null
-        ? ""
-        : await this.readDurable(terminalLane.logFile);
+    const stderrOutput = await readFile(terminalLane.stderrFile, "utf8");
     const termination = runnerTermination(terminalLane);
     const evidence: RunnerEvidence = {
       schemaVersion: 1,
       runId,
       laneId,
       command: terminalLane.dispatchedCommand,
-      logFile: terminalLane.logFile,
+      stdoutArtifact: terminalLane.logFile,
+      stderrArtifact: terminalLane.stderrFile,
       dispatchedAt: terminalLane.dispatchedAt,
       liveAt: terminalLane.liveAt,
       completedAt: terminalLane.completedAt,
       exitCode: parsedExitCode,
       signal: terminalLane.signal,
-      environmentFailure: firstEnvironmentFailure(output),
+      environmentFailure: firstNonEmptyLine(stderrOutput),
+      observationTimeouts: terminalLane.observationTimeouts,
       ...termination,
     };
     await mkdir(dirname(evidenceFile), { recursive: true });
-    await writeFile(evidenceFile, `${JSON.stringify(evidence, null, 2)}\n`, "utf8");
+    await this.writeRunnerEvidenceFile(evidenceFile, evidence);
     const evidenceComplete =
       evidence.command !== null &&
       evidence.command.length > 0 &&
-      evidence.logFile.length > 0 &&
+      evidence.stdoutArtifact.length > 0 &&
+      evidence.stderrArtifact.length > 0 &&
       evidence.dispatchedAt !== null &&
       evidence.liveAt !== null &&
       evidence.completedAt !== null &&
@@ -791,7 +833,51 @@ export class WorkflowRuntime {
         },
       };
     });
+    await this.syncEvidenceObservationTimeouts(runId, laneId);
     await this.releaseControllerLeaseIfFactsComplete(runId);
+  }
+
+  private async syncEvidenceObservationTimeouts(
+    runId: string,
+    laneId: string,
+  ): Promise<void> {
+    const key = `${runId}:${laneId}`;
+    const prior = this.evidenceSyncTails.get(key) ?? Promise.resolve();
+    const sync = prior.then(async () => {
+      const lane = this.getLane(this.getRun(runId), laneId);
+      if (lane.evidenceFile === null) return;
+      const evidence = JSON.parse(
+        await readFile(lane.evidenceFile, "utf8"),
+      ) as RunnerEvidence;
+      if (evidence.observationTimeouts === lane.observationTimeouts) return;
+      await this.writeRunnerEvidenceFile(lane.evidenceFile, {
+        ...evidence,
+        observationTimeouts: lane.observationTimeouts,
+      });
+    });
+    const tail = sync.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.evidenceSyncTails.set(key, tail);
+    try {
+      await sync;
+      this.evidenceSyncFailures.delete(key);
+    } catch (error) {
+      this.evidenceSyncFailures.add(key);
+      throw error;
+    } finally {
+      if (this.evidenceSyncTails.get(key) === tail) {
+        this.evidenceSyncTails.delete(key);
+      }
+    }
+  }
+
+  protected async writeRunnerEvidenceFile(
+    path: string,
+    evidence: RunnerEvidence,
+  ): Promise<void> {
+    await writeFile(path, `${JSON.stringify(evidence, null, 2)}\n`, "utf8");
   }
 
   private async finishIfTerminal(runId: string): Promise<void> {
@@ -802,19 +888,7 @@ export class WorkflowRuntime {
       if (!lanes.every((lane) => TERMINAL_RUNTIME.has(lane.runtimeState))) {
         return null;
       }
-      const breakdown: RunOutcomeBreakdown = {
-        exitedZero: lanes.filter(
-          (lane) => lane.runtimeState === "exited" && lane.exitCode === 0,
-        ).length,
-        exitedNonZero: lanes.filter(
-          (lane) => lane.runtimeState === "exited" && lane.exitCode !== 0,
-        ).length,
-        crashed: lanes.filter((lane) => lane.runtimeState === "crashed").length,
-        lost: lanes.filter((lane) => lane.runtimeState === "lost").length,
-        failedToStart: lanes.filter(
-          (lane) => lane.runtimeState === "failed_to_start",
-        ).length,
-      };
+      const breakdown = projectRunOutcomeBreakdown(run);
       const clean = breakdown.exitedZero === lanes.length;
       return {
         type: "run_finished",
@@ -829,6 +903,18 @@ export class WorkflowRuntime {
   ): Promise<void> {
     const run = this.getRun(runId);
     if (run.finishStatus === null) return;
+    if ((this.activeLaneWaits.get(runId) ?? 0) > 0) return;
+    const evidenceKeyPrefix = `${runId}:`;
+    if (
+      [...this.evidenceSyncTails.keys()].some((key) =>
+        key.startsWith(evidenceKeyPrefix),
+      ) ||
+      [...this.evidenceSyncFailures].some((key) =>
+        key.startsWith(evidenceKeyPrefix),
+      )
+    ) {
+      return;
+    }
     const factsComplete = run.laneOrder.every((laneId) => {
       const lane = this.getLane(run, laneId);
       return (

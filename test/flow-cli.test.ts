@@ -70,6 +70,7 @@ async function seedFinishedRun(
         laneId: "lane-1",
         paneId: "w1:p2",
         logFile: "/tmp/cli-run/lane.log",
+        stderrFile: "/tmp/cli-run/lane.stderr.log",
         sentinelToken: "FLOW_run-cli_LANE_lane-1_EXIT",
         steps: 1,
         stepDelaySeconds: 0,
@@ -179,7 +180,7 @@ async function flow(root: string, ...args: string[]) {
   return { exitCode, stdout, stderr };
 }
 
-class PoisoningLedger extends FsLedger {
+class AmbiguousCommitLedger extends FsLedger {
   protected override async appendAndSync(
     handle: FileHandle,
     contents: string,
@@ -193,7 +194,7 @@ class PoisoningLedger extends FsLedger {
   }
 }
 
-function poisonedRunStarted(): RunEvent {
+function ambiguousRunStarted(): RunEvent {
   return {
     schemaVersion: 1,
     eventId: "run-poisoned#1",
@@ -244,7 +245,8 @@ describe("flow CLI external behavior", () => {
     );
     expect(result.stdout).toContain("controlMode=managed exitCode=0");
     expect(result.stdout).toContain("dispatchedAt=120 liveAt=130 completedAt=140");
-    expect(result.stdout).toContain("log=/tmp/cli-run/lane.log");
+    expect(result.stdout).toContain("stdout=/tmp/cli-run/lane.log");
+    expect(result.stdout).toContain("stderr=/tmp/cli-run/lane.stderr.log");
     expect(result.stdout).toContain("checkpoint=/tmp/cli-run/checkpoint.md");
     expect(result.stdout).toContain("result=/tmp/cli-run/result.txt");
     expect(result.stdout).toContain("evidence=/tmp/cli-run/evidence.json");
@@ -302,16 +304,20 @@ describe("flow CLI external behavior", () => {
     expect(result.stderr).not.toContain("flow:");
   });
 
-  test("inspect fails closed for a run poisoned by another ledger instance", async () => {
+  test("status and inspect fail closed for an ambiguous run", async () => {
     const root = await tempRoot();
     await expect(
-      new PoisoningLedger(root).commit(poisonedRunStarted()),
+      new AmbiguousCommitLedger(root).commit(ambiguousRunStarted()),
     ).rejects.toThrow(/append failure.*rollback failure/);
 
-    const result = await flow(root, "inspect", "run-poisoned");
+    const status = await flow(root, "status");
+    const inspect = await flow(root, "inspect", "run-poisoned");
 
-    expect(result.exitCode).not.toBe(0);
-    expect(result.stderr).toContain('run "run-poisoned" is poisoned');
-    expect(result.stdout).toBe("");
+    expect(status.exitCode).not.toBe(0);
+    expect(status.stderr).toContain('run "run-poisoned" has an ambiguous commit');
+    expect(status.stdout).toBe("");
+    expect(inspect.exitCode).not.toBe(0);
+    expect(inspect.stderr).toContain('run "run-poisoned" has an ambiguous commit');
+    expect(inspect.stdout).toBe("");
   });
 });

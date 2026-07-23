@@ -53,6 +53,7 @@ describe("reduce", () => {
           laneId: "lane-1",
           paneId: "w1:p2",
           logFile: "/tmp/lane-1.log",
+          stderrFile: "/tmp/lane-1.stderr.log",
           sentinelToken: "FLOW_run-1_LANE_lane-1_EXIT",
           steps: 1,
           stepDelaySeconds: 0,
@@ -97,6 +98,7 @@ describe("reduce", () => {
             laneId,
             paneId: `w1:p${index + 2}`,
             logFile: `/tmp/${laneId}.log`,
+            stderrFile: `/tmp/${laneId}.stderr.log`,
             sentinelToken: `FLOW_run-1_LANE_${laneId}_EXIT`,
             steps: 3,
             stepDelaySeconds: 0.1,
@@ -250,6 +252,7 @@ describe("reduce", () => {
           laneId: "lane-1",
           paneId: "w1:p2",
           logFile: "/tmp/lane-1.log",
+          stderrFile: "/tmp/lane-1.stderr.log",
           sentinelToken: "FLOW_run-1_LANE_lane-1_EXIT",
           steps: 1,
           stepDelaySeconds: 0,
@@ -286,6 +289,7 @@ describe("reduce", () => {
           laneId: "lane-1",
           paneId: "w1:p2",
           logFile: "/tmp/lane-1.log",
+          stderrFile: "/tmp/lane-1.stderr.log",
           sentinelToken: "FLOW_run-1_LANE_lane-1_EXIT",
           steps: 1,
           stepDelaySeconds: 0,
@@ -370,13 +374,31 @@ describe("reduce", () => {
       ),
     ).toThrow(/terminal/);
 
+    expect(() =>
+      reduce(
+        started,
+        event(2, "run_finished", {
+          data: {
+            status: "clean",
+            breakdown: {
+              exitedZero: 0,
+              exitedNonZero: 0,
+              crashed: 0,
+              lost: 0,
+              failedToStart: 0,
+            },
+          },
+        }),
+      ),
+    ).toThrow(/at least one lane/);
+
     const finished = reduce(
-      started,
-      event(2, "run_finished", {
+      terminal,
+      event(4, "run_finished", {
         data: {
           status: "clean",
           breakdown: {
-            exitedZero: 0,
+            exitedZero: 1,
             exitedNonZero: 0,
             crashed: 0,
             lost: 0,
@@ -388,11 +410,11 @@ describe("reduce", () => {
     expect(() =>
       reduce(
         finished,
-        event(3, "run_finished", {
+        event(5, "run_finished", {
           data: {
             status: "clean",
             breakdown: {
-              exitedZero: 0,
+              exitedZero: 1,
               exitedNonZero: 0,
               crashed: 0,
               lost: 0,
@@ -423,6 +445,7 @@ describe("reduce", () => {
           laneId: "lane-1",
           paneId: "w1:p2",
           logFile: "/tmp/lane-1.log",
+          stderrFile: "/tmp/lane-1.stderr.log",
           sentinelToken: "FLOW_run-1_LANE_lane-1_EXIT",
           steps: 1,
           stepDelaySeconds: 0,
@@ -471,6 +494,7 @@ describe("terminal lanes cannot be re-dispatched", () => {
           laneId: "lane-1",
           paneId: "p1",
           logFile: "/tmp/ev/lane-1.log",
+          stderrFile: "/tmp/ev/lane-1.stderr.log",
           sentinelToken: "FLOW_run-1_LANE_lane-1_EXIT",
           steps: 1,
           stepDelaySeconds: 0.1,

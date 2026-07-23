@@ -79,7 +79,7 @@ export async function runFlowCli(
         `  registeredAt=${lane.registeredAt} dispatchedAt=${value(lane.dispatchedAt)} liveAt=${value(lane.liveAt)} completedAt=${value(lane.completedAt)} checkpointAt=${value(lane.checkpointAt)} contractEvaluatedAt=${value(lane.contractEvaluatedAt)} verificationRecordedAt=${value(lane.verificationRecordedAt)}\n`,
       );
       stdout.write(
-        `  artifacts log=${lane.logFile} checkpoint=${value(lane.checkpointFile)} result=${value(lane.resultFile)} evidence=${value(lane.evidenceFile)}\n`,
+        `  artifacts stdout=${lane.logFile} stderr=${lane.stderrFile} checkpoint=${value(lane.checkpointFile)} result=${value(lane.resultFile)} evidence=${value(lane.evidenceFile)}\n`,
       );
     }
     return 0;

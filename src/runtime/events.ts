@@ -4,6 +4,7 @@ export type RunEventType =
   | "lane_dispatch_intent"
   | "lane_dispatched"
   | "lane_live"
+  | "lane_wait_timed_out"
   | "lane_checkpoint"
   | "lane_exited"
   | "lane_crashed"
@@ -59,8 +60,10 @@ export interface RunnerEvidence {
   readonly runId: string;
   readonly laneId: string;
   readonly command: string | null;
-  /** Durable stdout/stderr artifact; the lane tees all process output here. */
-  readonly logFile: string;
+  /** Durable stdout artifact; the lane tees its stdout here. */
+  readonly stdoutArtifact: string;
+  /** Durable stderr artifact written independently from the stdout pipeline. */
+  readonly stderrArtifact: string;
   readonly dispatchedAt: number | null;
   readonly liveAt: number | null;
   readonly completedAt: number | null;
@@ -68,12 +71,12 @@ export interface RunnerEvidence {
   readonly signal: string | null;
   readonly failure: string | null;
   readonly environmentFailure: string | null;
+  readonly observationTimeouts: number;
   readonly termination:
     | "sentinel-exit"
     | "crashed"
     | "lost"
-    | "failed_to_start"
-    | "timeout";
+    | "failed_to_start";
 }
 
 export type EmptyEventData = Readonly<Record<string, never>>;
@@ -92,6 +95,7 @@ export interface LaneRegisteredData {
   readonly laneId: string;
   readonly paneId: string;
   readonly logFile: string;
+  readonly stderrFile: string;
   readonly sentinelToken: string;
   readonly steps: number;
   readonly stepDelaySeconds: number;
@@ -100,6 +104,10 @@ export interface LaneRegisteredData {
 
 export interface LaneDispatchedData {
   readonly command: string;
+}
+
+export interface LaneWaitTimedOutData {
+  readonly timeoutMs: number;
 }
 
 export interface LaneCheckpointData {
@@ -162,6 +170,7 @@ export interface RunEventDataByType {
   readonly lane_dispatch_intent: EmptyEventData;
   readonly lane_dispatched: LaneDispatchedData;
   readonly lane_live: EmptyEventData;
+  readonly lane_wait_timed_out: LaneWaitTimedOutData;
   readonly lane_checkpoint: LaneCheckpointData;
   readonly lane_exited: LaneExitedData;
   readonly lane_crashed: EmptyEventData;
@@ -206,6 +215,7 @@ export type RunEvent =
   | EventFor<"lane_dispatch_intent", "runtime", string>
   | EventFor<"lane_dispatched", "runtime", string>
   | EventFor<"lane_live", "runtime", string>
+  | EventFor<"lane_wait_timed_out", "runtime", string>
   | EventFor<"lane_checkpoint", "agent", string>
   | EventFor<"lane_exited", "runtime", string>
   | EventFor<"lane_crashed", "runtime", string>

@@ -60,6 +60,7 @@ describe("buildLaneCommand", () => {
       runId: "run1",
       laneId: "lane-2",
       logFile: "/tmp/ev/lane-2.log",
+      stderrFile: "/tmp/ev/lane-2.stderr.log",
       checkpointFile: "/tmp/ev/checkpoints/lane-2.md",
       resultFile: "/tmp/ev/results/lane-2-result.txt",
       steps: 5,
@@ -67,11 +68,12 @@ describe("buildLaneCommand", () => {
     });
     expect(command.startsWith("bash -c '")).toBe(true);
     const tokens = scanSingleQuoted(command);
-    // [script, runId, laneId, logFile, steps, delay]
+    // [script, runId, laneId, logFile, stderrFile, steps, delay]
     expect(tokens[1]).toBe("run1");
     expect(tokens[2]).toBe("lane-2");
     expect(tokens[3]).toBe("/tmp/ev/lane-2.log");
-    expect(tokens[4]).toBe("5");
+    expect(tokens[4]).toBe("/tmp/ev/lane-2.stderr.log");
+    expect(tokens[5]).toBe("5");
   });
 
   test("keeps the sentinel token format aligned with laneSentinelToken", () => {
@@ -79,6 +81,7 @@ describe("buildLaneCommand", () => {
       runId: "run1",
       laneId: "lane-2",
       logFile: "/tmp/ev/lane-2.log",
+      stderrFile: "/tmp/ev/lane-2.stderr.log",
       checkpointFile: "/tmp/ev/checkpoints/lane-2.md",
       resultFile: "/tmp/ev/results/lane-2-result.txt",
       steps: 5,
@@ -94,6 +97,7 @@ describe("buildLaneCommand", () => {
       runId: "run1",
       laneId: "l'x",
       logFile: "/tmp/ev/lane.log",
+      stderrFile: "/tmp/ev/lane.stderr.log",
       checkpointFile: "/tmp/ev/checkpoints/lane.md",
       resultFile: "/tmp/ev/results/lane-result.txt",
       steps: 1,
@@ -106,6 +110,7 @@ describe("buildLaneCommand", () => {
     const root = await mkdtemp(join(tmpdir(), "agent-flow-lane-' quoted "));
     try {
       const logFile = join(root, "logs", "lane's log.txt");
+      const stderrFile = join(root, "logs", "lane's stderr.txt");
       const checkpointFile = join(root, "check points", "lane's checkpoint.md");
       const resultFile = join(root, "result files", "lane's result.txt");
       await mkdir(join(root, "logs"), { recursive: true });
@@ -114,6 +119,7 @@ describe("buildLaneCommand", () => {
         runId: "run1",
         laneId: "lane-2",
         logFile,
+        stderrFile,
         checkpointFile,
         resultFile,
         steps: 1,
@@ -127,6 +133,7 @@ describe("buildLaneCommand", () => {
       expect(await readFile(logFile, "utf8")).toContain(
         "FLOW_run1_LANE_lane-2_EXIT=0",
       );
+      expect(await readFile(stderrFile, "utf8")).toBe("");
       const checkpoint = await readFile(checkpointFile, "utf8");
       for (const field of [
         "STATUS: complete",
@@ -152,12 +159,14 @@ describe("buildLaneCommand", () => {
       const invalidParent = join(root, "not-a-directory");
       await writeFile(invalidParent, "file", "utf8");
       const logFile = join(root, "logs", "lane.log");
+      const stderrFile = join(root, "logs", "lane.stderr.log");
       await mkdir(join(root, "logs"), { recursive: true });
       await writeFile(logFile, "", "utf8");
       const command = buildLaneCommand({
         runId: "run1",
         laneId: "lane-2",
         logFile,
+        stderrFile,
         checkpointFile: join(invalidParent, "checkpoint.md"),
         resultFile: join(root, "results", "result.txt"),
         steps: 0,
@@ -170,7 +179,43 @@ describe("buildLaneCommand", () => {
 
       await process.exited;
 
-      expect(await readFile(logFile, "utf8")).toMatch(/^mkdir:.*not-a-directory/m);
+      expect(await readFile(stderrFile, "utf8")).toMatch(
+        /^mkdir:.*not-a-directory/m,
+      );
+      expect(await readFile(logFile, "utf8")).not.toMatch(
+        /^mkdir:.*not-a-directory/m,
+      );
+    } finally {
+      await rm(root, { recursive: true });
+    }
+  });
+
+  test("captures stdout-writer failures in the durable stderr log", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-flow-lane-tee-error-"));
+    try {
+      const logFile = join(root, "log-is-a-directory");
+      const stderrFile = join(root, "logs", "lane.stderr.log");
+      await mkdir(logFile, { recursive: true });
+      await mkdir(join(root, "logs"), { recursive: true });
+      await writeFile(stderrFile, "", "utf8");
+      const command = buildLaneCommand({
+        runId: "run1",
+        laneId: "lane-2",
+        logFile,
+        stderrFile,
+        checkpointFile: join(root, "checkpoints", "lane.md"),
+        resultFile: join(root, "results", "result.txt"),
+        steps: 1,
+        stepDelaySeconds: 0,
+      });
+      const process = Bun.spawn(["bash", "-c", command], {
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+
+      await process.exited;
+
+      expect(await readFile(stderrFile, "utf8")).toMatch(/^tee:/m);
     } finally {
       await rm(root, { recursive: true });
     }
@@ -179,6 +224,7 @@ describe("buildLaneCommand", () => {
   test("durably records an interrupt delivered to the lane process group", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-flow-lane-sigint-"));
     const logFile = join(root, "logs", "lane.log");
+    const stderrFile = join(root, "logs", "lane.stderr.log");
     const checkpointFile = join(root, "checkpoints", "lane.md");
     const resultFile = join(root, "results", "lane-result.txt");
     await mkdir(join(root, "logs"), { recursive: true });
@@ -187,6 +233,7 @@ describe("buildLaneCommand", () => {
       runId: "interrupt-run",
       laneId: "interrupt-lane",
       logFile,
+      stderrFile,
       checkpointFile,
       resultFile,
       steps: 10,

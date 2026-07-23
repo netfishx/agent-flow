@@ -106,6 +106,7 @@ export interface LaneCommandInput {
   readonly runId: string;
   readonly laneId: string;
   readonly logFile: string;
+  readonly stderrFile: string;
   readonly checkpointFile: string;
   readonly resultFile: string;
   readonly steps: number;

@@ -81,6 +81,7 @@ interface FakePaneState {
   laneId?: string;
   runId?: string;
   logFile?: string;
+  stderrFile?: string;
   checkpointFile?: string;
   resultFile?: string;
   program?: FakeLaneProgram;
@@ -208,15 +209,34 @@ export class FakeHerdrAdapter implements HerdrAdapter {
     const state = this.panes.get(pane.id);
     if (!state) throw new Error(`fake: unknown pane ${pane.id}`);
     const tokens = scanSingleQuoted(shellCommand);
-    // tokens: [script, runId, laneId, logFile, steps, delay, checkpointFile, resultFile]
-    const [, runId, laneId, logFile, , , checkpointFile, resultFile] = tokens;
-    if (!runId || !laneId || !logFile || !checkpointFile || !resultFile) {
+    // tokens: [script, runId, laneId, logFile, stderrFile, steps, delay,
+    // checkpointFile, resultFile]
+    const [
+      ,
+      runId,
+      laneId,
+      logFile,
+      stderrFile,
+      ,
+      ,
+      checkpointFile,
+      resultFile,
+    ] = tokens;
+    if (
+      !runId ||
+      !laneId ||
+      !logFile ||
+      !stderrFile ||
+      !checkpointFile ||
+      !resultFile
+    ) {
       throw new Error(`fake: could not parse lane command: ${shellCommand}`);
     }
     state.role = "lane";
     state.runId = runId;
     state.laneId = laneId;
     state.logFile = logFile;
+    state.stderrFile = stderrFile;
     state.checkpointFile = checkpointFile;
     state.resultFile = resultFile;
     state.program = this.programs.get(laneId);
