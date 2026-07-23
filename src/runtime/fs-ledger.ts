@@ -48,7 +48,7 @@ let leaseSequence = 0;
 const COMMIT_INTENT_FILE = "commit-intent.json";
 const COMMIT_STATE_FILE = "commit-state.json";
 const TAKEOVER_ATTEMPTS = 4;
-const TAKEOVER_RECLAIM_ATTEMPTS = 3;
+const TAKEOVER_GUARD_ACQUIRE_ATTEMPTS = 4;
 const STABLE_READ_ATTEMPTS = 3;
 
 export function realPidIsAlive(pid: number): boolean {
@@ -546,6 +546,7 @@ export class FsLedger implements Ledger {
         runDir,
         runId,
         holder.epoch,
+        replacement.pid,
       );
 
       const guardedHolder = await this.readControllerLease(lockFile, runId);
@@ -599,30 +600,77 @@ export class FsLedger implements Ledger {
     runDir: string,
     runId: string,
     epoch: number,
+    pid: number,
   ): Promise<void> {
     const guard: ControllerTakeoverMarker = {
       schemaVersion: 1,
-      pid: process.pid,
+      pid,
     };
     for (
       let attempt = 0;
-      attempt < TAKEOVER_RECLAIM_ATTEMPTS;
+      attempt < TAKEOVER_GUARD_ACQUIRE_ATTEMPTS;
       attempt++
     ) {
-      const guardFile = join(
+      const guards = await this.readControllerTakeoverReclaimGuards(
         runDir,
-        `.controller.takeover.epoch-${epoch}.reclaim-${attempt}`,
-      );
-      if (await this.createControllerTakeoverMarker(guardFile, guard)) return;
-      const existing = await this.readControllerTakeoverMarker(
-        guardFile,
         runId,
+        epoch,
       );
-      if (existing.pid === process.pid || this.isPidAlive(existing.pid)) {
+      const highest = guards.at(-1);
+      if (
+        highest &&
+        (highest.marker.pid === process.pid ||
+          this.isPidAlive(highest.marker.pid))
+      ) {
         throw new Error(`controller lease for run "${runId}" is already held`);
       }
+      const ordinal = highest ? highest.ordinal + 1 : 0;
+      if (!Number.isSafeInteger(ordinal)) {
+        throw new Error(
+          `corrupt controller takeover guard ordinal for run "${runId}"`,
+        );
+      }
+      const guardFile = join(
+        runDir,
+        `.controller.takeover.epoch-${epoch}.reclaim-${ordinal}`,
+      );
+      if (await this.createControllerTakeoverMarker(guardFile, guard)) return;
     }
     throw new Error(`controller lease for run "${runId}" is already held`);
+  }
+
+  private async readControllerTakeoverReclaimGuards(
+    runDir: string,
+    runId: string,
+    epoch: number,
+  ): Promise<
+    Array<{ ordinal: number; marker: ControllerTakeoverMarker }>
+  > {
+    const prefix = `.controller.takeover.epoch-${epoch}.reclaim-`;
+    const guards: Array<{
+      ordinal: number;
+      marker: ControllerTakeoverMarker;
+    }> = [];
+    for (const name of await readdir(runDir)) {
+      if (!name.startsWith(prefix)) continue;
+      const suffix = name.slice(prefix.length);
+      if (!/^(?:0|[1-9]\d*)$/.test(suffix)) continue;
+      const ordinal = Number(suffix);
+      if (!Number.isSafeInteger(ordinal)) {
+        throw new Error(
+          `corrupt controller takeover guard ordinal for run "${runId}"`,
+        );
+      }
+      guards.push({
+        ordinal,
+        marker: await this.readControllerTakeoverMarker(
+          join(runDir, name),
+          runId,
+        ),
+      });
+    }
+    guards.sort((left, right) => left.ordinal - right.ordinal);
+    return guards;
   }
 
   private async readControllerTakeoverMarker(

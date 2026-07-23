@@ -659,6 +659,47 @@ describe("FsLedger public capabilities", () => {
     await expect(takeover.release()).resolves.toBeUndefined();
   });
 
+  test("advances beyond accumulated dead reclaim guards", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root, () => false).acquireLease("run-fs", {
+      controllerId: "dead-controller",
+      pid: 100,
+    });
+    const runDir = join(root, "runs", "run-fs");
+    await writeFile(
+      join(runDir, ".controller.takeover.epoch-0"),
+      `${JSON.stringify({ schemaVersion: 1, pid: 101 })}\n`,
+      "utf8",
+    );
+    for (let ordinal = 0; ordinal <= 3; ordinal++) {
+      await writeFile(
+        join(
+          runDir,
+          `.controller.takeover.epoch-0.reclaim-${ordinal}`,
+        ),
+        `${JSON.stringify({ schemaVersion: 1, pid: 110 + ordinal })}\n`,
+        "utf8",
+      );
+    }
+
+    const takeover = await new FsLedger(
+      root,
+      (pid) => pid === 200,
+    ).acquireLease("run-fs", {
+      controllerId: "fresh-controller",
+      pid: 200,
+    });
+
+    expect(
+      JSON.parse(await readFile(join(runDir, "controller.lock"), "utf8")),
+    ).toMatchObject({
+      controllerId: "fresh-controller",
+      pid: 200,
+      epoch: 1,
+    });
+    await expect(takeover.release()).resolves.toBeUndefined();
+  });
+
   test("refuses takeover while the existing takeover marker holder is alive", async () => {
     const root = await tempRoot();
     await new FsLedger(root, () => false).acquireLease("run-fs", {
