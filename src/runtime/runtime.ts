@@ -349,6 +349,50 @@ export class WorkflowRuntime {
     return this.workflowStatus(run);
   }
 
+  async takeoverLane(
+    runId: string,
+    laneId: string,
+  ): Promise<WorkflowStatus> {
+    const loaded = await this.deps.ledger.load(runId);
+    if (!loaded) throw new Error(`run not found: "${runId}"`);
+    this.registerReducedView(loaded);
+    this.getLane(this.getRun(runId), laneId);
+    await this.commitEventConditionally(runId, (current) => {
+      if (!current) throw new Error(`unknown runId "${runId}"`);
+      const lane = this.getLane(current, laneId);
+      if (lane.controlMode === "human_owned") return null;
+      return {
+        type: "lane_takeover",
+        actor: "human",
+        laneId,
+        data: {},
+      };
+    });
+    return this.workflowStatus(this.getRun(runId));
+  }
+
+  async releaseLane(
+    runId: string,
+    laneId: string,
+  ): Promise<WorkflowStatus> {
+    const loaded = await this.deps.ledger.load(runId);
+    if (!loaded) throw new Error(`run not found: "${runId}"`);
+    this.registerReducedView(loaded);
+    this.getLane(this.getRun(runId), laneId);
+    await this.commitEventConditionally(runId, (current) => {
+      if (!current) throw new Error(`unknown runId "${runId}"`);
+      const lane = this.getLane(current, laneId);
+      if (lane.controlMode === "managed") return null;
+      return {
+        type: "lane_release",
+        actor: "human",
+        laneId,
+        data: {},
+      };
+    });
+    return this.workflowStatus(this.getRun(runId));
+  }
+
   async resumeWorkflow(
     runId: string,
     perLaneTimeoutMs = 300_000,
@@ -392,7 +436,7 @@ export class WorkflowRuntime {
               data: {},
             });
           }
-          liveLaneIds.push(laneId);
+          if (!this.autoControlSuppressed(lane)) liveLaneIds.push(laneId);
           continue;
         }
 
@@ -445,15 +489,24 @@ export class WorkflowRuntime {
       }
       const completed = this.getRun(runId);
       if (completed.finishStatus === null) {
-        const incompleteLaneIds = completed.laneOrder.filter(
-          (laneId) =>
-            !TERMINAL_RUNTIME.has(this.getLane(completed, laneId).runtimeState),
+        const nonTerminal = completed.laneOrder
+          .map((laneId) => this.getLane(completed, laneId))
+          .filter((lane) => !TERMINAL_RUNTIME.has(lane.runtimeState));
+        const drivable = nonTerminal.filter(
+          (lane) => !this.autoControlSuppressed(lane),
         );
-        throw new Error(
-          `resume did not reach run_finished; lanes did not terminate: ${incompleteLaneIds.join(", ")}`,
-        );
+        if (drivable.length > 0) {
+          throw new Error(
+            `resume did not reach run_finished; lanes did not terminate: ${drivable
+              .map((lane) => lane.laneId)
+              .join(", ")}`,
+          );
+        }
+        // Every remaining non-terminal lane is human_owned: reconciled, never auto-driven.
+        // The controller detaches; the human-owned lane keeps running in its pane.
+        await this.releaseControllerLease(runId);
       }
-      return this.workflowStatus(completed);
+      return this.workflowStatus(this.getRun(runId));
     } catch (error) {
       try {
         await this.releaseControllerLease(runId);
@@ -642,6 +695,10 @@ export class WorkflowRuntime {
 
   private controllerId(): string {
     return `runtime-${process.pid}`;
+  }
+
+  private autoControlSuppressed(lane: LaneView): boolean {
+    return lane.controlMode === "human_owned";
   }
 
   protected async releaseControllerLease(runId: string): Promise<void> {

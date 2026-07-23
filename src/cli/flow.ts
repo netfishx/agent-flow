@@ -5,7 +5,8 @@ import { projectRunState, type RunView } from "../runtime/reducer.ts";
 import { WorkflowRuntime } from "../runtime/runtime.ts";
 import { stat } from "node:fs/promises";
 
-const USAGE = "usage: flow status | flow inspect <runId> | flow resume <runId>";
+const USAGE =
+  "usage: flow status | flow inspect <runId> | flow resume <runId> | flow takeover <runId> <laneId> | flow release <runId> <laneId>";
 const DEFAULT_LANE_TIMEOUT_MS = 300_000;
 
 interface TextSink {
@@ -89,12 +90,19 @@ export async function runFlowCli(
   stderr: TextSink = process.stderr,
   options: FlowCliOptions = {},
 ): Promise<number> {
-  const [command, runId, ...extra] = args;
+  const [command, runId, laneId, ...extra] = args;
   if (
-    (command !== "status" && command !== "inspect" && command !== "resume") ||
-    (command === "status" && (runId !== undefined || extra.length > 0)) ||
+    (command !== "status" &&
+      command !== "inspect" &&
+      command !== "resume" &&
+      command !== "takeover" &&
+      command !== "release") ||
+    (command === "status" &&
+      (runId !== undefined || laneId !== undefined || extra.length > 0)) ||
     ((command === "inspect" || command === "resume") &&
-      (runId === undefined || extra.length > 0))
+      (runId === undefined || laneId !== undefined || extra.length > 0)) ||
+    ((command === "takeover" || command === "release") &&
+      (runId === undefined || laneId === undefined || extra.length > 0))
   ) {
     stderr.write(`${USAGE}\n`);
     return 2;
@@ -119,6 +127,12 @@ export async function runFlowCli(
     if (command === "resume") {
       const runtime = (options.runtimeFactory ?? createRealRuntime)(ledger);
       await runtime.resumeWorkflow(runId!, laneTimeout(environment));
+    } else if (command === "takeover") {
+      const runtime = (options.runtimeFactory ?? createRealRuntime)(ledger);
+      await runtime.takeoverLane(runId!, laneId!);
+    } else if (command === "release") {
+      const runtime = (options.runtimeFactory ?? createRealRuntime)(ledger);
+      await runtime.releaseLane(runId!, laneId!);
     }
     const run = await ledger.load(runId!);
     if (!run) {

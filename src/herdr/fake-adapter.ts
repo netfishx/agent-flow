@@ -142,6 +142,9 @@ export class FakeHerdrAdapter implements HerdrAdapter {
   focusedPaneId: string | null = null;
   focusedTabId: string | null = null;
   processInfoCalls = 0;
+  readonly processInfoPaneIds: string[] = [];
+  readonly waitedPaneIds: string[] = [];
+  readonly interruptedPaneIds: string[] = [];
   readonly dispatched: { paneId: string; command: string }[] = [];
 
   constructor(options: FakeHerdrAdapterOptions = {}) {
@@ -253,6 +256,7 @@ export class FakeHerdrAdapter implements HerdrAdapter {
     _regex: string,
     _timeoutMs: number,
   ): Promise<WaitOutcome> {
+    this.waitedPaneIds.push(pane.id);
     const state = this.panes.get(pane.id);
     if (state?.role === "lane") {
       this.tick(state.program?.execMs);
@@ -274,6 +278,7 @@ export class FakeHerdrAdapter implements HerdrAdapter {
 
   async processInfo(pane: PaneRef): Promise<ProcessInfo> {
     this.processInfoCalls++;
+    this.processInfoPaneIds.push(pane.id);
     this.tick(this.advances.processInfo);
     const state = this.panes.get(pane.id);
     if (!state) throw new Error(`fake: unknown pane ${pane.id}`);
@@ -295,6 +300,7 @@ export class FakeHerdrAdapter implements HerdrAdapter {
   }
 
   async interruptPane(pane: PaneRef): Promise<InterruptEvidence> {
+    this.interruptedPaneIds.push(pane.id);
     this.tick(this.advances.interruptPane);
     const state = this.panes.get(pane.id);
     const running = state?.role === "lane" && !state.finished;

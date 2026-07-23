@@ -299,6 +299,27 @@ describe("flow CLI external behavior", () => {
     expect(result.stdout).toContain("evidence=/tmp/cli-run/evidence.json");
   });
 
+  test("takeover and release durably flip and render lane control mode", async () => {
+    const root = await tempRoot();
+    await seedFinishedRun(root, { finished: false });
+
+    const takeover = await flow(root, "takeover", "run-cli", "lane-1");
+    const takenOver = await new FsLedger(root).load("run-cli");
+    const release = await flow(root, "release", "run-cli", "lane-1");
+    const released = await new FsLedger(root).load("run-cli");
+    await flow(root, "takeover", "run-cli", "lane-1");
+    const inspect = await flow(root, "inspect", "run-cli");
+
+    expect(takeover.exitCode).toBe(0);
+    expect(takeover.stdout).toContain("controlMode=human_owned");
+    expect(takenOver!.lanes["lane-1"]!.controlMode).toBe("human_owned");
+    expect(release.exitCode).toBe(0);
+    expect(release.stdout).toContain("controlMode=managed");
+    expect(released!.lanes["lane-1"]!.controlMode).toBe("managed");
+    expect(inspect.exitCode).toBe(0);
+    expect(inspect.stdout).toContain("controlMode=human_owned");
+  });
+
   test("resume reports an already-finished run without changing its event history", async () => {
     const root = await tempRoot();
     await seedFinishedRun(root);
@@ -470,6 +491,8 @@ describe("flow CLI external behavior", () => {
     const root = await tempRoot();
     expect((await flow(root, "inspect")).exitCode).not.toBe(0);
     expect((await flow(root, "unknown")).exitCode).not.toBe(0);
+    expect((await flow(root, "takeover", "run-cli")).exitCode).toBe(2);
+    expect((await flow(root, "release")).exitCode).toBe(2);
   });
 
   test("an unusable ledger root fails loudly without an in-memory fallback", async () => {
