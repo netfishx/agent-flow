@@ -700,6 +700,43 @@ describe("FsLedger public capabilities", () => {
     await expect(takeover.release()).resolves.toBeUndefined();
   });
 
+  test("fails closed on a non-canonical reclaim guard ordinal", async () => {
+    for (const suffix of ["x", "-1", "01"]) {
+      const root = await tempRoot();
+      await new FsLedger(root, () => false).acquireLease("run-fs", {
+        controllerId: "dead-controller",
+        pid: 100,
+      });
+      const runDir = join(root, "runs", "run-fs");
+      await writeFile(
+        join(runDir, ".controller.takeover.epoch-0"),
+        `${JSON.stringify({ schemaVersion: 1, pid: 101 })}\n`,
+        "utf8",
+      );
+      // A live pid hidden behind a non-canonical name in the reserved guard
+      // namespace must not be silently skipped.
+      await writeFile(
+        join(runDir, `.controller.takeover.epoch-0.reclaim-${suffix}`),
+        `${JSON.stringify({ schemaVersion: 1, pid: 200 })}\n`,
+        "utf8",
+      );
+
+      await expect(
+        new FsLedger(root, (pid) => pid === 200 || pid === 300).acquireLease(
+          "run-fs",
+          { controllerId: "fresh", pid: 300 },
+        ),
+      ).rejects.toThrow(/corrupt controller takeover guard/);
+      expect(
+        (
+          JSON.parse(
+            await readFile(join(runDir, "controller.lock"), "utf8"),
+          ) as { controllerId: string }
+        ).controllerId,
+      ).toBe("dead-controller");
+    }
+  });
+
   test("refuses takeover while the existing takeover marker holder is alive", async () => {
     const root = await tempRoot();
     await new FsLedger(root, () => false).acquireLease("run-fs", {

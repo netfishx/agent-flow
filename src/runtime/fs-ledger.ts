@@ -654,7 +654,11 @@ export class FsLedger implements Ledger {
     for (const name of await readdir(runDir)) {
       if (!name.startsWith(prefix)) continue;
       const suffix = name.slice(prefix.length);
-      if (!/^(?:0|[1-9]\d*)$/.test(suffix)) continue;
+      if (!/^(?:0|[1-9]\d*)$/.test(suffix)) {
+        throw new Error(
+          `corrupt controller takeover guard ordinal for run "${runId}"`,
+        );
+      }
       const ordinal = Number(suffix);
       if (!Number.isSafeInteger(ordinal)) {
         throw new Error(
