@@ -89,6 +89,49 @@ class LeaseFreeLedger implements Ledger {
   }
 }
 
+class FinishBetweenLoadsLedger implements Ledger {
+  readonly committedTypes: RunEvent["type"][] = [];
+  private loadCount = 0;
+  private leaseHeld = false;
+
+  constructor(
+    private readonly firstView: RunView,
+    private readonly delegate: Ledger,
+  ) {}
+
+  async commit(event: RunEvent): Promise<void> {
+    await this.delegate.commit(event);
+    this.committedTypes.push(event.type);
+  }
+
+  load(runId: string): Promise<RunView | null> {
+    if (this.loadCount++ === 0) {
+      return Promise.resolve(structuredClone(this.firstView));
+    }
+    return this.delegate.load(runId);
+  }
+
+  list(): Promise<{ runId: string }[]> {
+    return this.delegate.list();
+  }
+
+  async acquireLease(
+    _runId: string,
+    _controller: { controllerId: string; pid: number },
+  ): Promise<LeaseHandle> {
+    if (this.leaseHeld) throw new Error("test lease already held");
+    this.leaseHeld = true;
+    let released = false;
+    return {
+      release: async () => {
+        if (released) return;
+        released = true;
+        this.leaseHeld = false;
+      },
+    };
+  }
+}
+
 describe("WorkflowRuntime resume", () => {
   test("reconciles the unobserved window, reattaches live lanes, and finishes runtime outcomes", async () => {
     const cwd = await tempWork();
@@ -305,6 +348,57 @@ describe("WorkflowRuntime resume", () => {
     expect(ledger.leaseAcquisitions).toBe(leaseAcquisitions);
   });
 
+  test("reports read-only when the run finishes before the authoritative reload", async () => {
+    const cwd = await tempWork();
+    const clock = createClock(35_000);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "done", exitCode: 0 }],
+    });
+    const sourceLedger = new ObservedLedger();
+    const source = new WorkflowRuntime({
+      adapter,
+      ledger: sourceLedger,
+      clock: clock.now,
+      idgen: () => "run-finished-during-acquire",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await source.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd,
+      lanes: [{ laneId: "done", steps: 1 }],
+    });
+    const unfinished = await sourceLedger.load(handle.runId);
+    await source.confirmLaneStarted(handle.runId, "done");
+    await source.awaitLane(handle.runId, "done", 1_000);
+    const eventCount = sourceLedger.committedEvents.length;
+    const racingLedger = new FinishBetweenLoadsLedger(
+      unfinished!,
+      sourceLedger,
+    );
+    const resumed = new WorkflowRuntime({
+      adapter,
+      ledger: racingLedger,
+      clock: clock.now,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+
+    const status = await resumed.resumeWorkflow(handle.runId);
+
+    expect(status.state).toBe("complete");
+    expect(racingLedger.committedTypes).toEqual([]);
+    expect(sourceLedger.committedEvents).toHaveLength(eventCount);
+    const reacquired = await racingLedger.acquireLease(
+      handle.runId,
+      { controllerId: "next-controller", pid: process.pid },
+    );
+    await expect(reacquired.release()).resolves.toBeUndefined();
+  });
+
   test("fails before lease acquisition when the run does not exist", async () => {
     const clock = createClock();
     const adapter = new FakeHerdrAdapter({ clock });
@@ -411,5 +505,56 @@ describe("WorkflowRuntime resume", () => {
         },
       },
     });
+  });
+
+  test("releases its durable controller lease after a resume failure", async () => {
+    const root = await tempWork();
+    const clock = createClock(60_000);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [
+        {
+          laneId: "slow-lane",
+          exitCode: 0,
+          emitSentinel: false,
+          waitMatches: false,
+        },
+      ],
+    });
+    const durableLedger = new FsLedger(
+      join(root, "ledger"),
+      (pid) => pid === process.pid,
+    );
+    const source = new WorkflowRuntime({
+      adapter,
+      ledger: new LeaseFreeLedger(durableLedger),
+      clock: clock.now,
+      idgen: () => "run-release-after-failure",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    await source.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd: join(root, "work"),
+      lanes: [{ laneId: "slow-lane", steps: 1 }],
+    });
+    const resumed = new WorkflowRuntime({
+      adapter,
+      ledger: durableLedger,
+      clock: clock.now,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+
+    await expect(
+      resumed.resumeWorkflow("run-release-after-failure", 1),
+    ).rejects.toThrow(/did not terminate.*slow-lane/);
+    const reacquired = await durableLedger.acquireLease(
+      "run-release-after-failure",
+      { controllerId: "next-controller", pid: process.pid },
+    );
+    await expect(reacquired.release()).resolves.toBeUndefined();
   });
 });

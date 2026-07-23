@@ -37,12 +37,19 @@ interface ControllerLeaseRecord {
   readonly acquiredAt: number;
 }
 
+interface ControllerTakeoverClaim {
+  readonly schemaVersion: 1;
+  readonly pid: number;
+  readonly claimId?: string;
+}
+
 let snapshotSequence = 0;
 let commitStateSequence = 0;
 let leaseSequence = 0;
 const COMMIT_INTENT_FILE = "commit-intent.json";
 const COMMIT_STATE_FILE = "commit-state.json";
 const CONTROLLER_TAKEOVER_FILE = "controller.takeover";
+const TAKEOVER_CLAIM_ATTEMPTS = 3;
 const STABLE_READ_ATTEMPTS = 3;
 
 export function realPidIsAlive(pid: number): boolean {
@@ -467,24 +474,26 @@ export class FsLedger implements Ledger {
     replacement: ControllerLeaseRecord,
   ): Promise<void> {
     const claimFile = join(runDir, CONTROLLER_TAKEOVER_FILE);
-    let claim: FileHandle | undefined;
+    const takeoverClaim: ControllerTakeoverClaim = {
+      schemaVersion: 1,
+      pid: process.pid,
+      claimId: `${process.pid}-${++leaseSequence}`,
+    };
+    let ownsClaim = false;
     try {
-      try {
-        claim = await open(claimFile, "wx");
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-          throw new Error(`controller lease for run "${runId}" is already held`);
-        }
-        throw error;
-      }
-      await claim.writeFile(
-        `${JSON.stringify({ schemaVersion: 1, pid: process.pid })}\n`,
-        "utf8",
+      await this.acquireControllerTakeoverClaim(
+        claimFile,
+        runDir,
+        runId,
+        takeoverClaim,
       );
-      await claim.sync();
-      await claim.close();
-      claim = undefined;
+      ownsClaim = true;
 
+      await this.assertControllerTakeoverClaim(
+        claimFile,
+        runId,
+        takeoverClaim,
+      );
       const current = await this.readControllerLease(lockFile, runId);
       if (
         !isDeepStrictEqual(current, observed) ||
@@ -497,10 +506,105 @@ export class FsLedger implements Ledger {
         lockFile,
         replacement,
       );
+      await this.assertControllerTakeoverClaim(
+        claimFile,
+        runId,
+        takeoverClaim,
+      );
     } finally {
-      await claim?.close().catch(() => {});
-      await unlink(claimFile).catch(() => {});
+      if (ownsClaim) {
+        const currentClaim = await this.readControllerTakeoverClaim(
+          claimFile,
+          runId,
+        ).catch(() => null);
+        if (isDeepStrictEqual(currentClaim, takeoverClaim)) {
+          await unlink(claimFile).catch(() => {});
+        }
+      }
     }
+  }
+
+  private async acquireControllerTakeoverClaim(
+    claimFile: string,
+    runDir: string,
+    runId: string,
+    claim: ControllerTakeoverClaim,
+  ): Promise<void> {
+    for (let attempt = 0; attempt < TAKEOVER_CLAIM_ATTEMPTS; attempt++) {
+      let handle: FileHandle | undefined;
+      try {
+        handle = await open(claimFile, "wx");
+        await handle.writeFile(`${JSON.stringify(claim)}\n`, "utf8");
+        await handle.sync();
+        await handle.close();
+        return;
+      } catch (error) {
+        await handle?.close().catch(() => {});
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+          if (handle) await unlink(claimFile).catch(() => {});
+          throw error;
+        }
+      }
+
+      const existing = await this.readControllerTakeoverClaim(
+        claimFile,
+        runId,
+      );
+      if (existing.pid === process.pid || this.isPidAlive(existing.pid)) {
+        throw new Error(`controller lease for run "${runId}" is already held`);
+      }
+
+      const stolenClaim = join(
+        runDir,
+        `.controller.takeover.stale-${process.pid}-${++leaseSequence}`,
+      );
+      try {
+        await rename(claimFile, stolenClaim);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      await unlink(stolenClaim);
+    }
+    throw new Error(`controller lease for run "${runId}" is already held`);
+  }
+
+  private async assertControllerTakeoverClaim(
+    claimFile: string,
+    runId: string,
+    expected: ControllerTakeoverClaim,
+  ): Promise<void> {
+    const current = await this.readControllerTakeoverClaim(claimFile, runId);
+    if (!isDeepStrictEqual(current, expected)) {
+      throw new Error(`controller lease for run "${runId}" is already held`);
+    }
+  }
+
+  private async readControllerTakeoverClaim(
+    claimFile: string,
+    runId: string,
+  ): Promise<ControllerTakeoverClaim> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await readFile(claimFile, "utf8"));
+    } catch (error) {
+      throw new Error(`corrupt controller takeover claim for run "${runId}"`, {
+        cause: error,
+      });
+    }
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      (parsed as { schemaVersion?: unknown }).schemaVersion !== 1 ||
+      !Number.isSafeInteger((parsed as { pid?: unknown }).pid) ||
+      (parsed as { pid: number }).pid <= 0 ||
+      ((parsed as { claimId?: unknown }).claimId !== undefined &&
+        (typeof (parsed as { claimId?: unknown }).claimId !== "string" ||
+          (parsed as { claimId: string }).claimId.length === 0))
+    ) {
+      throw new Error(`corrupt controller takeover claim for run "${runId}"`);
+    }
+    return parsed as ControllerTakeoverClaim;
   }
 
   private runDir(runId: string): string {

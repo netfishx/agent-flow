@@ -536,6 +536,79 @@ describe("FsLedger public capabilities", () => {
     await winningResult!.value.release();
   });
 
+  test("reclaims a dead takeover claim and completes the dead-holder takeover", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root, () => false).acquireLease("run-fs", {
+      controllerId: "dead-controller",
+      pid: 101,
+    });
+    const runDir = join(root, "runs", "run-fs");
+    await writeFile(
+      join(runDir, "controller.takeover"),
+      `${JSON.stringify({ schemaVersion: 1, pid: 102 })}\n`,
+      "utf8",
+    );
+
+    const takeover = await new FsLedger(root, () => false).acquireLease(
+      "run-fs",
+      { controllerId: "controller-2", pid: 202 },
+    );
+
+    expect(
+      JSON.parse(await readFile(join(runDir, "controller.lock"), "utf8")),
+    ).toMatchObject({
+      controllerId: "controller-2",
+      pid: 202,
+      epoch: 1,
+    });
+    await expect(takeover.release()).resolves.toBeUndefined();
+  });
+
+  test("refuses takeover while the existing takeover claimer is alive", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root, () => false).acquireLease("run-fs", {
+      controllerId: "dead-controller",
+      pid: 101,
+    });
+    const runDir = join(root, "runs", "run-fs");
+    const claim = `${JSON.stringify({ schemaVersion: 1, pid: 102 })}\n`;
+    await writeFile(join(runDir, "controller.takeover"), claim, "utf8");
+
+    await expect(
+      new FsLedger(root, (pid) => pid === 102).acquireLease("run-fs", {
+        controllerId: "controller-2",
+        pid: 202,
+      }),
+    ).rejects.toThrow('controller lease for run "run-fs" is already held');
+    expect(
+      await readFile(join(runDir, "controller.takeover"), "utf8"),
+    ).toBe(claim);
+  });
+
+  test("fails closed on a corrupt takeover claim", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root, () => false).acquireLease("run-fs", {
+      controllerId: "dead-controller",
+      pid: 101,
+    });
+    const runDir = join(root, "runs", "run-fs");
+    await writeFile(
+      join(runDir, "controller.takeover"),
+      "{corrupt",
+      "utf8",
+    );
+
+    await expect(
+      new FsLedger(root, () => false).acquireLease("run-fs", {
+        controllerId: "controller-2",
+        pid: 202,
+      }),
+    ).rejects.toThrow(/corrupt controller takeover claim/);
+    expect(
+      await readFile(join(runDir, "controller.takeover"), "utf8"),
+    ).toBe("{corrupt");
+  });
+
   test("fails closed on a corrupt existing controller lock", async () => {
     const root = await tempRoot();
     const runDir = join(root, "runs", "run-fs");
