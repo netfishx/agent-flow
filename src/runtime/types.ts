@@ -5,6 +5,7 @@
 import type { HerdrAdapter } from "../herdr/adapter.ts";
 import type { Ledger } from "./ledger.ts";
 import type { FixedPoint } from "./events.ts";
+import type { RunState as ProjectedRunState } from "./reducer.ts";
 
 export type LaneState =
   | "starting"
@@ -13,7 +14,7 @@ export type LaneState =
   | "interrupted"
   | "failed";
 
-export type RunState = "dispatched" | "running" | "complete" | "partial";
+export type RunState = ProjectedRunState;
 
 /**
  * A single timing measurement. Either a real wall-clock value or an explicit
@@ -101,6 +102,16 @@ export interface StartWorkflowConfig {
   readonly fixedPoint?: FixedPoint | null;
 }
 
+export interface LaneCommandInput {
+  readonly runId: string;
+  readonly laneId: string;
+  readonly logFile: string;
+  readonly checkpointFile: string;
+  readonly resultFile: string;
+  readonly steps: number;
+  readonly stepDelaySeconds: number;
+}
+
 export interface RunHandle {
   readonly runId: string;
   readonly laneIds: readonly string[];
@@ -117,6 +128,8 @@ export interface RuntimeDeps {
   readonly idgen: () => string;
   /** Reads a lane's durable log (the source of truth for its exit code). */
   readonly readResultFile: (path: string) => Promise<string>;
+  /** Builds the exact command persisted at the physical dispatch boundary. */
+  readonly laneCommandBuilder?: (input: LaneCommandInput) => string;
   /** Real delay for settle/poll waits; a no-op in deterministic tests. */
   readonly sleep?: (ms: number) => Promise<void>;
   /** How long to confirm a lane's process has exited after its sentinel (default 2000ms). */

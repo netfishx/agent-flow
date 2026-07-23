@@ -5,6 +5,7 @@
 // the (centrally quoted) argument list varies.
 
 import { shellSingleQuote } from "../herdr/argv.ts";
+import type { LaneCommandInput } from "../runtime/types.ts";
 
 // A self-contained simulated lane: streams progress to a durable log, prints a
 // run+lane-specific sentinel on exit, and turns SIGINT into exit 130. It reads
@@ -14,9 +15,9 @@ const LANE_SCRIPT = [
   "set -u",
   'runId="$1"; laneId="$2"; logFile="$3"; steps="$4"; delay="$5"; checkpointFile="$6"; resultFile="$7"',
   'token="FLOW_${runId}_LANE_${laneId}_EXIT"',
+  "run_lane() {",
   'mkdir -p -- "$(dirname -- "$logFile")" "$(dirname -- "$checkpointFile")" "$(dirname -- "$resultFile")"',
-  ': >| "$logFile"',
-  'emit() { printf "%s\\n" "$1" | tee -a "$logFile"; }',
+  'emit() { printf "%s\\n" "$1"; }',
   'records() { { printf "STATUS: %s\\n" "$1"; printf "PHASE: simulated\\nCOMPLETED:\\n- steps ${i:-0}/${steps}\\nNEXT:\\n- none\\nBLOCKERS:\\n- none\\nARTIFACTS:\\n- %s\\nVERIFICATION_CLAIMS:\\n- completion sentinel\\nGAPS:\\n- none\\n" "$resultFile"; } >| "$checkpointFile"; printf "RESULT: %s steps=%s\\n" "$2" "${i:-0}" >| "$resultFile"; }',
   'finish() { records "$3" "$4"; emit "STEP=${i:-0} EVENT=$2"; emit "${token}=$1"; exit "$1"; }',
   "trap 'finish 130 interrupted-SIGINT partial interrupted' INT",
@@ -28,17 +29,11 @@ const LANE_SCRIPT = [
   '  sleep "$delay"',
   "done",
   "finish 0 done complete ok",
+  "}",
+  'run_lane 2>&1 | tee -a "$logFile"',
+  'laneStatus="${PIPESTATUS[0]}"',
+  'exit "$laneStatus"',
 ].join("\n");
-
-export interface LaneCommandInput {
-  readonly runId: string;
-  readonly laneId: string;
-  readonly logFile: string;
-  readonly checkpointFile: string;
-  readonly resultFile: string;
-  readonly steps: number;
-  readonly stepDelaySeconds: number;
-}
 
 export function buildLaneCommand(input: LaneCommandInput): string {
   return [

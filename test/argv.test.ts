@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -108,6 +108,8 @@ describe("buildLaneCommand", () => {
       const logFile = join(root, "logs", "lane's log.txt");
       const checkpointFile = join(root, "check points", "lane's checkpoint.md");
       const resultFile = join(root, "result files", "lane's result.txt");
+      await mkdir(join(root, "logs"), { recursive: true });
+      await writeFile(logFile, "", "utf8");
       const command = buildLaneCommand({
         runId: "run1",
         laneId: "lane-2",
@@ -139,6 +141,36 @@ describe("buildLaneCommand", () => {
         expect(checkpoint).toContain(field);
       }
       expect(await readFile(resultFile, "utf8")).toBe("RESULT: ok steps=1\n");
+    } finally {
+      await rm(root, { recursive: true });
+    }
+  });
+
+  test("captures setup failures in the durable stderr log", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-flow-lane-setup-"));
+    try {
+      const invalidParent = join(root, "not-a-directory");
+      await writeFile(invalidParent, "file", "utf8");
+      const logFile = join(root, "logs", "lane.log");
+      await mkdir(join(root, "logs"), { recursive: true });
+      await writeFile(logFile, "", "utf8");
+      const command = buildLaneCommand({
+        runId: "run1",
+        laneId: "lane-2",
+        logFile,
+        checkpointFile: join(invalidParent, "checkpoint.md"),
+        resultFile: join(root, "results", "result.txt"),
+        steps: 0,
+        stepDelaySeconds: 0,
+      });
+      const process = Bun.spawn(["bash", "-c", command], {
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+
+      await process.exited;
+
+      expect(await readFile(logFile, "utf8")).toMatch(/^mkdir:.*not-a-directory/m);
     } finally {
       await rm(root, { recursive: true });
     }

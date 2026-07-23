@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { RunEvent, RunEventDataByType, RunEventType } from "../src/runtime/events.ts";
-import { reduce, type RunView } from "../src/runtime/reducer.ts";
+import {
+  projectRunState,
+  reduce,
+  type RunView,
+} from "../src/runtime/reducer.ts";
 
 function event<T extends RunEventType>(
   sequence: number,
@@ -26,6 +30,53 @@ function event<T extends RunEventType>(
 }
 
 describe("reduce", () => {
+  test("projects an all-terminal replay without run_finished as incomplete", () => {
+    let state = reduce(
+      undefined,
+      event(1, "run_started", {
+        data: {
+          workflow: "wf",
+          workspace: "w1",
+          cwd: "/tmp/run-1",
+          splitDirection: "down",
+          tabId: "w1:t1",
+          controllerPaneId: "w1:p1",
+          fixedPoint: null,
+        },
+      }),
+    );
+    state = reduce(
+      state,
+      event(2, "lane_registered", {
+        laneId: "lane-1",
+        data: {
+          laneId: "lane-1",
+          paneId: "w1:p2",
+          logFile: "/tmp/lane-1.log",
+          sentinelToken: "FLOW_run-1_LANE_lane-1_EXIT",
+          steps: 1,
+          stepDelaySeconds: 0,
+        },
+      }),
+    );
+    state = reduce(
+      state,
+      event(3, "lane_dispatched", {
+        laneId: "lane-1",
+        data: { command: "actual command" },
+      }),
+    );
+    state = reduce(
+      state,
+      event(4, "lane_exited", {
+        laneId: "lane-1",
+        data: { exitCode: 0, waitMatched: true },
+      }),
+    );
+
+    expect(projectRunState(state)).toBe("incomplete");
+  });
+
   test("replays the complete event vocabulary into orthogonal lane state", () => {
     const events: RunEvent[] = [
       event(1, "run_started", {
@@ -54,7 +105,10 @@ describe("reduce", () => {
         }),
       ),
       event(6, "lane_dispatch_intent", { laneId: "exited", data: {} }),
-      event(7, "lane_dispatched", { laneId: "exited", data: {} }),
+      event(7, "lane_dispatched", {
+        laneId: "exited",
+        data: { command: "actual command" },
+      }),
       event(8, "lane_live", { laneId: "exited", data: {} }),
       event(9, "lane_checkpoint", {
         actor: "agent",
@@ -94,7 +148,7 @@ describe("reduce", () => {
       }),
       event(19, "lane_failed_to_start", {
         laneId: "rejected",
-        data: { rejection: "dispatch rejected" },
+        data: { rejection: "dispatch rejected", command: "failed command" },
       }),
       event(20, "controller_attached", {
         data: { controllerId: "controller-2", epoch: 1, pid: 4242 },
@@ -139,6 +193,7 @@ describe("reduce", () => {
     expect(stateAfterDispatch!.lanes.exited).toMatchObject({
       runtimeState: "pending",
       dispatchedAt: 70,
+      dispatchedCommand: "actual command",
     });
     expect(stateAfterLive!.lanes.exited).toMatchObject({
       runtimeState: "running",
@@ -251,12 +306,18 @@ describe("reduce", () => {
 
     const dispatched = reduce(
       registered,
-      event(3, "lane_dispatched", { laneId: "lane-1", data: {} }),
+      event(3, "lane_dispatched", {
+        laneId: "lane-1",
+        data: { command: "actual command" },
+      }),
     );
     expect(() =>
       reduce(
         dispatched,
-        event(4, "lane_dispatched", { laneId: "lane-1", data: {} }),
+        event(4, "lane_dispatched", {
+          laneId: "lane-1",
+          data: { command: "duplicate command" },
+        }),
       ),
     ).toThrow(/lane_dispatched/);
 
@@ -304,7 +365,7 @@ describe("reduce", () => {
         terminal,
         event(4, "lane_failed_to_start", {
           laneId: "lane-1",
-          data: { rejection: "rejected" },
+          data: { rejection: "rejected", command: null },
         }),
       ),
     ).toThrow(/terminal/);
@@ -435,7 +496,7 @@ describe("terminal lanes cannot be re-dispatched", () => {
       "failed_to_start",
       event(3, "lane_failed_to_start", {
         laneId: "lane-1",
-        data: { rejection: "refused" },
+        data: { rejection: "refused", command: null },
       }),
     ],
   ];
@@ -447,7 +508,13 @@ describe("terminal lanes cannot be re-dispatched", () => {
         expect(() =>
           reduce(
             terminal,
-            event(4, dispatchType, { laneId: "lane-1", data: {} }),
+            event(4, dispatchType, {
+              laneId: "lane-1",
+              data:
+                dispatchType === "lane_dispatched"
+                  ? { command: "late command" }
+                  : {},
+            }),
           ),
         ).toThrow(/terminal/);
       });

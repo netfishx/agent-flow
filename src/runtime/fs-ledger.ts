@@ -29,6 +29,7 @@ interface ReplayResult {
 }
 
 let snapshotSequence = 0;
+const POISON_FILE = "poison.json";
 
 export function resolveLedgerRoot(environment = process.env): string {
   const configured = environment.FLOW_LEDGER_ROOT;
@@ -130,6 +131,7 @@ export class FsLedger implements Ledger {
     if (root.length === 0) throw new Error("FsLedger root must not be empty");
     internalRegisterCommittedEventReader(this, async (runId) => {
       assertHandleId("runId", runId);
+      await this.assertRunNotPoisoned(runId);
       const replayed = await replayFile(join(this.runDir(runId), "events.jsonl"));
       return replayed.events.map((event) => structuredClone(event));
     });
@@ -147,6 +149,7 @@ export class FsLedger implements Ledger {
       if (queuedPoison) {
         throw this.poisonedRunError(event.runId, queuedPoison);
       }
+      await this.assertRunNotPoisoned(event.runId);
       const runDir = this.runDir(event.runId);
       const eventFile = join(runDir, "events.jsonl");
       const replayed = await replayFile(eventFile);
@@ -190,10 +193,18 @@ export class FsLedger implements Ledger {
               `event append failed: ${errorMessage(appendError)}; rollback failed: ${errorMessage(rollbackError)}`,
               { cause: appendError },
             );
-            // This poison is intentionally instance-local. Another process may
-            // still replay the orphan line; #15 recovery owns that
-            // cross-process window.
             this.poisonedRuns.set(event.runId, compound);
+            try {
+              await this.writePoisonMarker(runDir, {
+                appendFailure: errorMessage(appendError),
+                rollbackFailure: errorMessage(rollbackError),
+                lastValidByteLength: originalSize,
+              });
+            } catch {
+              // If even the poison marker cannot be persisted (for example, a
+              // total disk failure), another process can still see the orphan
+              // line. #15 recovery owns that residual cross-process window.
+            }
             throw compound;
           }
           throw appendError;
@@ -227,6 +238,7 @@ export class FsLedger implements Ledger {
 
   async load(runId: string): Promise<RunView | null> {
     assertHandleId("runId", runId);
+    await this.assertRunNotPoisoned(runId);
     return (await replayFile(join(this.runDir(runId), "events.jsonl"))).view;
   }
 
@@ -318,6 +330,54 @@ export class FsLedger implements Ledger {
     contents: string,
   ): Promise<void> {
     await writeFile(path, contents, "utf8");
+  }
+
+  private async assertRunNotPoisoned(runId: string): Promise<void> {
+    const instancePoison = this.poisonedRuns.get(runId);
+    if (instancePoison) throw this.poisonedRunError(runId, instancePoison);
+    const path = join(this.runDir(runId), POISON_FILE);
+    let marker: string;
+    try {
+      marker = await readFile(path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw new Error(`cannot verify poison state for run "${runId}"`, {
+        cause: error,
+      });
+    }
+    throw new Error(
+      `run "${runId}" is poisoned after an unrecoverable append rollback failure: ${marker.trim() || "poison marker present"}`,
+    );
+  }
+
+  private async writePoisonMarker(
+    runDir: string,
+    failure: {
+      appendFailure: string;
+      rollbackFailure: string;
+      lastValidByteLength: number;
+    },
+  ): Promise<void> {
+    const path = join(runDir, POISON_FILE);
+    let handle: FileHandle | undefined;
+    try {
+      handle = await open(path, "wx");
+      await handle.writeFile(
+        `${JSON.stringify({ schemaVersion: 1, ...failure }, null, 2)}\n`,
+        "utf8",
+      );
+      await handle.sync();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+    const directory = await open(runDir, "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
   }
 
   private async truncateTrailingPartial(

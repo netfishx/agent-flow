@@ -26,6 +26,7 @@ export interface LaneView {
   readonly registeredAt: number;
   readonly dispatchIntentAt: number | null;
   readonly dispatchedAt: number | null;
+  readonly dispatchedCommand: string | null;
   readonly liveAt: number | null;
   readonly completedAt: number | null;
   readonly checkpointAt: number | null;
@@ -70,6 +71,13 @@ export interface RunView {
   readonly lastAppliedSequence: number;
 }
 
+export type RunState =
+  | "dispatched"
+  | "running"
+  | "incomplete"
+  | "complete"
+  | "partial";
+
 function assertNever(value: never): never {
   throw new Error(`unhandled run event ${JSON.stringify(value)}`);
 }
@@ -80,6 +88,29 @@ const TERMINAL_RUNTIME: ReadonlySet<RuntimeState> = new Set([
   "lost",
   "failed_to_start",
 ]);
+
+export function projectRunState(run: RunView): RunState {
+  if (run.finishStatus !== null) {
+    return run.finishStatus === "clean" ? "complete" : "partial";
+  }
+  const lanes = run.laneOrder.map((laneId) => run.lanes[laneId]!);
+  if (
+    lanes.length > 0 &&
+    lanes.every((lane) => TERMINAL_RUNTIME.has(lane.runtimeState))
+  ) {
+    return "incomplete";
+  }
+  if (
+    lanes.some(
+      (lane) =>
+        lane.runtimeState === "running" ||
+        (lane.runtimeState === "pending" && lane.dispatchedAt !== null),
+    )
+  ) {
+    return "running";
+  }
+  return "dispatched";
+}
 
 function assertNonTerminal(lane: LaneView, eventType: RunEvent["type"]): void {
   if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
@@ -185,6 +216,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         registeredAt: event.at,
         dispatchIntentAt: null,
         dispatchedAt: null,
+        dispatchedCommand: null,
         liveAt: null,
         completedAt: null,
         checkpointAt: null,
@@ -229,6 +261,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
           ...lane,
           runtimeState: "pending",
           dispatchedAt: event.at,
+          dispatchedCommand: event.data.command,
         };
       });
     case "lane_live":
@@ -291,6 +324,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
           runtimeState: "failed_to_start",
           completedAt: event.at,
           startRejection: event.data.rejection,
+          dispatchedCommand: event.data.command,
         };
       });
     case "lane_contract_evaluated":

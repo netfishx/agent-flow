@@ -3,11 +3,13 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FakeHerdrAdapter, createClock } from "../src/herdr/fake-adapter.ts";
+import type { PaneRef } from "../src/herdr/types.ts";
 import { FsLedger } from "../src/runtime/fs-ledger.ts";
 import type { FixedPoint, RunEvent } from "../src/runtime/events.ts";
 import type { LeaseHandle, Ledger } from "../src/runtime/ledger.ts";
 import type { RunView } from "../src/runtime/reducer.ts";
 import { PartialDispatchError, WorkflowRuntime } from "../src/runtime/runtime.ts";
+import { buildLaneCommand } from "../src/smoke/lane.ts";
 import { SmokeRuntime } from "../src/smoke/smoke-runtime.ts";
 
 const roots: string[] = [];
@@ -60,13 +62,131 @@ class RejectFactOnceLedger implements Ledger {
   }
 }
 
+class RejectEventTypeLedger implements Ledger {
+  constructor(
+    private readonly delegate: FsLedger,
+    private readonly rejectedType: RunEvent["type"],
+  ) {}
+
+  commit(event: RunEvent): Promise<void> {
+    if (event.type === this.rejectedType) {
+      return Promise.reject(new Error(`injected ${event.type} failure`));
+    }
+    return this.delegate.commit(event);
+  }
+
+  load(runId: string): Promise<RunView | null> {
+    return this.delegate.load(runId);
+  }
+
+  list(): Promise<{ runId: string }[]> {
+    return this.delegate.list();
+  }
+
+  acquireLease(
+    runId: string,
+    controller: { controllerId: string; pid: number },
+  ): Promise<LeaseHandle> {
+    return this.delegate.acquireLease(runId, controller);
+  }
+}
+
 class InspectableWorkflowRuntime extends WorkflowRuntime {
   currentView(runId: string): RunView {
     return this.runView(runId);
   }
 }
 
+class ShellExecutingFakeAdapter extends FakeHerdrAdapter {
+  override async runInPane(pane: PaneRef, command: string): Promise<void> {
+    const child = Bun.spawn(["bash", "-c", command], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    const exitCode = await child.exited;
+    if (exitCode !== 0) {
+      throw new Error(`shell-backed lane exited ${exitCode}`);
+    }
+    await super.runInPane(pane, command);
+  }
+}
+
 describe("persisted terminal lane facts", () => {
+  test("run_started commit failure releases the pre-dispatch controller lease", async () => {
+    const { ledgerRoot, cwd } = await directories();
+    const durable = new FsLedger(ledgerRoot);
+    const adapter = new FakeHerdrAdapter({
+      lanes: [{ laneId: "lane-1", exitCode: 0 }],
+    });
+    const runtime = new WorkflowRuntime({
+      adapter,
+      ledger: new RejectEventTypeLedger(durable, "run_started"),
+      clock: () => 10_000,
+      idgen: () => "run-start-rejected",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+
+    await expect(
+      runtime.startWorkflow({
+        workflow: "cross-review",
+        workspace: "w1",
+        cwd,
+        lanes: [{ laneId: "lane-1", steps: 1 }],
+      }),
+    ).rejects.toThrow(/run_started failure/);
+    expect(adapter.dispatched).toHaveLength(0);
+    expect(await durable.load("run-start-rejected")).toBeNull();
+    const reacquired = await new FsLedger(ledgerRoot).acquireLease(
+      "run-start-rejected",
+      { controllerId: "after-start-failure", pid: 10_001 },
+    );
+    await reacquired.release();
+  });
+
+  test("lane_registered commit failure is structured and releases its lease", async () => {
+    const { ledgerRoot, cwd } = await directories();
+    const durable = new FsLedger(ledgerRoot);
+    const adapter = new FakeHerdrAdapter({
+      lanes: [{ laneId: "lane-1", exitCode: 0 }],
+    });
+    const runtime = new WorkflowRuntime({
+      adapter,
+      ledger: new RejectEventTypeLedger(durable, "lane_registered"),
+      clock: () => 11_000,
+      idgen: () => "run-register-rejected",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    let failure: unknown;
+
+    try {
+      await runtime.startWorkflow({
+        workflow: "cross-review",
+        workspace: "w1",
+        cwd,
+        lanes: [{ laneId: "lane-1", steps: 1 }],
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(PartialDispatchError);
+    expect(failure).toMatchObject({
+      runId: "run-register-rejected",
+      startedLaneIds: [],
+    });
+    expect(adapter.dispatched).toHaveLength(0);
+    expect((await durable.load("run-register-rejected"))!.workflow).toBe(
+      "cross-review",
+    );
+    const reacquired = await new FsLedger(ledgerRoot).acquireLease(
+      "run-register-rejected",
+      { controllerId: "after-register-failure", pid: 11_001 },
+    );
+    await reacquired.release();
+  });
+
   test("a fresh ledger loads fixed point and all four dimensions with distinct artifacts", async () => {
     const { ledgerRoot, cwd } = await directories();
     const clock = createClock(1_000);
@@ -74,6 +194,7 @@ describe("persisted terminal lane facts", () => {
       clock,
       lanes: [{ laneId: "lane-1", exitCode: 0 }],
     });
+    let commandBuilds = 0;
     const runtime = new InspectableWorkflowRuntime({
       adapter,
       ledger: new FsLedger(ledgerRoot),
@@ -81,6 +202,8 @@ describe("persisted terminal lane facts", () => {
       idgen: () => "run-persist",
       readResultFile: adapter.readResultFile,
       sleep: async () => {},
+      laneCommandBuilder: (input) =>
+        `${buildLaneCommand(input)} command-build=${++commandBuilds}`,
     });
 
     const handle = await runtime.startWorkflow({
@@ -106,6 +229,7 @@ describe("persisted terminal lane facts", () => {
       .trim()
       .split("\n");
     expect(loaded!.lastAppliedSequence).toBe(eventLines.length);
+    expect(commandBuilds).toBe(1);
     expect(loaded).toEqual(runtime.currentView(handle.runId));
     expect(loaded!.fixedPoint).toEqual(fixedPoint);
     expect(loaded!.lanes["lane-1"]).toMatchObject({
@@ -118,13 +242,16 @@ describe("persisted terminal lane facts", () => {
     });
     const lane = loaded!.lanes["lane-1"]!;
     expect(lane.checkpointFile).toBe(
-      join(cwd, "checkpoints", "run-persist-lane-1.md"),
+      join(cwd, "run-persist", "checkpoints", "lane-1.md"),
     );
     expect(lane.resultFile).toBe(
-      join(cwd, "results", "run-persist-lane-1-result.txt"),
+      join(cwd, "run-persist", "results", "lane-1-result.txt"),
     );
     expect(lane.evidenceFile).toBe(
-      join(cwd, "evidence", "run-persist-lane-1-evidence.json"),
+      join(cwd, "run-persist", "evidence", "lane-1-evidence.json"),
+    );
+    expect(lane.logFile).toBe(
+      join(cwd, "run-persist", "logs", "lane-1.log"),
     );
     expect(lane.logFile).not.toBe(lane.checkpointFile);
     expect(lane.checkpointFile).not.toBe(lane.resultFile);
@@ -147,6 +274,7 @@ describe("persisted terminal lane facts", () => {
       termination: "sentinel-exit",
       signal: null,
       failure: null,
+      environmentFailure: null,
     });
     const reacquired = await new FsLedger(ledgerRoot).acquireLease(handle.runId, {
       controllerId: "next-controller",
@@ -193,7 +321,76 @@ describe("persisted terminal lane facts", () => {
       JSON.parse(
         await readFile(loaded!.lanes["lane-1"]!.evidenceFile!, "utf8"),
       ),
-    ).toMatchObject({ signal: "SIGINT", failure: null });
+    ).toMatchObject({
+      signal: "SIGINT",
+      failure: null,
+      environmentFailure: null,
+    });
+  });
+
+  test("foreign stderr is durable execution evidence and fails verification", async () => {
+    const { ledgerRoot, cwd } = await directories();
+    const clock = createClock(2_500);
+    const adapter = new ShellExecutingFakeAdapter({
+      clock,
+      lanes: [{ laneId: "stderr-lane", exitCode: 0 }],
+    });
+    const ledger = new FsLedger(ledgerRoot);
+    const runtime = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run-stderr",
+      readResultFile: (path) => readFile(path, "utf8"),
+      sleep: async () => {},
+    });
+    const handle = await runtime.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd,
+      lanes: [
+        {
+          laneId: "stderr-lane",
+          steps: 1,
+          stepDelaySeconds: -1,
+        },
+      ],
+    });
+    await runtime.confirmLaneStarted(handle.runId, "stderr-lane");
+    await runtime.awaitLane(handle.runId, "stderr-lane", 1_000);
+
+    const loaded = await ledger.load(handle.runId);
+    const lane = loaded!.lanes["stderr-lane"]!;
+    const durableLog = await readFile(lane.logFile, "utf8");
+    const evidence = JSON.parse(
+      await readFile(lane.evidenceFile!, "utf8"),
+    ) as Record<string, unknown>;
+    const events = (
+      await readFile(
+        join(ledgerRoot, "runs", handle.runId, "events.jsonl"),
+        "utf8",
+      )
+    )
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as RunEvent);
+    const dispatched = events.find((event) => event.type === "lane_dispatched");
+
+    expect(durableLog).toContain("sleep");
+    expect(evidence.environmentFailure).toBeString();
+    expect(String(evidence.environmentFailure)).toContain("sleep");
+    expect(durableLog).toContain(String(evidence.environmentFailure));
+    expect(evidence).toMatchObject({
+      command: adapter.dispatched[0]!.command,
+      exitCode: 0,
+      termination: "sentinel-exit",
+      signal: null,
+      failure: null,
+    });
+    expect(dispatched?.data).toEqual({
+      command: adapter.dispatched[0]!.command,
+    });
+    expect(lane.verificationState).toBe("failed");
   });
 
   test("crashed and lost lanes skip checkpoints but still record failed facts", async () => {
@@ -270,6 +467,7 @@ describe("persisted terminal lane facts", () => {
       exitCode: null,
       signal: null,
       failure: null,
+      environmentFailure: "process started",
     });
     expect(
       JSON.parse(await readFile(loaded!.lanes.lost!.evidenceFile!, "utf8")),
@@ -278,6 +476,7 @@ describe("persisted terminal lane facts", () => {
       exitCode: null,
       signal: null,
       failure: "dispatch-outcome-unknown",
+      environmentFailure: null,
     });
   });
 
@@ -378,7 +577,7 @@ describe("persisted terminal lane facts", () => {
     );
   });
 
-  test("a failed fact append is retried before run_finished", async () => {
+  test("a failed fact append does not block run_finished and holds the lease until retry", async () => {
     const { ledgerRoot, cwd } = await directories();
     const clock = createClock(6_000);
     const adapter = new FakeHerdrAdapter({
@@ -405,16 +604,45 @@ describe("persisted terminal lane facts", () => {
     await expect(runtime.awaitLane(handle.runId, "lane-1", 1_000)).rejects.toThrow(
       /contract append failure/,
     );
-    expect((await durable.load(handle.runId))!.finishStatus).toBeNull();
+    const finishedWithoutFacts = await durable.load(handle.runId);
+    expect(finishedWithoutFacts!.finishStatus).toBe("clean");
+    expect(finishedWithoutFacts!.lanes["lane-1"]).toMatchObject({
+      contractState: "unknown",
+      verificationState: "unverified",
+    });
+    await expect(
+      new FsLedger(ledgerRoot).acquireLease(handle.runId, {
+        controllerId: "too-early",
+        pid: 6_001,
+      }),
+    ).rejects.toThrow(/already held/);
 
     await expect(runtime.awaitLane(handle.runId, "lane-1", 1_000)).resolves.toMatchObject({
       state: "complete",
       exitCode: 0,
     });
-    expect((await durable.load(handle.runId))!.finishStatus).toBe("clean");
+    const completed = await durable.load(handle.runId);
+    expect(completed!.finishStatus).toBe("clean");
+    expect(completed!.lanes["lane-1"]).toMatchObject({
+      contractState: "satisfied",
+      verificationState: "verified",
+    });
+    const eventFile = join(ledgerRoot, "runs", handle.runId, "events.jsonl");
+    const types = (await readFile(eventFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => (JSON.parse(line) as RunEvent).type);
+    expect(types.indexOf("run_finished")).toBeLessThan(
+      types.indexOf("lane_contract_evaluated"),
+    );
+    const reacquired = await new FsLedger(ledgerRoot).acquireLease(handle.runId, {
+      controllerId: "after-facts",
+      pid: 6_002,
+    });
+    await reacquired.release();
   });
 
-  test("a terminal sibling cannot finish the run while another lane lacks a durable fact", async () => {
+  test("runtime-terminal siblings finish even while one lane lacks durable facts", async () => {
     const { ledgerRoot, cwd } = await directories();
     const clock = createClock(7_000);
     const adapter = new FakeHerdrAdapter({
@@ -456,9 +684,9 @@ describe("persisted terminal lane facts", () => {
       .trim()
       .split("\n")
       .map((line) => (JSON.parse(line) as RunEvent).type);
-    expect(committedTypes).not.toContain("run_finished");
-    expect((await durable.load(handle.runId))!.finishStatus).toBeNull();
-    expect(runtime.currentView(handle.runId).finishStatus).toBeNull();
+    expect(committedTypes).toContain("run_finished");
+    expect((await durable.load(handle.runId))!.finishStatus).toBe("clean");
+    expect(runtime.currentView(handle.runId).finishStatus).toBe("clean");
 
     await runtime.awaitLane(handle.runId, "missing-fact", 1_000);
 
@@ -468,6 +696,9 @@ describe("persisted terminal lane facts", () => {
       .map((line) => (JSON.parse(line) as RunEvent).type);
     expect(completedTypes.filter((type) => type === "run_finished")).toHaveLength(1);
     expect((await durable.load(handle.runId))!.finishStatus).toBe("clean");
+    expect(completedTypes.lastIndexOf("lane_verification_recorded")).toBeGreaterThan(
+      completedTypes.indexOf("run_finished"),
+    );
   });
 
   test("inspect records failed-to-start facts after a partial dispatch", async () => {
@@ -527,9 +758,11 @@ describe("persisted terminal lane facts", () => {
         await readFile(loaded!.lanes.rejected!.evidenceFile!, "utf8"),
       ),
     ).toMatchObject({
+      command: adapter.dispatched[1]!.command,
       termination: "failed_to_start",
       signal: null,
       failure: "fake: runInPane failed",
+      environmentFailure: null,
       exitCode: null,
     });
     const events = (
@@ -561,17 +794,30 @@ describe("persisted terminal lane facts", () => {
           event.laneId === "rejected",
       ),
     ).toBe(true);
-    expect(events.at(-1)?.type).toBe("run_finished");
+    const runFinishedIndex = events.findIndex(
+      (event) => event.type === "run_finished",
+    );
+    expect(runFinishedIndex).toBeGreaterThan(-1);
+    expect(
+      events.findIndex(
+        (event) =>
+          event.type === "lane_contract_evaluated" &&
+          event.laneId === "rejected",
+      ),
+    ).toBeGreaterThan(runFinishedIndex);
   });
 
-  test("two runs sharing cwd and laneId keep all artifact facts isolated", async () => {
+  test("run and lane path segments prevent hyphen-boundary artifact collisions", async () => {
     const { ledgerRoot, cwd } = await directories();
     const clock = createClock(9_000);
     const adapter = new FakeHerdrAdapter({
       clock,
-      lanes: [{ laneId: "lane-1", exitCode: 0 }],
+      lanes: [
+        { laneId: "c", exitCode: 0 },
+        { laneId: "b-c", exitCode: 0 },
+      ],
     });
-    const runIds = ["run-artifact-1", "run-artifact-2"];
+    const runIds = ["a-b", "a"];
     const ledger = new FsLedger(ledgerRoot);
     const runtime = new WorkflowRuntime({
       adapter,
@@ -581,29 +827,44 @@ describe("persisted terminal lane facts", () => {
       readResultFile: adapter.readResultFile,
       sleep: async () => {},
     });
-    const config = {
+    const first = await runtime.startWorkflow({
       workflow: "cross-review",
       workspace: "w1",
       cwd,
-      lanes: [{ laneId: "lane-1", steps: 1 }],
-    } as const;
-    const first = await runtime.startWorkflow(config);
-    await runtime.confirmLaneStarted(first.runId, "lane-1");
-    const second = await runtime.startWorkflow(config);
-    await runtime.confirmLaneStarted(second.runId, "lane-1");
-    await runtime.interruptLane(first.runId, "lane-1");
+      lanes: [{ laneId: "c", steps: 1 }],
+    });
+    await runtime.confirmLaneStarted(first.runId, "c");
+    await runtime.awaitLane(first.runId, "c", 1_000);
+    const second = await runtime.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd,
+      lanes: [{ laneId: "b-c", steps: 1 }],
+    });
+    await runtime.confirmLaneStarted(second.runId, "b-c");
+    await runtime.awaitLane(second.runId, "b-c", 1_000);
 
-    await runtime.awaitLane(first.runId, "lane-1", 1_000);
-    await runtime.awaitLane(second.runId, "lane-1", 1_000);
-
-    const firstLane = (await ledger.load(first.runId))!.lanes["lane-1"]!;
-    const secondLane = (await ledger.load(second.runId))!.lanes["lane-1"]!;
-    expect(firstLane.semanticState).toBe("partial");
-    expect(secondLane.semanticState).toBe("complete");
-    for (const field of ["checkpointFile", "resultFile", "evidenceFile"] as const) {
+    const firstLane = (await ledger.load(first.runId))!.lanes.c!;
+    const secondLane = (await ledger.load(second.runId))!.lanes["b-c"]!;
+    expect(firstLane).toMatchObject({
+      logFile: join(cwd, "a-b", "logs", "c.log"),
+      checkpointFile: join(cwd, "a-b", "checkpoints", "c.md"),
+      resultFile: join(cwd, "a-b", "results", "c-result.txt"),
+      evidenceFile: join(cwd, "a-b", "evidence", "c-evidence.json"),
+    });
+    expect(secondLane).toMatchObject({
+      logFile: join(cwd, "a", "logs", "b-c.log"),
+      checkpointFile: join(cwd, "a", "checkpoints", "b-c.md"),
+      resultFile: join(cwd, "a", "results", "b-c-result.txt"),
+      evidenceFile: join(cwd, "a", "evidence", "b-c-evidence.json"),
+    });
+    for (const field of [
+      "logFile",
+      "checkpointFile",
+      "resultFile",
+      "evidenceFile",
+    ] as const) {
       expect(firstLane[field]).not.toBe(secondLane[field]);
-      expect(firstLane[field]).toContain(first.runId);
-      expect(secondLane[field]).toContain(second.runId);
     }
   });
 });

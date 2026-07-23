@@ -4,7 +4,7 @@
 import type { PaneRef } from "../herdr/types.ts";
 import { buildLaneCommand } from "../smoke/lane.ts";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import type {
   NewRunEvent,
   RunEvent,
@@ -19,7 +19,12 @@ import {
   parseExitFromSentinel,
 } from "./ids.ts";
 import { measured, REASONS, tokensUnavailable, unavailable } from "./metrics.ts";
-import { reduce, type LaneView, type RunView } from "./reducer.ts";
+import {
+  projectRunState,
+  reduce,
+  type LaneView,
+  type RunView,
+} from "./reducer.ts";
 import type {
   InterruptOutcome,
   LanePhaseTiming,
@@ -27,7 +32,6 @@ import type {
   LaneState,
   LaneStatus,
   RunHandle,
-  RunState,
   RuntimeDeps,
   StartWorkflowConfig,
   WorkflowMetrics,
@@ -43,6 +47,7 @@ const TERMINAL_RUNTIME: ReadonlySet<RuntimeState> = new Set([
 ]);
 
 interface LaneArtifactPaths {
+  readonly logFile: string;
   readonly checkpointFile: string;
   readonly resultFile: string;
   readonly evidenceFile: string;
@@ -53,10 +58,12 @@ function laneArtifactPaths(
   runId: string,
   laneId: string,
 ): LaneArtifactPaths {
+  const runDirectory = join(cwd, runId);
   return {
-    checkpointFile: `${cwd}/checkpoints/${runId}-${laneId}.md`,
-    resultFile: `${cwd}/results/${runId}-${laneId}-result.txt`,
-    evidenceFile: `${cwd}/evidence/${runId}-${laneId}-evidence.json`,
+    logFile: join(runDirectory, "logs", `${laneId}.log`),
+    checkpointFile: join(runDirectory, "checkpoints", `${laneId}.md`),
+    resultFile: join(runDirectory, "results", `${laneId}-result.txt`),
+    evidenceFile: join(runDirectory, "evidence", `${laneId}-evidence.json`),
   };
 }
 
@@ -105,9 +112,24 @@ function runnerTermination(lane: LaneView): Pick<
   }
 }
 
+function firstEnvironmentFailure(output: string): string | null {
+  const knownLaneOutput = [
+    /^START run=[A-Za-z0-9-]+ lane=[A-Za-z0-9-]+ pid=\d+$/,
+    /^STEP=\d+\/\d+ lane=[A-Za-z0-9-]+$/,
+    /^STEP=\d+ EVENT=\S+$/,
+    /^FLOW_[A-Za-z0-9-]+_LANE_[A-Za-z0-9-]+_EXIT=-?\d+$/,
+    /^RESULT:.*$/,
+  ];
+  for (const line of output.split("\n")) {
+    if (line.length === 0) continue;
+    if (!knownLaneOutput.some((format) => format.test(line))) return line;
+  }
+  return null;
+}
+
 /**
- * Raised when dispatch fails partway. The run is already registered, so the
- * lanes that did start remain inspectable and interruptible via `runId`.
+ * Raised after durable run creation when pre-dispatch registration or physical
+ * dispatch fails. Any lanes that did start remain controllable via `runId`.
  */
 export class PartialDispatchError extends Error {
   constructor(
@@ -169,13 +191,14 @@ export class WorkflowRuntime {
         cwd: config.cwd,
       });
       previous = pane;
+      const artifacts = laneArtifactPaths(config.cwd, runId, spec.laneId);
       const item = {
         spec,
         pane,
-        logFile: `${config.cwd}/lane-${runId}-${spec.laneId}.log`,
+        logFile: artifacts.logFile,
         sentinelToken: laneSentinelToken(runId, spec.laneId),
         stepDelaySeconds: spec.stepDelaySeconds ?? 0.2,
-        artifacts: laneArtifactPaths(config.cwd, runId, spec.laneId),
+        artifacts,
       };
       topology.push(item);
     }
@@ -203,30 +226,50 @@ export class WorkflowRuntime {
       await this.releaseControllerLease(runId);
       throw error;
     }
-    for (const item of topology) {
-      const { spec } = item;
-      await this.commitEvent(runId, {
-        type: "lane_registered",
-        actor: "runtime",
-        laneId: spec.laneId,
-        data: {
+    try {
+      for (const item of topology) {
+        const { spec } = item;
+        await this.commitEvent(runId, {
+          type: "lane_registered",
+          actor: "runtime",
           laneId: spec.laneId,
-          paneId: item.pane.id,
-          logFile: item.logFile,
-          sentinelToken: item.sentinelToken,
-          steps: spec.steps,
-          stepDelaySeconds: item.stepDelaySeconds,
-          ...(spec.role === undefined ? {} : { role: spec.role }),
-        },
-      });
-    }
+          data: {
+            laneId: spec.laneId,
+            paneId: item.pane.id,
+            logFile: item.logFile,
+            sentinelToken: item.sentinelToken,
+            steps: spec.steps,
+            stepDelaySeconds: item.stepDelaySeconds,
+            ...(spec.role === undefined ? {} : { role: spec.role }),
+          },
+        });
+      }
+      for (const item of topology) {
+        await mkdir(dirname(item.logFile), { recursive: true });
+        await writeFile(item.logFile, "", "utf8");
+      }
 
-    await this.settle(config.startupSettleMs ?? 0);
+      await this.settle(config.startupSettleMs ?? 0);
+    } catch (cause) {
+      try {
+        await this.releaseControllerLease(runId);
+      } catch (releaseCause) {
+        throw new PartialDispatchError(
+          runId,
+          [],
+          new AggregateError(
+            [cause, releaseCause],
+            "pre-dispatch failure and controller lease release failure",
+          ),
+        );
+      }
+      throw new PartialDispatchError(runId, [], cause);
+    }
 
     const started: string[] = [];
     for (let index = 0; index < topology.length; index++) {
       const item = topology[index]!;
-      const command = buildLaneCommand({
+      const command = (this.deps.laneCommandBuilder ?? buildLaneCommand)({
         runId,
         laneId: item.spec.laneId,
         logFile: item.logFile,
@@ -244,7 +287,7 @@ export class WorkflowRuntime {
             type: "lane_failed_to_start",
             actor: "runtime",
             laneId: item.spec.laneId,
-            data: { rejection: rejectionMessage(cause) },
+            data: { rejection: rejectionMessage(cause), command },
           });
           for (const aborted of topology.slice(index + 1)) {
             await this.commitEvent(runId, {
@@ -253,6 +296,7 @@ export class WorkflowRuntime {
               laneId: aborted.spec.laneId,
               data: {
                 rejection: "dispatch aborted after earlier lane failed",
+                command: null,
               },
             });
           }
@@ -270,7 +314,7 @@ export class WorkflowRuntime {
             type: "lane_dispatched",
             actor: "runtime",
             laneId: item.spec.laneId,
-            data: {},
+            data: { command },
           },
           dispatchedAt,
         );
@@ -285,6 +329,7 @@ export class WorkflowRuntime {
 
   async inspectWorkflow(runId: string): Promise<WorkflowStatus> {
     await this.flushPending(runId);
+    await this.finishIfTerminal(runId);
     let run = this.getRun(runId);
     for (const laneId of run.laneOrder) {
       await this.refreshLane(runId, laneId);
@@ -303,7 +348,7 @@ export class WorkflowRuntime {
     });
     return {
       runId,
-      state: this.runState(run),
+      state: projectRunState(run),
       lanes,
       metrics: this.metrics(run),
     };
@@ -389,8 +434,8 @@ export class WorkflowRuntime {
     await this.flushPending(runId);
     let lane = this.getLane(this.getRun(runId), laneId);
     if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
-      await this.recordTerminalFacts(runId, laneId, lane.exitCode);
       await this.finishIfTerminal(runId);
+      await this.recordTerminalFacts(runId, laneId, lane.exitCode);
       return this.inspectLaneResult(runId, laneId);
     }
 
@@ -599,8 +644,8 @@ export class WorkflowRuntime {
           };
         },
       );
-      await this.recordTerminalFacts(runId, laneId, exitCode);
       await this.finishIfTerminal(runId);
+      await this.recordTerminalFacts(runId, laneId, exitCode);
       const finalizedLane = this.getLane(this.getRun(runId), laneId);
       if (
         finalizedLane.runtimeState === "lost" &&
@@ -629,8 +674,8 @@ export class WorkflowRuntime {
         },
       };
     });
-    await this.recordTerminalFacts(runId, laneId, exitCode);
     await this.finishIfTerminal(runId);
+    await this.recordTerminalFacts(runId, laneId, exitCode);
   }
 
   private async recordTerminalFacts(
@@ -701,39 +746,37 @@ export class WorkflowRuntime {
     });
 
     const terminalLane = this.getLane(this.getRun(runId), laneId);
-    const command = buildLaneCommand({
-      runId,
-      laneId,
-      logFile: terminalLane.logFile,
-      checkpointFile,
-      resultFile,
-      steps: terminalLane.steps,
-      stepDelaySeconds: terminalLane.stepDelaySeconds,
-    });
+    const output =
+      terminalLane.dispatchedAt === null
+        ? ""
+        : await this.readDurable(terminalLane.logFile);
     const termination = runnerTermination(terminalLane);
     const evidence: RunnerEvidence = {
       schemaVersion: 1,
       runId,
       laneId,
-      command,
+      command: terminalLane.dispatchedCommand,
       logFile: terminalLane.logFile,
       dispatchedAt: terminalLane.dispatchedAt,
       liveAt: terminalLane.liveAt,
       completedAt: terminalLane.completedAt,
       exitCode: parsedExitCode,
       signal: terminalLane.signal,
+      environmentFailure: firstEnvironmentFailure(output),
       ...termination,
     };
     await mkdir(dirname(evidenceFile), { recursive: true });
     await writeFile(evidenceFile, `${JSON.stringify(evidence, null, 2)}\n`, "utf8");
     const evidenceComplete =
+      evidence.command !== null &&
       evidence.command.length > 0 &&
       evidence.logFile.length > 0 &&
       evidence.dispatchedAt !== null &&
       evidence.liveAt !== null &&
       evidence.completedAt !== null &&
       evidence.exitCode !== null &&
-      evidence.termination === "sentinel-exit";
+      evidence.termination === "sentinel-exit" &&
+      evidence.environmentFailure === null;
     await this.commitEventConditionally(runId, (current) => {
       if (!current) throw new Error(`unknown runId "${runId}"`);
       const currentLane = this.getLane(current, laneId);
@@ -748,6 +791,7 @@ export class WorkflowRuntime {
         },
       };
     });
+    await this.releaseControllerLeaseIfFactsComplete(runId);
   }
 
   private async finishIfTerminal(runId: string): Promise<void> {
@@ -756,15 +800,6 @@ export class WorkflowRuntime {
       if (run.finishStatus !== null || run.laneOrder.length === 0) return null;
       const lanes = run.laneOrder.map((laneId) => this.getLane(run, laneId));
       if (!lanes.every((lane) => TERMINAL_RUNTIME.has(lane.runtimeState))) {
-        return null;
-      }
-      if (
-        lanes.some(
-          (lane) =>
-            (lane.contractEvaluatedAt === null ||
-              lane.verificationRecordedAt === null),
-        )
-      ) {
         return null;
       }
       const breakdown: RunOutcomeBreakdown = {
@@ -787,9 +822,21 @@ export class WorkflowRuntime {
         data: { status: clean ? "clean" : "degraded", breakdown },
       };
     });
-    if (this.getRun(runId).finishStatus !== null) {
-      await this.releaseControllerLease(runId);
-    }
+  }
+
+  private async releaseControllerLeaseIfFactsComplete(
+    runId: string,
+  ): Promise<void> {
+    const run = this.getRun(runId);
+    if (run.finishStatus === null) return;
+    const factsComplete = run.laneOrder.every((laneId) => {
+      const lane = this.getLane(run, laneId);
+      return (
+        lane.contractEvaluatedAt !== null &&
+        lane.verificationRecordedAt !== null
+      );
+    });
+    if (factsComplete) await this.releaseControllerLease(runId);
   }
 
   private async readDurable(path: string): Promise<string> {
@@ -811,17 +858,6 @@ export class WorkflowRuntime {
     const lane = run.lanes[laneId];
     if (!lane) throw new Error(`unknown laneId "${laneId}" in run "${run.runId}"`);
     return lane;
-  }
-
-  private runState(run: RunView): RunState {
-    const states = run.laneOrder.map((laneId) =>
-      laneState(this.getLane(run, laneId)),
-    );
-    if (states.some((state) => state === "running")) return "running";
-    if (states.every((state) => state !== "starting" && state !== "running")) {
-      return states.every((state) => state === "complete") ? "complete" : "partial";
-    }
-    return "dispatched";
   }
 
   private laneTiming(lane: LaneView): LanePhaseTiming {

@@ -538,10 +538,10 @@ describe("WorkflowRuntime event commits", () => {
       "run1#5",
       "run1#6",
       "run1#7",
-      "run1#11",
+      "run1#8",
     ]);
     expect(ledger.events.map((event) => event.sequence)).toEqual([
-      1, 2, 3, 4, 5, 6, 7, 11,
+      1, 2, 3, 4, 5, 6, 7, 8,
     ]);
     expect(
       ledger.events.every(

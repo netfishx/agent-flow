@@ -1,26 +1,11 @@
 import { FsLedger, resolveLedgerRoot } from "../runtime/fs-ledger.ts";
-import type { RunView } from "../runtime/reducer.ts";
+import { projectRunState } from "../runtime/reducer.ts";
 import { stat } from "node:fs/promises";
 
 const USAGE = "usage: flow status | flow inspect <runId>";
 
 interface TextSink {
   write(text: string): unknown;
-}
-
-function runState(run: RunView): string {
-  if (run.finishStatus !== null) {
-    return run.finishStatus === "clean" ? "complete" : "partial";
-  }
-  if (
-    run.laneOrder.some((laneId) => {
-      const lane = run.lanes[laneId]!;
-      return lane.runtimeState === "running" || lane.dispatchedAt !== null;
-    })
-  ) {
-    return "running";
-  }
-  return "dispatched";
 }
 
 function value(input: string | number | null): string {
@@ -66,7 +51,7 @@ export async function runFlowCli(
         const run = await ledger.load(listedRunId);
         if (!run) continue;
         stdout.write(
-          `${run.runId} workflow=${run.workflow} state=${runState(run)} finishStatus=${value(run.finishStatus)} lanes=${run.laneOrder.length} updatedAt=${run.updatedAt}\n`,
+          `${run.runId} workflow=${run.workflow} state=${projectRunState(run)} finishStatus=${value(run.finishStatus)} lanes=${run.laneOrder.length} updatedAt=${run.updatedAt}\n`,
         );
       }
       return 0;
@@ -78,7 +63,7 @@ export async function runFlowCli(
       return 1;
     }
     stdout.write(
-      `runId=${run.runId} workflow=${run.workflow} state=${runState(run)} finishStatus=${value(run.finishStatus)} updatedAt=${run.updatedAt}\n`,
+      `runId=${run.runId} workflow=${run.workflow} state=${projectRunState(run)} finishStatus=${value(run.finishStatus)} updatedAt=${run.updatedAt}\n`,
     );
     stdout.write(`fixedPoint=${JSON.stringify(run.fixedPoint)}\n`);
     for (const laneId of run.laneOrder) {

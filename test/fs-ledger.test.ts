@@ -213,7 +213,11 @@ describe("FsLedger public capabilities", () => {
     await expect(ledger.commit(started())).rejects.toThrow(
       /append fsync failure.*truncate rollback failure/,
     );
-    expect((await new FsLedger(root).load("run-fs"))!.lastAppliedSequence).toBe(1);
+    const fresh = new FsLedger(root);
+    await expect(fresh.load("run-fs")).rejects.toThrow(/run "run-fs" is poisoned/);
+    await expect(fresh.commit(registered())).rejects.toThrow(
+      /run "run-fs" is poisoned/,
+    );
 
     await expect(ledger.commit(registered())).rejects.toThrow(
       /run "run-fs" is poisoned/,

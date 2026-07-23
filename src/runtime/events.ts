@@ -58,7 +58,7 @@ export interface RunnerEvidence {
   readonly schemaVersion: 1;
   readonly runId: string;
   readonly laneId: string;
-  readonly command: string;
+  readonly command: string | null;
   /** Durable stdout/stderr artifact; the lane tees all process output here. */
   readonly logFile: string;
   readonly dispatchedAt: number | null;
@@ -67,11 +67,13 @@ export interface RunnerEvidence {
   readonly exitCode: number | null;
   readonly signal: string | null;
   readonly failure: string | null;
+  readonly environmentFailure: string | null;
   readonly termination:
     | "sentinel-exit"
     | "crashed"
     | "lost"
-    | "failed_to_start";
+    | "failed_to_start"
+    | "timeout";
 }
 
 export type EmptyEventData = Readonly<Record<string, never>>;
@@ -96,6 +98,10 @@ export interface LaneRegisteredData {
   readonly role?: string;
 }
 
+export interface LaneDispatchedData {
+  readonly command: string;
+}
+
 export interface LaneCheckpointData {
   readonly semanticState: SemanticState;
   readonly checkpointFile: string;
@@ -113,6 +119,7 @@ export interface LaneLostData {
 
 export interface LaneFailedToStartData {
   readonly rejection: string;
+  readonly command: string | null;
 }
 
 export interface LaneContractEvaluatedData {
@@ -153,7 +160,7 @@ export interface RunEventDataByType {
   readonly run_started: RunStartedData;
   readonly lane_registered: LaneRegisteredData;
   readonly lane_dispatch_intent: EmptyEventData;
-  readonly lane_dispatched: EmptyEventData;
+  readonly lane_dispatched: LaneDispatchedData;
   readonly lane_live: EmptyEventData;
   readonly lane_checkpoint: LaneCheckpointData;
   readonly lane_exited: LaneExitedData;

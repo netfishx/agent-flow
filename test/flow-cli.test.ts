@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  rm,
+  writeFile,
+  type FileHandle,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FsLedger } from "../src/runtime/fs-ledger.ts";
@@ -17,7 +23,10 @@ async function tempRoot(): Promise<string> {
   return root;
 }
 
-async function seedFinishedRun(root: string): Promise<void> {
+async function seedFinishedRun(
+  root: string,
+  options: { finished?: boolean } = {},
+): Promise<void> {
   const ledger = new FsLedger(root);
   const base = {
     schemaVersion: 1 as const,
@@ -74,7 +83,7 @@ async function seedFinishedRun(root: string): Promise<void> {
       type: "lane_dispatched",
       at: 120,
       actor: "runtime",
-      data: {},
+      data: { command: "actual command" },
     },
     {
       ...base,
@@ -149,7 +158,10 @@ async function seedFinishedRun(root: string): Promise<void> {
       },
     },
   ];
-  for (const event of events) await ledger.commit(event);
+  for (const event of events) {
+    if (options.finished === false && event.type === "run_finished") continue;
+    await ledger.commit(event);
+  }
 }
 
 async function flow(root: string, ...args: string[]) {
@@ -165,6 +177,42 @@ async function flow(root: string, ...args: string[]) {
     new Response(child.stderr).text(),
   ]);
   return { exitCode, stdout, stderr };
+}
+
+class PoisoningLedger extends FsLedger {
+  protected override async appendAndSync(
+    handle: FileHandle,
+    contents: string,
+  ): Promise<void> {
+    await handle.writeFile(contents, "utf8");
+    throw new Error("injected append failure");
+  }
+
+  protected override async rollbackAppend(): Promise<void> {
+    throw new Error("injected rollback failure");
+  }
+}
+
+function poisonedRunStarted(): RunEvent {
+  return {
+    schemaVersion: 1,
+    eventId: "run-poisoned#1",
+    runId: "run-poisoned",
+    sequence: 1,
+    type: "run_started",
+    at: 100,
+    actor: "runtime",
+    controllerEpoch: 0,
+    data: {
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd: "/tmp/poisoned",
+      splitDirection: "down",
+      tabId: "w1:t1",
+      controllerPaneId: "w1:p1",
+      fixedPoint: null,
+    },
+  };
 }
 
 describe("flow CLI external behavior", () => {
@@ -200,6 +248,19 @@ describe("flow CLI external behavior", () => {
     expect(result.stdout).toContain("checkpoint=/tmp/cli-run/checkpoint.md");
     expect(result.stdout).toContain("result=/tmp/cli-run/result.txt");
     expect(result.stdout).toContain("evidence=/tmp/cli-run/evidence.json");
+  });
+
+  test("status and inspect render an all-terminal unfinished replay as incomplete", async () => {
+    const root = await tempRoot();
+    await seedFinishedRun(root, { finished: false });
+
+    const status = await flow(root, "status");
+    const inspect = await flow(root, "inspect", "run-cli");
+
+    expect(status.exitCode).toBe(0);
+    expect(status.stdout).toContain("state=incomplete");
+    expect(inspect.exitCode).toBe(0);
+    expect(inspect.stdout).toContain("state=incomplete");
   });
 
   test("usage errors are non-zero", async () => {
@@ -239,5 +300,18 @@ describe("flow CLI external behavior", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toBe("");
     expect(result.stderr).not.toContain("flow:");
+  });
+
+  test("inspect fails closed for a run poisoned by another ledger instance", async () => {
+    const root = await tempRoot();
+    await expect(
+      new PoisoningLedger(root).commit(poisonedRunStarted()),
+    ).rejects.toThrow(/append failure.*rollback failure/);
+
+    const result = await flow(root, "inspect", "run-poisoned");
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain('run "run-poisoned" is poisoned');
+    expect(result.stdout).toBe("");
   });
 });
