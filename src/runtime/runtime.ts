@@ -277,6 +277,16 @@ export class WorkflowRuntime {
     const started: string[] = [];
     for (let index = 0; index < dispatchPlan.length; index++) {
       const { item, command } = dispatchPlan[index]!;
+      try {
+        await this.commitEvent(runId, {
+          type: "lane_dispatch_intent",
+          actor: "runtime",
+          laneId: item.spec.laneId,
+          data: {},
+        });
+      } catch (cause) {
+        throw new PartialDispatchError(runId, [...started], cause);
+      }
       const dispatchedAt = this.deps.clock();
       try {
         await this.deps.adapter.runInPane(item.pane, command);
@@ -336,6 +346,102 @@ export class WorkflowRuntime {
     }
     await this.finishIfTerminal(runId);
     run = this.getRun(runId);
+    return this.workflowStatus(run);
+  }
+
+  async resumeWorkflow(
+    runId: string,
+    perLaneTimeoutMs = 300_000,
+  ): Promise<WorkflowStatus> {
+    const loaded = await this.deps.ledger.load(runId);
+    if (!loaded) throw new Error(`run not found: "${runId}"`);
+    if (loaded.finishStatus !== null) return this.workflowStatus(loaded);
+
+    await this.acquireControllerLease(runId);
+    const authoritative = await this.deps.ledger.load(runId);
+    if (!authoritative) throw new Error(`run not found: "${runId}"`);
+    this.registerReducedView(authoritative);
+
+    const epoch = authoritative.controllerEpoch + 1;
+    await this.commitEvent(runId, {
+      type: "controller_attached",
+      actor: "runtime",
+      data: {
+        controllerId: this.controllerId(),
+        epoch,
+        pid: process.pid,
+      },
+    });
+
+    const liveLaneIds: string[] = [];
+    for (const laneId of authoritative.laneOrder) {
+      const lane = this.getLane(this.getRun(runId), laneId);
+      if (TERMINAL_RUNTIME.has(lane.runtimeState)) continue;
+      const info = await this.deps.adapter.processInfo({ id: lane.paneId });
+      if (info.foregroundProcessGroupId !== info.shellPid) {
+        if (lane.runtimeState === "pending") {
+          await this.commitEvent(runId, {
+            type: "lane_live",
+            actor: "runtime",
+            laneId,
+            data: {},
+          });
+        }
+        liveLaneIds.push(laneId);
+        continue;
+      }
+
+      const output = await this.readDurable(lane.logFile);
+      const exitCode = parseExitFromSentinel(runId, laneId, output);
+      if (exitCode !== null) {
+        await this.commitEvent(runId, {
+          type: "lane_exited",
+          actor: "runtime",
+          laneId,
+          data: {
+            exitCode,
+            ...(exitCode === 130 ? { signal: "SIGINT" } : {}),
+          },
+        });
+      } else if (lane.liveAt !== null || output.length > 0) {
+        await this.commitEvent(runId, {
+          type: "lane_crashed",
+          actor: "runtime",
+          laneId,
+          data: {},
+        });
+      } else {
+        await this.commitEvent(runId, {
+          type: "lane_lost",
+          actor: "runtime",
+          laneId,
+          data: { cause: "dispatch-outcome-unknown" },
+        });
+      }
+    }
+
+    await this.finishIfTerminal(runId);
+    for (const laneId of liveLaneIds) {
+      try {
+        await this.awaitLane(runId, laneId, perLaneTimeoutMs);
+      } catch (error) {
+        const lane = this.getLane(this.getRun(runId), laneId);
+        if (lane.runtimeState !== "crashed" && lane.runtimeState !== "lost") {
+          throw error;
+        }
+      }
+    }
+    await this.finishIfTerminal(runId);
+    for (const laneId of this.getRun(runId).laneOrder) {
+      const lane = this.getLane(this.getRun(runId), laneId);
+      if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
+        await this.recordTerminalFacts(runId, laneId, lane.exitCode);
+      }
+    }
+    return this.workflowStatus(this.getRun(runId));
+  }
+
+  private workflowStatus(run: RunView): WorkflowStatus {
     const lanes: LaneStatus[] = run.laneOrder.map((laneId) => {
       const lane = this.getLane(run, laneId);
       return {
@@ -346,7 +452,7 @@ export class WorkflowRuntime {
       };
     });
     return {
-      runId,
+      runId: run.runId,
       state: projectRunState(run),
       lanes,
       metrics: this.metrics(run),
@@ -502,10 +608,14 @@ export class WorkflowRuntime {
   protected async acquireControllerLease(runId: string): Promise<void> {
     if (this.leases.has(runId)) return;
     const lease = await this.deps.ledger.acquireLease(runId, {
-      controllerId: `runtime-${process.pid}`,
+      controllerId: this.controllerId(),
       pid: process.pid,
     });
     this.leases.set(runId, lease);
+  }
+
+  private controllerId(): string {
+    return `runtime-${process.pid}`;
   }
 
   protected async releaseControllerLease(runId: string): Promise<void> {

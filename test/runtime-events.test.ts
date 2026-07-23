@@ -1,20 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import { FakeHerdrAdapter, createClock } from "../src/herdr/fake-adapter.ts";
+import type { PaneRef } from "../src/herdr/types.ts";
 import type { RunEvent } from "../src/runtime/events.ts";
 import { InMemoryLedger, type Ledger, type LeaseHandle } from "../src/runtime/ledger.ts";
 import type { RunView } from "../src/runtime/reducer.ts";
-import { PartialDispatchError } from "../src/runtime/runtime.ts";
-import { SmokeRuntime } from "../src/smoke/smoke-runtime.ts";
+import {
+  PartialDispatchError,
+  WorkflowRuntime,
+} from "../src/runtime/runtime.ts";
 
-class InspectableSmokeRuntime extends SmokeRuntime {
+class InspectableWorkflowRuntime extends WorkflowRuntime {
   reducedView(runId: string): RunView {
     return this.runView(runId);
-  }
-}
-
-class RejectingInMemoryLedger extends InMemoryLedger {
-  protected override beforeCommit(_event: RunEvent): void {
-    throw new Error("fake: synchronous smoke append rejected");
   }
 }
 
@@ -83,11 +80,48 @@ class RecordingLedger implements Ledger {
 }
 
 describe("WorkflowRuntime event commits", () => {
+  test("durably records dispatch intent before invoking the pane command", async () => {
+    const clock = createClock();
+    const ledger = new InMemoryLedger();
+    let observedBeforeDispatch: RunView | null = null;
+    class IntentObservingAdapter extends FakeHerdrAdapter {
+      override async runInPane(pane: PaneRef, command: string): Promise<void> {
+        observedBeforeDispatch = await ledger.load("run1");
+        await super.runInPane(pane, command);
+      }
+    }
+    const adapter = new IntentObservingAdapter({
+      clock,
+      lanes: [{ laneId: "lane-1", exitCode: 0 }],
+    });
+    const runtime = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run1",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+
+    await runtime.startWorkflow({
+      workflow: "wf",
+      workspace: "w1",
+      cwd: "/tmp/ev",
+      lanes: [{ laneId: "lane-1", steps: 1 }],
+    });
+
+    expect(observedBeforeDispatch!.lanes["lane-1"]).toMatchObject({
+      dispatchIntentAt: 0,
+      dispatchedAt: null,
+      dispatchedCommand: null,
+    });
+  });
+
   test("an append rejection leaves the transition externally uncommitted", async () => {
     const clock = createClock();
     const adapter = new FakeHerdrAdapter({ clock });
     const ledger = new RejectingLedger();
-    const runtime = new SmokeRuntime({
+    const runtime = new WorkflowRuntime({
       adapter,
       ledger,
       clock: clock.now,
@@ -115,7 +149,7 @@ describe("WorkflowRuntime event commits", () => {
       failSplitPaneAfter: 1,
     });
     const ledger = new RecordingLedger();
-    const runtime = new SmokeRuntime({
+    const runtime = new WorkflowRuntime({
       adapter,
       ledger,
       clock: clock.now,
@@ -140,121 +174,6 @@ describe("WorkflowRuntime event commits", () => {
     expect(ledger.events).toHaveLength(0);
   });
 
-  test("smoke export and attach rebuild the run by committing event history", async () => {
-    const clock = createClock();
-    const adapter = new FakeHerdrAdapter({
-      clock,
-      lanes: [{ laneId: "lane-1", exitCode: 0 }],
-    });
-    const sourceLedger = new InMemoryLedger();
-    const makeRuntime = (ledger: Ledger) =>
-      new InspectableSmokeRuntime({
-        adapter,
-        ledger,
-        clock: clock.now,
-        idgen: () => "run1",
-        readResultFile: adapter.readResultFile,
-        sleep: async () => {},
-      });
-    const source = makeRuntime(sourceLedger);
-    const handle = await source.startWorkflow({
-      workflow: "wf",
-      workspace: "w1",
-      cwd: "/tmp/ev",
-      lanes: [{ laneId: "lane-1", steps: 1 }],
-    });
-    await source.confirmLaneStarted(handle.runId, "lane-1");
-    expect(await sourceLedger.load(handle.runId)).toEqual(
-      source.reducedView(handle.runId),
-    );
-
-    const freshLedger = new InMemoryLedger();
-    const fresh = makeRuntime(freshLedger);
-    expect(await fresh.attachRun(await source.exportRun(handle.runId))).toEqual(handle);
-
-    expect(await freshLedger.load(handle.runId)).toEqual(
-      await sourceLedger.load(handle.runId),
-    );
-    expect((await fresh.inspectWorkflow(handle.runId)).lanes[0]!.state).toBe(
-      "running",
-    );
-  });
-
-  test("smoke attach rejects a failed append without registering a live view", async () => {
-    const clock = createClock();
-    const adapter = new FakeHerdrAdapter({
-      clock,
-      lanes: [{ laneId: "lane-1", exitCode: 0 }],
-    });
-    const sourceLedger = new InMemoryLedger();
-    const source = new SmokeRuntime({
-      adapter,
-      ledger: sourceLedger,
-      clock: clock.now,
-      idgen: () => "run1",
-      readResultFile: adapter.readResultFile,
-      sleep: async () => {},
-    });
-    const handle = await source.startWorkflow({
-      workflow: "wf",
-      workspace: "w1",
-      cwd: "/tmp/ev",
-      lanes: [{ laneId: "lane-1", steps: 1 }],
-    });
-
-    const rejectingLedger = new RejectingInMemoryLedger();
-    const fresh = new SmokeRuntime({
-      adapter,
-      ledger: rejectingLedger,
-      clock: clock.now,
-      idgen: () => "unused",
-      readResultFile: adapter.readResultFile,
-      sleep: async () => {},
-    });
-
-    await expect(
-      fresh.attachRun(await source.exportRun(handle.runId)),
-    ).rejects.toThrow(/synchronous smoke append rejected/);
-    await expect(fresh.inspectWorkflow(handle.runId)).rejects.toThrow(
-      /unknown runId/,
-    );
-    expect(await rejectingLedger.load(handle.runId)).toBeNull();
-  });
-
-  test("smoke export refuses a pending checkpoint until an async operation flushes it", async () => {
-    const clock = createClock();
-    const adapter = new FakeHerdrAdapter({
-      clock,
-      lanes: [{ laneId: "lane-1", exitCode: 0 }],
-    });
-    const runtime = new SmokeRuntime({
-      adapter,
-      ledger: new InMemoryLedger(),
-      clock: clock.now,
-      idgen: () => "run1",
-      readResultFile: adapter.readResultFile,
-      sleep: async () => {},
-    });
-    const handle = await runtime.startWorkflow({
-      workflow: "wf",
-      workspace: "w1",
-      cwd: "/tmp/ev",
-      lanes: [{ laneId: "lane-1", steps: 1 }],
-    });
-
-    runtime.markCheckpoint(handle.runId);
-    await expect(runtime.exportRun(handle.runId)).rejects.toThrow(
-      /pending transition.*await an async public operation/i,
-    );
-    await runtime.inspectWorkflow(handle.runId);
-    const history = JSON.parse(await runtime.exportRun(handle.runId)) as {
-      events: RunEvent[];
-    };
-    expect(history.events.some((event) => event.type === "checkpoint_announced")).toBe(
-      true,
-    );
-  });
-
   test("a rejected lane transition is absent from both live and replayed views", async () => {
     const clock = createClock();
     const adapter = new FakeHerdrAdapter({
@@ -262,7 +181,7 @@ describe("WorkflowRuntime event commits", () => {
       lanes: [{ laneId: "lane-1", exitCode: 0 }],
     });
     const ledger = new RecordingLedger("lane_live");
-    const runtime = new SmokeRuntime({
+    const runtime = new WorkflowRuntime({
       adapter,
       ledger,
       clock: clock.now,
@@ -298,7 +217,7 @@ describe("WorkflowRuntime event commits", () => {
       ],
     });
     const ledger = new RecordingLedger();
-    const runtime = new InspectableSmokeRuntime({
+    const runtime = new InspectableWorkflowRuntime({
       adapter,
       ledger,
       clock: clock.now,
@@ -324,7 +243,7 @@ describe("WorkflowRuntime event commits", () => {
       ),
     ).toEqual([true, true]);
     const liveEvents = ledger.events.filter((event) => event.type === "lane_live");
-    expect(liveEvents.map((event) => event.sequence)).toEqual([6, 7]);
+    expect(liveEvents.map((event) => event.sequence)).toEqual([8, 9]);
     expect(await ledger.load(handle.runId)).toEqual(
       runtime.reducedView(handle.runId),
     );
@@ -337,7 +256,7 @@ describe("WorkflowRuntime event commits", () => {
       lanes: [{ laneId: "lane-1", exitCode: 0 }],
     });
     const ledger = new RecordingLedger();
-    const runtime = new SmokeRuntime({
+    const runtime = new WorkflowRuntime({
       adapter,
       ledger,
       clock: clock.now,
@@ -370,7 +289,7 @@ describe("WorkflowRuntime event commits", () => {
       lanes: [{ laneId: "lane-1", exitCode: 0 }],
     });
     const ledger = new RecordingLedger();
-    const runtime = new SmokeRuntime({
+    const runtime = new WorkflowRuntime({
       adapter,
       ledger,
       clock: clock.now,
@@ -408,7 +327,7 @@ describe("WorkflowRuntime event commits", () => {
       clock,
       lanes: [{ laneId: "lane-1", exitCode: 0 }],
     });
-    const runtime = new SmokeRuntime({
+    const runtime = new WorkflowRuntime({
       adapter,
       ledger: new InMemoryLedger(),
       clock: clock.now,
@@ -435,7 +354,7 @@ describe("WorkflowRuntime event commits", () => {
       advances: { runInPane: 10, processInfo: 5 },
       lanes: [{ laneId: "lane-1", exitCode: 0 }],
     });
-    const runtime = new SmokeRuntime({
+    const runtime = new WorkflowRuntime({
       adapter,
       ledger: new InMemoryLedger(),
       clock: clock.now,
@@ -464,7 +383,7 @@ describe("WorkflowRuntime event commits", () => {
       lanes: [{ laneId: "lane-1", exitCode: 0 }],
     });
     const ledger = new RecordingLedger("checkpoint_announced");
-    const runtime = new SmokeRuntime({
+    const runtime = new WorkflowRuntime({
       adapter,
       ledger,
       clock: clock.now,
@@ -497,7 +416,7 @@ describe("WorkflowRuntime event commits", () => {
     });
     const ledger = new RecordingLedger();
     let idCalls = 0;
-    const runtime = new SmokeRuntime({
+    const runtime = new WorkflowRuntime({
       adapter,
       ledger,
       clock: clock.now,
@@ -523,6 +442,7 @@ describe("WorkflowRuntime event commits", () => {
     expect(ledger.events.map((event) => event.type)).toEqual([
       "run_started",
       "lane_registered",
+      "lane_dispatch_intent",
       "lane_dispatched",
       "lane_live",
       "checkpoint_announced",
@@ -539,9 +459,10 @@ describe("WorkflowRuntime event commits", () => {
       "run1#6",
       "run1#7",
       "run1#8",
+      "run1#9",
     ]);
     expect(ledger.events.map((event) => event.sequence)).toEqual([
-      1, 2, 3, 4, 5, 6, 7, 8,
+      1, 2, 3, 4, 5, 6, 7, 8, 9,
     ]);
     expect(
       ledger.events.every(
@@ -560,7 +481,7 @@ describe("WorkflowRuntime event commits", () => {
       lanes: [{ laneId: "lane-1", exitCode: 0, emitSentinel: false }],
     });
     const ledger = new RecordingLedger();
-    const runtime = new SmokeRuntime({
+    const runtime = new WorkflowRuntime({
       adapter,
       ledger,
       clock: clock.now,
@@ -595,7 +516,7 @@ describe("WorkflowRuntime event commits", () => {
       lanes: [{ laneId: "lane-1", exitCode: 0, emitSentinel: false }],
     });
     const ledger = new RecordingLedger();
-    const runtime = new SmokeRuntime({
+    const runtime = new WorkflowRuntime({
       adapter,
       ledger,
       clock: clock.now,
@@ -641,7 +562,7 @@ describe("WorkflowRuntime event commits", () => {
         },
       ],
     });
-    const runtime = new SmokeRuntime({
+    const runtime = new WorkflowRuntime({
       adapter,
       ledger: new InMemoryLedger(),
       clock: clock.now,
@@ -674,7 +595,7 @@ describe("WorkflowRuntime event commits", () => {
       lanes: [{ laneId: "lane-1", exitCode: 0 }],
     });
     const ledger = new RecordingLedger();
-    const runtime = new SmokeRuntime({
+    const runtime = new WorkflowRuntime({
       adapter,
       ledger,
       clock: clock.now,
@@ -718,7 +639,7 @@ describe("WorkflowRuntime event commits", () => {
       lanes: [{ laneId: "lane-1", exitCode: 0 }],
     });
     const ledger = new RecordingLedger("lane_dispatched");
-    const runtime = new SmokeRuntime({
+    const runtime = new WorkflowRuntime({
       adapter,
       ledger,
       clock: clock.now,
@@ -762,7 +683,7 @@ describe("WorkflowRuntime event commits", () => {
       lanes: [{ laneId: "lane-1", exitCode: 0 }],
     });
     const ledger = new RecordingLedger("lane_failed_to_start");
-    const runtime = new SmokeRuntime({
+    const runtime = new WorkflowRuntime({
       adapter,
       ledger,
       clock: clock.now,
@@ -807,7 +728,7 @@ describe("WorkflowRuntime event commits", () => {
       lanes: [{ laneId: "lane-1", exitCode: 0 }],
     });
     const ledger = new RecordingLedger();
-    const runtime = new SmokeRuntime({
+    const runtime = new WorkflowRuntime({
       adapter,
       ledger,
       clock: clock.now,

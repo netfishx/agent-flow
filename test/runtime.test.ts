@@ -7,10 +7,12 @@ import {
   type MutableClock,
   scanSingleQuoted,
 } from "../src/herdr/fake-adapter.ts";
-import { PartialDispatchError } from "../src/runtime/runtime.ts";
+import {
+  PartialDispatchError,
+  WorkflowRuntime,
+} from "../src/runtime/runtime.ts";
 import { InMemoryLedger } from "../src/runtime/ledger.ts";
 import type { LaneSpec, RuntimeDeps } from "../src/runtime/types.ts";
-import { SmokeRuntime } from "../src/smoke/smoke-runtime.ts";
 
 interface SetupOptions {
   lanes?: FakeLaneProgram[];
@@ -26,7 +28,7 @@ function makeRuntime(
   fake: FakeHerdrAdapter,
   clock: MutableClock,
   opts: SetupOptions = {},
-): SmokeRuntime {
+): WorkflowRuntime {
   let n = 0;
   const deps: RuntimeDeps = {
     adapter: fake,
@@ -38,9 +40,7 @@ function makeRuntime(
     processGoneTimeoutMs: opts.processGoneTimeoutMs,
     processGoneIntervalMs: opts.processGoneIntervalMs,
   };
-  // SmokeRuntime IS-A WorkflowRuntime, so it exercises the same public behavior
-  // while also exposing the smoke's export/attach handoff for the tests below.
-  return new SmokeRuntime(deps);
+  return new WorkflowRuntime(deps);
 }
 
 function setup(opts: SetupOptions = {}) {
@@ -67,7 +67,7 @@ const config = (lanes: LaneSpec[]) => ({
   lanes,
 });
 
-async function startAndConfirm(runtime: SmokeRuntime, ids: string[]) {
+async function startAndConfirm(runtime: WorkflowRuntime, ids: string[]) {
   const handle = await runtime.startWorkflow(config(laneSpecs(...ids)));
   for (const laneId of handle.laneIds) {
     await runtime.confirmLaneStarted(handle.runId, laneId);
@@ -241,48 +241,6 @@ describe("interrupt isolation", () => {
     expect(r2.exitCode).toBe(130);
     expect(r3.state).toBe("complete");
     expect(r3.exitCode).toBe(0);
-  });
-});
-
-describe("controller loss (export / attach)", () => {
-  test("a fresh controller attaches, sees the lanes alive, and collects them", async () => {
-    const { runtime, fake, clock } = setup({
-      lanes: [
-        { laneId: "lane-1", exitCode: 0 },
-        { laneId: "lane-2", exitCode: 0 },
-      ],
-    });
-    const handle = await startAndConfirm(runtime, ["lane-1", "lane-2"]);
-    const topology = await runtime.exportRun(handle.runId);
-
-    // A fresh controller (new runtime) over the SAME adapter — as if the
-    // dispatching controller had exited and the lanes kept running under Herdr.
-    const fresh = makeRuntime(fake, clock);
-    const attached = await fresh.attachRun(topology);
-    expect(attached.runId).toBe(handle.runId);
-    expect(attached.laneIds).toEqual(["lane-1", "lane-2"]);
-
-    // The fresh controller sees the lanes still running.
-    const status = await fresh.inspectWorkflow(handle.runId);
-    expect(status.lanes.every((l) => l.state === "running")).toBe(true);
-
-    // ...and can drive them to completion through logical handles.
-    const r1 = await fresh.awaitLane(handle.runId, "lane-1", 1000);
-    const r2 = await fresh.awaitLane(handle.runId, "lane-2", 1000);
-    expect(r1.state).toBe("complete");
-    expect(r2.state).toBe("complete");
-  });
-
-  test("attach rejects an unsupported topology version", async () => {
-    const { runtime } = setup();
-    await expect(runtime.attachRun(JSON.stringify({ v: 2 }))).rejects.toThrow(
-      /unsupported run topology/,
-    );
-  });
-
-  test("exportRun rejects an unknown run", async () => {
-    const { runtime } = setup();
-    await expect(runtime.exportRun("nope")).rejects.toThrow(/unknown runId/);
   });
 });
 
