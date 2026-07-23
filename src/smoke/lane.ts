@@ -30,7 +30,7 @@ const LANE_SCRIPT = [
   "done",
   "finish 0 done complete ok",
   "}",
-  'run_lane 2>&1 | tee -a "$logFile"',
+  'run_lane 2>&1 | { trap "" INT; exec tee -a "$logFile"; }',
   'laneStatus="${PIPESTATUS[0]}"',
   'exit "$laneStatus"',
 ].join("\n");

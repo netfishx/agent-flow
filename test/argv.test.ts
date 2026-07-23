@@ -175,4 +175,59 @@ describe("buildLaneCommand", () => {
       await rm(root, { recursive: true });
     }
   });
+
+  test("durably records an interrupt delivered to the lane process group", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-flow-lane-sigint-"));
+    const logFile = join(root, "logs", "lane.log");
+    const checkpointFile = join(root, "checkpoints", "lane.md");
+    const resultFile = join(root, "results", "lane-result.txt");
+    await mkdir(join(root, "logs"), { recursive: true });
+    await writeFile(logFile, "", "utf8");
+    const command = buildLaneCommand({
+      runId: "interrupt-run",
+      laneId: "interrupt-lane",
+      logFile,
+      checkpointFile,
+      resultFile,
+      steps: 10,
+      stepDelaySeconds: 10,
+    });
+    const lane = Bun.spawn(["bash", "-c", command], {
+      detached: true,
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+
+    try {
+      const deadline = Date.now() + 5_000;
+      while (!(await readFile(logFile, "utf8")).includes("STEP=1/10")) {
+        if (Date.now() >= deadline) {
+          throw new Error("lane did not write its first step before timeout");
+        }
+        await Bun.sleep(10);
+      }
+
+      process.kill(-lane.pid, "SIGINT");
+      expect(await lane.exited).toBe(130);
+
+      const log = await readFile(logFile, "utf8");
+      expect(log).toContain("EVENT=interrupted-SIGINT");
+      expect(log).toContain(
+        "FLOW_interrupt-run_LANE_interrupt-lane_EXIT=130",
+      );
+      expect(await readFile(checkpointFile, "utf8")).toContain(
+        "STATUS: partial",
+      );
+      expect(await readFile(resultFile, "utf8")).toContain(
+        "RESULT: interrupted",
+      );
+    } finally {
+      try {
+        process.kill(-lane.pid, "SIGKILL");
+      } catch {
+        // The process group already exited normally.
+      }
+      await rm(root, { recursive: true });
+    }
+  });
 });
