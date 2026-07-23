@@ -13,15 +13,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { RunEvent } from "./events.ts";
 import { assertHandleId } from "./ids.ts";
-import {
-  internalRegisterCommittedEventReader,
-  type LeaseHandle,
-  type Ledger,
-} from "./ledger.ts";
+import type { LeaseHandle, Ledger } from "./ledger.ts";
 import { reduce, type RunView } from "./reducer.ts";
 
 interface ReplayResult {
-  readonly events: readonly RunEvent[];
   readonly byEventId: ReadonlyMap<string, RunEvent>;
   readonly view: RunView | null;
   readonly validByteLength: number;
@@ -34,11 +29,32 @@ interface CommitState {
   readonly state: "idle" | "writing";
 }
 
+interface ControllerLeaseRecord {
+  readonly schemaVersion: 1;
+  readonly controllerId: string;
+  readonly pid: number;
+  readonly epoch: number;
+  readonly acquiredAt: number;
+}
+
 let snapshotSequence = 0;
 let commitStateSequence = 0;
+let leaseSequence = 0;
 const COMMIT_INTENT_FILE = "commit-intent.json";
 const COMMIT_STATE_FILE = "commit-state.json";
 const STABLE_READ_ATTEMPTS = 3;
+
+function realPidIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EPERM") return true;
+    if (code === "ESRCH") return false;
+    throw error;
+  }
+}
 
 export function resolveLedgerRoot(environment = process.env): string {
   const configured = environment.FLOW_LEDGER_ROOT;
@@ -66,7 +82,6 @@ async function replayFile(path: string): Promise<ReplayResult> {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return {
-        events: [],
         byEventId: new Map(),
         view: null,
         validByteLength: 0,
@@ -80,7 +95,6 @@ async function replayFile(path: string): Promise<ReplayResult> {
   const lines = contents.split("\n");
   if (endsWithNewline) lines.pop();
 
-  const events: RunEvent[] = [];
   const byEventId = new Map<string, RunEvent>();
   let state: RunView | undefined;
   let validByteLength = Buffer.byteLength(contents);
@@ -120,10 +134,8 @@ async function replayFile(path: string): Promise<ReplayResult> {
       throw corruption(path, index + 1, error);
     }
     byEventId.set(event.eventId, event);
-    events.push(event);
   }
   return {
-    events,
     byEventId,
     view: state ?? null,
     validByteLength,
@@ -135,13 +147,11 @@ async function replayFile(path: string): Promise<ReplayResult> {
 export class FsLedger implements Ledger {
   private readonly commitTails = new Map<string, Promise<void>>();
 
-  constructor(private readonly root: string) {
+  constructor(
+    private readonly root: string,
+    private readonly isPidAlive: (pid: number) => boolean = realPidIsAlive,
+  ) {
     if (root.length === 0) throw new Error("FsLedger root must not be empty");
-    internalRegisterCommittedEventReader(this, async (runId) => {
-      assertHandleId("runId", runId);
-      const replayed = await this.readStableReplay(runId);
-      return replayed.events.map((event) => structuredClone(event));
-    });
   }
 
   commit(event: RunEvent): Promise<void> {
@@ -335,27 +345,40 @@ export class FsLedger implements Ledger {
     const runDir = this.runDir(runId);
     await mkdir(runDir, { recursive: true });
     const lockFile = join(runDir, "controller.lock");
-    let handle;
+    const record = (
+      epoch: number,
+    ): ControllerLeaseRecord => ({
+      schemaVersion: 1,
+      ...controller,
+      epoch,
+      acquiredAt: Date.now(),
+    });
+    let handle: FileHandle | undefined;
     try {
       handle = await open(lockFile, "wx");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const holder = await this.readControllerLease(lockFile, runId);
+      if (this.isPidAlive(holder.pid)) {
         throw new Error(`controller lease for run "${runId}" is already held`);
       }
-      throw error;
-    }
-    try {
-      await handle.writeFile(
-        `${JSON.stringify({ ...controller, acquiredAt: Date.now() })}\n`,
-        "utf8",
+      await this.replaceControllerLease(
+        runDir,
+        lockFile,
+        record(holder.epoch + 1),
       );
-      await handle.sync();
-    } catch (error) {
-      await handle.close();
-      await unlink(lockFile).catch(() => {});
-      throw error;
     }
-    await handle.close();
+    if (handle) {
+      try {
+        await handle.writeFile(`${JSON.stringify(record(0))}\n`, "utf8");
+        await handle.sync();
+      } catch (error) {
+        await handle.close();
+        await unlink(lockFile).catch(() => {});
+        throw error;
+      }
+      await handle.close();
+    }
 
     let released = false;
     let releaseInFlight: Promise<void> | null = null;
@@ -373,6 +396,64 @@ export class FsLedger implements Ledger {
         return releaseInFlight;
       },
     };
+  }
+
+  private async readControllerLease(
+    lockFile: string,
+    runId: string,
+  ): Promise<ControllerLeaseRecord> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await readFile(lockFile, "utf8"));
+    } catch (error) {
+      throw new Error(`corrupt controller lease for run "${runId}"`, {
+        cause: error,
+      });
+    }
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      (parsed as { schemaVersion?: unknown }).schemaVersion !== 1 ||
+      typeof (parsed as { controllerId?: unknown }).controllerId !== "string" ||
+      !Number.isSafeInteger((parsed as { pid?: unknown }).pid) ||
+      (parsed as { pid: number }).pid <= 0 ||
+      !Number.isSafeInteger((parsed as { epoch?: unknown }).epoch) ||
+      (parsed as { epoch: number }).epoch < 0 ||
+      !Number.isFinite((parsed as { acquiredAt?: unknown }).acquiredAt)
+    ) {
+      throw new Error(`corrupt controller lease for run "${runId}"`);
+    }
+    return parsed as ControllerLeaseRecord;
+  }
+
+  private async replaceControllerLease(
+    runDir: string,
+    lockFile: string,
+    record: ControllerLeaseRecord,
+  ): Promise<void> {
+    const temp = join(
+      runDir,
+      `.controller.lock.tmp-${process.pid}-${++leaseSequence}`,
+    );
+    let handle: FileHandle | undefined;
+    try {
+      handle = await open(temp, "wx");
+      await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      await rename(temp, lockFile);
+      const directory = await open(runDir, "r");
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
+    } catch (error) {
+      await handle?.close().catch(() => {});
+      await unlink(temp).catch(() => {});
+      throw error;
+    }
   }
 
   private runDir(runId: string): string {

@@ -441,7 +441,7 @@ describe("FsLedger public capabilities", () => {
   });
 
   test("refuses a lease while held and permits reacquire after release", async () => {
-    const ledger = new FsLedger(await tempRoot());
+    const ledger = new FsLedger(await tempRoot(), () => true);
     const first = await ledger.acquireLease("run-fs", {
       controllerId: "controller-1",
       pid: 101,
@@ -456,6 +456,58 @@ describe("FsLedger public capabilities", () => {
       pid: 202,
     });
     await expect(second.release()).resolves.toBeUndefined();
+  });
+
+  test("takes over a dead holder with an epoch bump and then refuses a live holder", async () => {
+    const root = await tempRoot();
+    const firstLedger = new FsLedger(root, () => false);
+    await firstLedger.acquireLease("run-fs", {
+      controllerId: "controller-1",
+      pid: 101,
+    });
+    const takeoverLedger = new FsLedger(root, (pid) => pid === 202);
+    const takeover = await takeoverLedger.acquireLease("run-fs", {
+      controllerId: "controller-2",
+      pid: 202,
+    });
+
+    expect(
+      JSON.parse(
+        await readFile(
+          join(root, "runs", "run-fs", "controller.lock"),
+          "utf8",
+        ),
+      ),
+    ).toMatchObject({
+      schemaVersion: 1,
+      controllerId: "controller-2",
+      pid: 202,
+      epoch: 1,
+    });
+    await expect(
+      takeoverLedger.acquireLease("run-fs", {
+        controllerId: "controller-3",
+        pid: 303,
+      }),
+    ).rejects.toThrow('controller lease for run "run-fs" is already held');
+    await takeover.release();
+  });
+
+  test("fails closed on a corrupt existing controller lock", async () => {
+    const root = await tempRoot();
+    const runDir = join(root, "runs", "run-fs");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(join(runDir, "controller.lock"), "{corrupt", "utf8");
+
+    await expect(
+      new FsLedger(root, () => false).acquireLease("run-fs", {
+        controllerId: "controller-2",
+        pid: 202,
+      }),
+    ).rejects.toThrow(/corrupt controller lease/);
+    expect(
+      await readFile(join(runDir, "controller.lock"), "utf8"),
+    ).toBe("{corrupt");
   });
 
   test("load never returns an event exposed inside an active commit", async () => {
