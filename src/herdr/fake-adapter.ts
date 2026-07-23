@@ -5,6 +5,8 @@
 // that the command's shell quoting round-trips.
 
 import type { HerdrAdapter } from "./adapter.ts";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import type {
   CreatedTab,
   CreateTabOptions,
@@ -79,6 +81,9 @@ interface FakePaneState {
   laneId?: string;
   runId?: string;
   logFile?: string;
+  stderrFile?: string;
+  checkpointFile?: string;
+  resultFile?: string;
   program?: FakeLaneProgram;
   finished: boolean;
   pendingExit: number | null;
@@ -204,19 +209,43 @@ export class FakeHerdrAdapter implements HerdrAdapter {
     const state = this.panes.get(pane.id);
     if (!state) throw new Error(`fake: unknown pane ${pane.id}`);
     const tokens = scanSingleQuoted(shellCommand);
-    // tokens: [script, runId, laneId, logFile, steps, delay]
-    const [, runId, laneId, logFile] = tokens;
-    if (!runId || !laneId || !logFile) {
+    // tokens: [script, runId, laneId, logFile, stderrFile, steps, delay,
+    // checkpointFile, resultFile]
+    const [
+      ,
+      runId,
+      laneId,
+      logFile,
+      stderrFile,
+      ,
+      ,
+      checkpointFile,
+      resultFile,
+    ] = tokens;
+    if (
+      !runId ||
+      !laneId ||
+      !logFile ||
+      !stderrFile ||
+      !checkpointFile ||
+      !resultFile
+    ) {
       throw new Error(`fake: could not parse lane command: ${shellCommand}`);
     }
     state.role = "lane";
     state.runId = runId;
     state.laneId = laneId;
     state.logFile = logFile;
+    state.stderrFile = stderrFile;
+    state.checkpointFile = checkpointFile;
+    state.resultFile = resultFile;
     state.program = this.programs.get(laneId);
     state.finished = false;
     state.pendingExit = null;
     this.paneByLane.set(laneId, pane.id);
+    if (state.program?.emitSentinel ?? true) {
+      await this.writeRecords(state, "complete", "ok");
+    }
   }
 
   async waitForOutput(
@@ -274,6 +303,7 @@ export class FakeHerdrAdapter implements HerdrAdapter {
     }
     state.pendingExit = 130;
     state.finished = true;
+    await this.writeRecords(state, "partial", "interrupted");
     return {
       signal: "SIGINT",
       processGroupId: 2000 + this.paneSeqIndex(pane.id),
@@ -303,6 +333,23 @@ export class FakeHerdrAdapter implements HerdrAdapter {
     lines.push(`STEP=42 EVENT=${event}`);
     lines.push(`FLOW_${state.runId}_LANE_${state.laneId}_EXIT=${exit}`);
     return lines.join("\n");
+  }
+
+  private async writeRecords(
+    state: FakePaneState,
+    status: "complete" | "partial",
+    result: "ok" | "interrupted",
+  ): Promise<void> {
+    if (!state.checkpointFile || !state.resultFile) return;
+    await mkdir(dirname(state.checkpointFile), { recursive: true });
+    await mkdir(dirname(state.resultFile), { recursive: true });
+    const steps = state.program?.exitCode === 130 || status === "partial" ? 0 : 1;
+    await writeFile(
+      state.checkpointFile,
+      `STATUS: ${status}\nPHASE: simulated\nCOMPLETED:\n- steps ${steps}\nNEXT:\n- none\nBLOCKERS:\n- none\nARTIFACTS:\n- ${state.resultFile}\nVERIFICATION_CLAIMS:\n- completion sentinel\nGAPS:\n- none\n`,
+      "utf8",
+    );
+    await writeFile(state.resultFile, `RESULT: ${result} steps=${steps}\n`, "utf8");
   }
 
   private paneSeqIndex(paneId: string): number {

@@ -45,6 +45,40 @@ export type VerificationState = "unverified" | "verified" | "failed";
 export type ControlMode = "managed" | "human_owned";
 export type RunFinishStatus = "clean" | "degraded";
 
+export interface FixedPoint {
+  readonly repoRoot: string;
+  readonly baseCommit: string;
+  readonly headCommit: string;
+  readonly diffHash: string;
+  readonly dirtyStatePolicy: "reject" | "record-hash";
+  readonly capturedAt: number;
+}
+
+export interface RunnerEvidence {
+  readonly schemaVersion: 1;
+  readonly runId: string;
+  readonly laneId: string;
+  readonly command: string | null;
+  /** Durable stdout artifact; the lane tees its stdout here. */
+  readonly stdoutArtifact: string;
+  /** Durable stderr artifact written independently from the stdout pipeline. */
+  readonly stderrArtifact: string;
+  readonly dispatchedAt: number | null;
+  readonly liveAt: number | null;
+  readonly completedAt: number | null;
+  readonly exitCode: number | null;
+  readonly signal: string | null;
+  readonly failure: string | null;
+  readonly environmentFailure: string | null;
+  /** No simulated-run execution deadline exists in #14. */
+  readonly executionTimeout: string | null;
+  readonly termination:
+    | "sentinel-exit"
+    | "crashed"
+    | "lost"
+    | "failed_to_start";
+}
+
 export type EmptyEventData = Readonly<Record<string, never>>;
 
 export interface RunStartedData {
@@ -54,16 +88,22 @@ export interface RunStartedData {
   readonly splitDirection: "right" | "down";
   readonly tabId: string;
   readonly controllerPaneId: string;
+  readonly fixedPoint: FixedPoint | null;
 }
 
 export interface LaneRegisteredData {
   readonly laneId: string;
   readonly paneId: string;
   readonly logFile: string;
+  readonly stderrFile: string;
   readonly sentinelToken: string;
   readonly steps: number;
   readonly stepDelaySeconds: number;
   readonly role?: string;
+}
+
+export interface LaneDispatchedData {
+  readonly command: string;
 }
 
 export interface LaneCheckpointData {
@@ -83,6 +123,7 @@ export interface LaneLostData {
 
 export interface LaneFailedToStartData {
   readonly rejection: string;
+  readonly command: string | null;
 }
 
 export interface LaneContractEvaluatedData {
@@ -123,7 +164,7 @@ export interface RunEventDataByType {
   readonly run_started: RunStartedData;
   readonly lane_registered: LaneRegisteredData;
   readonly lane_dispatch_intent: EmptyEventData;
-  readonly lane_dispatched: EmptyEventData;
+  readonly lane_dispatched: LaneDispatchedData;
   readonly lane_live: EmptyEventData;
   readonly lane_checkpoint: LaneCheckpointData;
   readonly lane_exited: LaneExitedData;

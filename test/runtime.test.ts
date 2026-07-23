@@ -253,12 +253,12 @@ describe("controller loss (export / attach)", () => {
       ],
     });
     const handle = await startAndConfirm(runtime, ["lane-1", "lane-2"]);
-    const topology = runtime.exportRun(handle.runId);
+    const topology = await runtime.exportRun(handle.runId);
 
     // A fresh controller (new runtime) over the SAME adapter — as if the
     // dispatching controller had exited and the lanes kept running under Herdr.
     const fresh = makeRuntime(fake, clock);
-    const attached = fresh.attachRun(topology);
+    const attached = await fresh.attachRun(topology);
     expect(attached.runId).toBe(handle.runId);
     expect(attached.laneIds).toEqual(["lane-1", "lane-2"]);
 
@@ -273,16 +273,16 @@ describe("controller loss (export / attach)", () => {
     expect(r2.state).toBe("complete");
   });
 
-  test("attach rejects an unsupported topology version", () => {
+  test("attach rejects an unsupported topology version", async () => {
     const { runtime } = setup();
-    expect(() => runtime.attachRun(JSON.stringify({ v: 2 }))).toThrow(
+    await expect(runtime.attachRun(JSON.stringify({ v: 2 }))).rejects.toThrow(
       /unsupported run topology/,
     );
   });
 
-  test("exportRun rejects an unknown run", () => {
+  test("exportRun rejects an unknown run", async () => {
     const { runtime } = setup();
-    expect(() => runtime.exportRun("nope")).toThrow(/unknown runId/);
+    await expect(runtime.exportRun("nope")).rejects.toThrow(/unknown runId/);
   });
 });
 
