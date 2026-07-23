@@ -17,10 +17,6 @@ export interface Ledger {
 
 const histories = new WeakMap<InMemoryLedger, Map<string, RunEvent[]>>();
 const liveViews = new WeakMap<InMemoryLedger, Map<string, RunView>>();
-const committedEventReaders = new WeakMap<
-  Ledger,
-  (runId: string) => Promise<readonly RunEvent[]>
->();
 const synchronousCommit = Symbol("InMemoryLedger.synchronousCommit");
 
 function historyFor(ledger: InMemoryLedger): Map<string, RunEvent[]> {
@@ -47,9 +43,6 @@ export class InMemoryLedger implements Ledger {
   constructor() {
     histories.set(this, new Map());
     liveViews.set(this, new Map());
-    internalRegisterCommittedEventReader(this, async (runId) =>
-      (historyFor(this).get(runId) ?? []).map(cloneEvent),
-    );
   }
 
   commit(event: RunEvent): Promise<void> {
@@ -83,25 +76,6 @@ export class InMemoryLedger implements Ledger {
     this.beforeCommit(event);
     commitSynchronously(this, event);
   }
-}
-
-// Smoke-only implementation details. They are deliberately absent from the
-// package entry point and from Ledger: raw history/replay are not public ports.
-export async function internalCommittedEvents(
-  ledger: Ledger,
-  runId: string,
-): Promise<readonly RunEvent[]> {
-  const read = committedEventReaders.get(ledger);
-  if (read) return read(runId);
-  throw new Error("smoke event export requires a supported Ledger");
-}
-
-/** Module-internal registration for smoke history; absent from src/index.ts. */
-export function internalRegisterCommittedEventReader(
-  ledger: Ledger,
-  read: (runId: string) => Promise<readonly RunEvent[]>,
-): void {
-  committedEventReaders.set(ledger, read);
 }
 
 function commitSynchronously(ledger: InMemoryLedger, event: RunEvent): void {

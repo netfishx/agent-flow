@@ -1,263 +1,344 @@
-// Single entry command for the real-stack smoke.
+// Unattended real-stack controller-loss smoke.
 //
-// Controller-loss is proven for real: the entry process spawns a short-lived
-// DISPATCH child that lays out the tab, dispatches the lanes, exports the run
-// topology, and exits. That child is the controller — once it exits, a fresh
-// controller (this process, a different pid, a new WorkflowRuntime) attaches to
-// the run, confirms the lanes are still alive though their dispatcher is dead,
-// runs one human checkpoint, waits for every lane, and collects a durable
-// result. All of it flows through logical handles; a run performs zero model
-// calls for dispatch.
-//
-// Run with HERDR_ENV=1. Configuration comes from the environment:
-//
-//   FLOW_WORKSPACE      Herdr workspace id (default w1)
-//   FLOW_LANES          number of simulated lanes (default 4)
-//   FLOW_STEPS          steps per lane (default 30)
-//   FLOW_DELAY          seconds per step (default 2)
-//   FLOW_EVIDENCE_DIR   durable evidence directory
-//   FLOW_HANDOFF_FILE   run topology handoff path
-//   FLOW_INTERRUPT_FILE control file; its contents (a laneId) choose the lane
-//                       to interrupt at the checkpoint
-//   FLOW_CHECKPOINT_TIMEOUT_MS  how long to wait for the checkpoint (default 300000)
-//   FLOW_LANE_TIMEOUT_MS        per-lane wait timeout (default 300000)
+// A dispatch child starts visible lanes and stays alive holding the durable
+// controller lease. The parent proves a second resume is refused, SIGKILLs the
+// controller, allows an unobserved window, then resumes through the real CLI.
+// The ledger is the only run handoff; no event-history blob is exported.
 
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { RealHerdrAdapter } from "../herdr/real-adapter.ts";
+import type { RunEvent, RuntimeState } from "../runtime/events.ts";
 import { FsLedger, resolveLedgerRoot } from "../runtime/fs-ledger.ts";
 import type { Ledger } from "../runtime/ledger.ts";
-import type { LaneResult, LaneSpec, RuntimeDeps } from "../runtime/types.ts";
-import { SmokeRuntime } from "./smoke-runtime.ts";
+import { WorkflowRuntime } from "../runtime/runtime.ts";
+import type { LaneSpec, RuntimeDeps } from "../runtime/types.ts";
 
-const env = (key: string, fallback: string): string =>
-  process.env[key] && process.env[key]!.length > 0
-    ? process.env[key]!
-    : fallback;
-const num = (key: string, fallback: number): number => {
-  const value = Number(process.env[key]);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
+const TERMINAL_RUNTIME: ReadonlySet<RuntimeState> = new Set([
+  "exited",
+  "crashed",
+  "lost",
+  "failed_to_start",
+]);
+
+const env = (key: string, fallback: string): string => {
+  const value = process.env[key];
+  return value === undefined || value.length === 0 ? fallback : value;
 };
+
+const num = (key: string, fallback: number): number => {
+  const configured = process.env[key];
+  if (configured === undefined || configured.length === 0) return fallback;
+  const value = Number(configured);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${key} must be a positive number`);
+  }
+  return value;
+};
+
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
+
 const line = (message: string): void => {
   process.stdout.write(`${message}\n`);
 };
 
-function makeDeps(ledger: Ledger): RuntimeDeps {
+function config() {
+  const evidenceDir = env(
+    "FLOW_EVIDENCE_DIR",
+    `/private/tmp/agent-flow-resume-${process.pid}`,
+  );
+  return {
+    workspace: env("FLOW_WORKSPACE", "w1"),
+    runId: env(
+      "FLOW_RUN_ID",
+      `flow-${Date.now().toString(36)}-${process.pid.toString(36)}`,
+    ),
+    laneCount: num("FLOW_LANES", 4),
+    steps: num("FLOW_STEPS", 4),
+    stepSkew: num("FLOW_STEP_SKEW", 4),
+    delay: num("FLOW_DELAY", 1),
+    evidenceDir,
+    readyFile: env("FLOW_READY_FILE", join(evidenceDir, "controller-ready")),
+    readyTimeoutMs: num("FLOW_CONTROLLER_READY_TIMEOUT_MS", 30_000),
+    unobservedMs: num("FLOW_UNOBSERVED_MS", 6_000),
+    laneTimeoutMs: num("FLOW_LANE_TIMEOUT_MS", 300_000),
+    ledgerRoot: resolveLedgerRoot(),
+  };
+}
+
+function makeDeps(ledger: Ledger, runId: string): RuntimeDeps {
   return {
     adapter: new RealHerdrAdapter(),
     ledger,
     clock: () => Date.now(),
-    idgen: () =>
-      `flow-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,
+    idgen: () => runId,
     readResultFile: (path) => Bun.file(path).text(),
     sleep,
   };
 }
 
-function config() {
-  const evidenceDir = env(
-    "FLOW_EVIDENCE_DIR",
-    `/private/tmp/agent-flow-tracer-${process.pid}`,
-  );
-  return {
-    workspace: env("FLOW_WORKSPACE", "w1"),
-    laneCount: num("FLOW_LANES", 4),
-    steps: num("FLOW_STEPS", 30),
-    delay: num("FLOW_DELAY", 2),
-    evidenceDir,
-    handoffFile: env("FLOW_HANDOFF_FILE", `${evidenceDir}/run-handoff.json`),
-    interruptFile: env("FLOW_INTERRUPT_FILE", `${evidenceDir}/interrupt-request`),
-    checkpointTimeout: num("FLOW_CHECKPOINT_TIMEOUT_MS", 300_000),
-    laneTimeout: num("FLOW_LANE_TIMEOUT_MS", 300_000),
-    ledgerRoot: resolveLedgerRoot(),
-  };
-}
-
-// ── Dispatch child: the controller that will exit ───────────────────────────
-
 async function dispatchPhase(): Promise<void> {
   const c = config();
   await mkdir(c.evidenceDir, { recursive: true });
-  const runtime = new SmokeRuntime(makeDeps(new FsLedger(c.ledgerRoot)));
-  const lanes: LaneSpec[] = Array.from({ length: c.laneCount }, (_, i) => ({
-    laneId: `lane-${i + 1}`,
+  const runtime = new WorkflowRuntime(
+    makeDeps(new FsLedger(c.ledgerRoot), c.runId),
+  );
+  const lanes: LaneSpec[] = Array.from({ length: c.laneCount }, (_, index) => ({
+    laneId: `lane-${index + 1}`,
     role: "simulated",
-    steps: c.steps,
+    steps: c.steps + index * c.stepSkew,
     stepDelaySeconds: c.delay,
   }));
 
-  line(`[dispatch pid=${process.pid}] workspace=${c.workspace} lanes=${c.laneCount} steps=${c.steps} delay=${c.delay}s`);
+  line(
+    `[dispatch pid=${process.pid}] runId=${c.runId} workspace=${c.workspace} lanes=${c.laneCount}`,
+  );
   const handle = await runtime.startWorkflow({
-    workflow: "flow-tracer-smoke",
+    workflow: "flow-resume-smoke",
     workspace: c.workspace,
     cwd: c.evidenceDir,
     lanes,
     splitDirection: "down",
-    startupSettleMs: 1000,
+    startupSettleMs: 1_000,
   });
-  try {
-    line(`[dispatch] runId=${handle.runId} lanes=${handle.laneIds.join(", ")}`);
-    for (const laneId of handle.laneIds) {
-      await runtime.confirmLaneStarted(handle.runId, laneId);
-    }
-    await Bun.write(c.handoffFile, await runtime.exportRun(handle.runId));
-    line(`[dispatch] handoff written; dispatcher exiting -> controller is now gone`);
-  } finally {
-    await runtime.releaseForHandoff(handle.runId);
+  for (const laneId of handle.laneIds) {
+    const live = await runtime.confirmLaneStarted(handle.runId, laneId);
+    if (!live) throw new Error(`lane "${laneId}" did not become live`);
   }
+  await Bun.write(c.readyFile, `${handle.runId}\n`);
+  line(`[dispatch] controller ready and holding lease`);
+
+  for (;;) await sleep(60_000);
 }
 
-// ── Collect: a fresh controller after the dispatcher has exited ──────────────
+interface CliResult {
+  readonly exitCode: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}
 
-async function pollInterruptChoice(
-  file: string,
-  laneIds: readonly string[],
-  timeoutMs: number,
-): Promise<string | null> {
+async function flow(
+  ledgerRoot: string,
+  laneTimeoutMs: number,
+  ...args: string[]
+): Promise<CliResult> {
+  const child = Bun.spawn(["bun", "run", "flow", ...args], {
+    cwd: join(import.meta.dir, "../.."),
+    env: {
+      ...process.env,
+      FLOW_LEDGER_ROOT: ledgerRoot,
+      FLOW_LANE_TIMEOUT_MS: String(laneTimeoutMs),
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { exitCode, stdout, stderr };
+}
+
+async function waitForReady(path: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const handle = Bun.file(file);
-    if (await handle.exists()) {
-      const choice = (await handle.text()).trim();
-      if (laneIds.includes(choice)) return choice;
+    if (await Bun.file(path).exists()) return;
+    if (Date.now() >= deadline) {
+      throw new Error(`dispatch controller did not become ready within ${timeoutMs}ms`);
     }
-    if (Date.now() >= deadline) return null;
-    await sleep(1000);
+    await sleep(100);
   }
 }
 
-function isAlive(pid: number): boolean {
+function pidIsAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 
-async function collectPhase(): Promise<void> {
+async function parentPhase(): Promise<void> {
   const c = config();
   await mkdir(c.evidenceDir, { recursive: true });
-  line("== agent-flow visible-run tracer smoke ==");
-  line(`evidence=${c.evidenceDir}`);
+  line("== agent-flow resume-after-controller-loss smoke ==");
+  line(`runId=${c.runId} evidence=${c.evidenceDir}`);
 
-  // 1. Spawn the dispatch child and let it exit — the controller dies.
-  const child = Bun.spawn(["bun", "run", import.meta.path, "__dispatch__"], {
+  const controller = Bun.spawn(["bun", "run", import.meta.path, "__dispatch__"], {
     env: {
       ...process.env,
+      FLOW_RUN_ID: c.runId,
       FLOW_EVIDENCE_DIR: c.evidenceDir,
-      FLOW_HANDOFF_FILE: c.handoffFile,
+      FLOW_READY_FILE: c.readyFile,
+      FLOW_LEDGER_ROOT: c.ledgerRoot,
       FLOW_WORKSPACE: c.workspace,
       FLOW_LANES: String(c.laneCount),
       FLOW_STEPS: String(c.steps),
+      FLOW_STEP_SKEW: String(c.stepSkew),
       FLOW_DELAY: String(c.delay),
     },
     stdout: "inherit",
     stderr: "inherit",
   });
-  const dispatcherPid = child.pid;
-  const dispatcherExit = await child.exited;
-  await sleep(200); // let the OS reap the pid
-  const dispatcherDead = !isAlive(dispatcherPid);
-  line(`dispatcher pid=${dispatcherPid} exit=${dispatcherExit} dead=${dispatcherDead}`);
+  const controllerPid = controller.pid;
+  let controllerReaped = false;
+  try {
+    await waitForReady(c.readyFile, c.readyTimeoutMs);
 
-  // 2. Fresh controller (new pid, new runtime) attaches to the orphaned run.
-  const handoff = await Bun.file(c.handoffFile).text();
-  const runtime = new SmokeRuntime(makeDeps(new FsLedger(c.ledgerRoot)));
-  const handle = await runtime.attachRun(handoff);
-  line(`attached runId=${handle.runId} lanes=${handle.laneIds.join(", ")}`);
+    const refused = await flow(
+      c.ledgerRoot,
+      c.laneTimeoutMs,
+      "resume",
+      c.runId,
+    );
+    if (
+      refused.exitCode === 0 ||
+      !refused.stderr.includes("controller lease") ||
+      !refused.stderr.includes("already held")
+    ) {
+      throw new Error(
+        `live-controller resume was not refused: exit=${refused.exitCode} stderr=${refused.stderr.trim()}`,
+      );
+    }
+    line(`live-holder refusal proven (exit=${refused.exitCode})`);
 
-  // 3. Controller-loss proof: the dispatcher is dead, yet the lanes are alive.
-  const afterLoss = await runtime.inspectWorkflow(handle.runId);
-  const aliveLanes = afterLoss.lanes.filter((l) => l.state === "running").length;
-  line(`controller-loss: dispatcherDead=${dispatcherDead} lanesAlive=${aliveLanes}/${handle.laneIds.length}`);
+    controller.kill("SIGKILL");
+    const controllerExit = await controller.exited;
+    controllerReaped = true;
+    await sleep(100);
+    if (pidIsAlive(controllerPid)) {
+      throw new Error(`SIGKILLed controller pid ${controllerPid} is still alive`);
+    }
+    line(`controller SIGKILLed and reaped (exit=${controllerExit})`);
 
-  const focusLaneId = handle.laneIds[0]!;
-  await runtime.focusLane(handle.runId, focusLaneId);
-  line(`focused ${focusLaneId}`);
+    await sleep(c.unobservedMs);
+    const beforeResume = await new FsLedger(c.ledgerRoot).load(c.runId);
+    if (!beforeResume) throw new Error(`run "${c.runId}" disappeared`);
+    const adapter = new RealHerdrAdapter();
+    let goneBeforeResume = 0;
+    let aliveBeforeResume = 0;
+    for (const laneId of beforeResume.laneOrder) {
+      const lane = beforeResume.lanes[laneId]!;
+      const info = await adapter.processInfo({ id: lane.paneId });
+      if (info.foregroundProcessGroupId === info.shellPid) goneBeforeResume++;
+      else aliveBeforeResume++;
+    }
+    if (goneBeforeResume === 0 || aliveBeforeResume === 0) {
+      throw new Error(
+        `unobserved window must contain both exited and live lanes; exited=${goneBeforeResume} live=${aliveBeforeResume}`,
+      );
+    }
+    line(
+      `unobserved window: exited=${goneBeforeResume} live=${aliveBeforeResume}`,
+    );
 
-  // 4. One human checkpoint.
-  runtime.markCheckpoint(handle.runId);
-  line("");
-  line("HUMAN CHECKPOINT READY");
-  line(`  observe: the dedicated tab; ${handle.laneIds.length} lanes streaming STEP lines in separate panes.`);
-  line(`  operate: choose ONE logical lane to interrupt — one of ${handle.laneIds.join(", ")}.`);
-  line(`           the runtime runs interruptLane(runId, <lane>) — a real SIGINT, no pane id, no send-keys.`);
-  line(`  success: the chosen lane ends exit 130 (interrupted); every other lane ends exit 0.`);
-  line(`  waiting for lane choice via ${c.interruptFile} ...`);
+    const resumed = await flow(
+      c.ledgerRoot,
+      c.laneTimeoutMs,
+      "resume",
+      c.runId,
+    );
+    if (resumed.exitCode !== 0) {
+      throw new Error(
+        `fresh resume failed: exit=${resumed.exitCode} stderr=${resumed.stderr.trim()}`,
+      );
+    }
+    const inspected = await flow(
+      c.ledgerRoot,
+      c.laneTimeoutMs,
+      "inspect",
+      c.runId,
+    );
+    if (inspected.exitCode !== 0) {
+      throw new Error(
+        `inspect failed: exit=${inspected.exitCode} stderr=${inspected.stderr.trim()}`,
+      );
+    }
+    if (
+      !inspected.stdout.includes("runtimeState=") ||
+      !inspected.stdout.includes("semanticState=") ||
+      !inspected.stdout.includes("contractState=") ||
+      !inspected.stdout.includes("verificationState=")
+    ) {
+      throw new Error("inspect did not render all four lane dimensions");
+    }
 
-  const choice = await pollInterruptChoice(
-    c.interruptFile,
-    handle.laneIds,
-    c.checkpointTimeout,
-  );
-  let interruptedLane: string | null = null;
-  if (choice) {
-    const outcome = await runtime.interruptLane(handle.runId, choice);
-    interruptedLane = choice;
-    line(`interrupted ${outcome.laneId}: signal=${outcome.signal} delivered=${outcome.delivered}`);
-  } else {
-    line("no lane choice received before timeout — the human checkpoint was NOT satisfied");
+    const reloaded = await new FsLedger(c.ledgerRoot).load(c.runId);
+    if (!reloaded || reloaded.finishStatus === null) {
+      throw new Error("fresh ledger reload did not contain run_finished");
+    }
+    if (
+      reloaded.controller === null ||
+      reloaded.controllerEpoch < 1 ||
+      !reloaded.laneOrder.every((laneId) =>
+        TERMINAL_RUNTIME.has(reloaded.lanes[laneId]!.runtimeState),
+      )
+    ) {
+      throw new Error("fresh ledger reload failed controller/terminal integrity");
+    }
+    const eventFile = join(c.ledgerRoot, "runs", c.runId, "events.jsonl");
+    const events = (await readFile(eventFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((eventLine) => JSON.parse(eventLine) as RunEvent);
+    if (!events.some((event) => event.type === "controller_attached")) {
+      throw new Error("event history has no controller_attached");
+    }
+    const attachedIndex = events.findIndex(
+      (event) => event.type === "controller_attached",
+    );
+    const finishedIndex = events.findIndex(
+      (event) => event.type === "run_finished",
+    );
+    if (finishedIndex <= attachedIndex) {
+      throw new Error("event history does not drive the resumed run to run_finished");
+    }
+
+    const report = {
+      runId: c.runId,
+      controller: {
+        pid: controllerPid,
+        killedWith: "SIGKILL",
+        reaped: controllerReaped,
+      },
+      negativeResume: {
+        exitCode: refused.exitCode,
+        refusedByLease: true,
+      },
+      unobservedWindow: {
+        exited: goneBeforeResume,
+        live: aliveBeforeResume,
+      },
+      resumed: {
+        exitCode: resumed.exitCode,
+        controllerEpoch: reloaded.controllerEpoch,
+        finishStatus: reloaded.finishStatus,
+        breakdown: reloaded.breakdown,
+      },
+      inspect: inspected.stdout,
+      laneRuntimeStates: reloaded.laneOrder.map((laneId) => ({
+        laneId,
+        runtimeState: reloaded.lanes[laneId]!.runtimeState,
+        semanticState: reloaded.lanes[laneId]!.semanticState,
+        contractState: reloaded.lanes[laneId]!.contractState,
+        verificationState: reloaded.lanes[laneId]!.verificationState,
+      })),
+      ok: true,
+    };
+    await Bun.write(
+      join(c.evidenceDir, "smoke-result.json"),
+      `${JSON.stringify(report, null, 2)}\n`,
+    );
+    line(`FLOW_SMOKE_DONE=0`);
+  } finally {
+    if (!controllerReaped && pidIsAlive(controllerPid)) {
+      controller.kill("SIGKILL");
+      await controller.exited;
+    }
   }
-
-  // 5. Wait for every lane and collect durable results.
-  const results: LaneResult[] = [];
-  for (const laneId of handle.laneIds) {
-    results.push(await runtime.awaitLane(handle.runId, laneId, c.laneTimeout));
-  }
-  const status = await runtime.inspectWorkflow(handle.runId);
-
-  const controllerLossProven = dispatcherDead && aliveLanes === handle.laneIds.length;
-  const allDone = results.every(
-    (r) => r.state === "complete" || r.state === "interrupted",
-  );
-  const interruptOk =
-    interruptedLane !== null &&
-    results.find((r) => r.laneId === interruptedLane)?.exitCode === 130;
-  const othersOk = results
-    .filter((r) => r.laneId !== interruptedLane)
-    .every((r) => r.exitCode === 0);
-  const ok = controllerLossProven && allDone && interruptOk && othersOk;
-
-  const report = {
-    runId: handle.runId,
-    workflow: "flow-tracer-smoke",
-    laneIds: handle.laneIds,
-    controllerLoss: {
-      dispatcherPid,
-      dispatcherExit,
-      dispatcherDead,
-      lanesAliveAfterDispatcherExit: aliveLanes,
-      proven: controllerLossProven,
-    },
-    focused: focusLaneId,
-    interruptedLane,
-    humanCheckpointSatisfied: interruptedLane !== null,
-    lanes: results.map((r) => ({
-      laneId: r.laneId,
-      state: r.state,
-      exitCode: r.exitCode,
-      waitMatched: r.waitMatched,
-      sentinelToken: r.sentinelToken,
-      outputTail: r.outputTail,
-    })),
-    metrics: status.metrics,
-    zeroModelCalls: true,
-    ok,
-  };
-  await Bun.write(
-    `${c.evidenceDir}/smoke-result.json`,
-    `${JSON.stringify(report, null, 2)}\n`,
-  );
-
-  line("");
-  line(`result written: ${c.evidenceDir}/smoke-result.json`);
-  for (const r of results) {
-    line(`  ${r.laneId}: state=${r.state} exit=${r.exitCode} waitMatched=${r.waitMatched}`);
-  }
-  line(`FLOW_SMOKE_DONE=${ok ? 0 : 1}`);
-  process.exit(ok ? 0 : 1);
 }
 
 async function main(): Promise<void> {
@@ -265,10 +346,12 @@ async function main(): Promise<void> {
     await dispatchPhase();
     return;
   }
-  await collectPhase();
+  await parentPhase();
 }
 
 main().catch((error) => {
-  line(`FLOW_SMOKE_ERROR: ${error instanceof Error ? error.message : String(error)}`);
-  process.exit(2);
+  line(
+    `FLOW_SMOKE_ERROR: ${error instanceof Error ? error.message : String(error)}`,
+  );
+  process.exitCode = 2;
 });
