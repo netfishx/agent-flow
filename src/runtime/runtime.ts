@@ -349,6 +349,9 @@ export class WorkflowRuntime {
     return this.workflowStatus(run);
   }
 
+  // Ownership flips intentionally commit lease-free so a human can take control
+  // from a live managed controller. Use takeover -> controller loss -> resume;
+  // concurrent controller commits may race ledger state (issue #20).
   async takeoverLane(
     runId: string,
     laneId: string,
@@ -356,7 +359,6 @@ export class WorkflowRuntime {
     const loaded = await this.deps.ledger.load(runId);
     if (!loaded) throw new Error(`run not found: "${runId}"`);
     this.registerReducedView(loaded);
-    this.getLane(this.getRun(runId), laneId);
     await this.commitEventConditionally(runId, (current) => {
       if (!current) throw new Error(`unknown runId "${runId}"`);
       const lane = this.getLane(current, laneId);
@@ -378,7 +380,6 @@ export class WorkflowRuntime {
     const loaded = await this.deps.ledger.load(runId);
     if (!loaded) throw new Error(`run not found: "${runId}"`);
     this.registerReducedView(loaded);
-    this.getLane(this.getRun(runId), laneId);
     await this.commitEventConditionally(runId, (current) => {
       if (!current) throw new Error(`unknown runId "${runId}"`);
       const lane = this.getLane(current, laneId);

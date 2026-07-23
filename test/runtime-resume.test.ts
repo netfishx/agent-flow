@@ -194,6 +194,50 @@ describe("WorkflowRuntime resume", () => {
     expect(adapter.interruptedPaneIds).not.toContain(ownedPaneId);
   });
 
+  test("reconciles and durably collects a terminated human-owned lane", async () => {
+    const cwd = await tempWork();
+    const clock = createClock(6_000);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "owned", exitCode: 0 }],
+    });
+    const ledger = new ObservedLedger();
+    const deps = () => ({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run-terminated-owned",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const dispatch = new WorkflowRuntime(deps());
+    const handle = await dispatch.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd,
+      lanes: [{ laneId: "owned", steps: 1 }],
+    });
+    await dispatch.confirmLaneStarted(handle.runId, "owned");
+    const ownedPaneId = adapter.paneIdForLane("owned")!;
+    await dispatch.takeoverLane(handle.runId, "owned");
+    await adapter.waitForOutput({ id: ownedPaneId }, "ignored", 1);
+    const waitsBeforeResume = adapter.waitedPaneIds.length;
+
+    await new WorkflowRuntime(deps()).resumeWorkflow(handle.runId, 1_000);
+    const loaded = await ledger.load(handle.runId);
+    const owned = loaded!.lanes["owned"]!;
+
+    expect(owned.controlMode).toBe("human_owned");
+    expect(owned.runtimeState).toBe("exited");
+    expect(owned.contractEvaluatedAt).not.toBeNull();
+    expect(owned.verificationRecordedAt).not.toBeNull();
+    expect(owned.evidenceFile).not.toBeNull();
+    expect(loaded!.finishStatus).toBe("clean");
+    expect(adapter.waitedPaneIds.slice(waitsBeforeResume)).not.toContain(
+      ownedPaneId,
+    );
+  });
+
   test("release survives controller loss and restores managed automatic drive", async () => {
     const cwd = await tempWork();
     const clock = createClock(7_000);
