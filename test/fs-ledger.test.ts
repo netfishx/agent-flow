@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FsLedger } from "../src/runtime/fs-ledger.ts";
 import type { RunEvent } from "../src/runtime/events.ts";
+import type { LeaseHandle } from "../src/runtime/ledger.ts";
 import { reduce } from "../src/runtime/reducer.ts";
 
 const roots: string[] = [];
@@ -252,6 +253,44 @@ class InterleavedReaderLedger extends FsLedger {
   }
 }
 
+type ControllerTakeoverPhase =
+  | "after-dead-marker-read"
+  | "before-lock-replace";
+
+class PausingTakeoverLedger extends FsLedger {
+  private resolveReached!: () => void;
+  private resumeTakeover!: () => void;
+  readonly reached = new Promise<void>((resolve) => {
+    this.resolveReached = resolve;
+  });
+  private readonly takeoverResumed = new Promise<void>((resolve) => {
+    this.resumeTakeover = resolve;
+  });
+  private paused = false;
+
+  constructor(
+    root: string,
+    isPidAlive: (pid: number) => boolean,
+    private readonly pauseAt: ControllerTakeoverPhase,
+  ) {
+    super(root, isPidAlive);
+  }
+
+  protected override async afterControllerTakeoverPhase(
+    _runId: string,
+    phase: ControllerTakeoverPhase,
+  ): Promise<void> {
+    if (this.paused || phase !== this.pauseAt) return;
+    this.paused = true;
+    this.resolveReached();
+    await this.takeoverResumed;
+  }
+
+  resume(): void {
+    this.resumeTakeover();
+  }
+}
+
 describe("FsLedger public capabilities", () => {
   test("append, load, and list round-trip through the shared reducer", async () => {
     const ledger = new FsLedger(await tempRoot());
@@ -441,7 +480,7 @@ describe("FsLedger public capabilities", () => {
   });
 
   test("refuses a lease while held and permits reacquire after release", async () => {
-    const ledger = new FsLedger(await tempRoot());
+    const ledger = new FsLedger(await tempRoot(), () => true);
     const first = await ledger.acquireLease("run-fs", {
       controllerId: "controller-1",
       pid: 101,
@@ -456,6 +495,318 @@ describe("FsLedger public capabilities", () => {
       pid: 202,
     });
     await expect(second.release()).resolves.toBeUndefined();
+  });
+
+  test("takes over a dead holder with an epoch bump and then refuses a live holder", async () => {
+    const root = await tempRoot();
+    const firstLedger = new FsLedger(root, () => false);
+    await firstLedger.acquireLease("run-fs", {
+      controllerId: "controller-1",
+      pid: 101,
+    });
+    const takeoverLedger = new FsLedger(root, (pid) => pid === 202);
+    const takeover = await takeoverLedger.acquireLease("run-fs", {
+      controllerId: "controller-2",
+      pid: 202,
+    });
+
+    expect(
+      JSON.parse(
+        await readFile(
+          join(root, "runs", "run-fs", "controller.lock"),
+          "utf8",
+        ),
+      ),
+    ).toMatchObject({
+      schemaVersion: 1,
+      controllerId: "controller-2",
+      pid: 202,
+      epoch: 1,
+    });
+    await expect(
+      takeoverLedger.acquireLease("run-fs", {
+        controllerId: "controller-3",
+        pid: 303,
+      }),
+    ).rejects.toThrow('controller lease for run "run-fs" is already held');
+    await takeover.release();
+  });
+
+  test("admits exactly one concurrent takeover of the same dead holder", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root, () => false).acquireLease("run-fs", {
+      controllerId: "dead-controller",
+      pid: 101,
+    });
+    const contenders = [
+      { controllerId: "controller-2", pid: 202 },
+      { controllerId: "controller-3", pid: 303 },
+    ] as const;
+
+    const results = await Promise.allSettled(
+      contenders.map((controller) =>
+        new FsLedger(root, (pid) => pid !== 101).acquireLease(
+          "run-fs",
+          controller,
+        ),
+      ),
+    );
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(
+      1,
+    );
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(
+      1,
+    );
+    const winner = JSON.parse(
+      await readFile(
+        join(root, "runs", "run-fs", "controller.lock"),
+        "utf8",
+      ),
+    ) as { pid: number };
+    await expect(
+      new FsLedger(root, (pid) => pid === winner.pid).acquireLease("run-fs", {
+        controllerId: "controller-4",
+        pid: 404,
+      }),
+    ).rejects.toThrow('controller lease for run "run-fs" is already held');
+    const winningResult = results.find(
+      (result): result is PromiseFulfilledResult<LeaseHandle> =>
+        result.status === "fulfilled",
+    );
+    await winningResult!.value.release();
+  });
+
+  test("the fulfilled takeover owns the final lock across a distinct-pid ABA interleave", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root, () => false).acquireLease("run-fs", {
+      controllerId: "dead-controller",
+      pid: 100,
+    });
+    const runDir = join(root, "runs", "run-fs");
+    const deadMarker = `${JSON.stringify({
+      schemaVersion: 1,
+      pid: 400,
+    })}\n`;
+    await writeFile(
+      join(runDir, ".controller.takeover.epoch-0"),
+      deadMarker,
+      "utf8",
+    );
+    const isPidAlive = (pid: number) => pid === 200 || pid === 300;
+    const contenderB = new PausingTakeoverLedger(
+      root,
+      isPidAlive,
+      "after-dead-marker-read",
+    );
+    const contenderC = new PausingTakeoverLedger(
+      root,
+      isPidAlive,
+      "before-lock-replace",
+    );
+    const controllers = [
+      { controllerId: "controller-b", pid: 200 },
+      { controllerId: "controller-c", pid: 300 },
+    ] as const;
+
+    const resultB = contenderB.acquireLease("run-fs", controllers[0]);
+    await contenderB.reached;
+    const resultC = contenderC.acquireLease("run-fs", controllers[1]);
+    await contenderC.reached;
+    contenderB.resume();
+    await resultB.catch(() => {});
+    contenderC.resume();
+    const results = await Promise.allSettled([resultB, resultC]);
+
+    const winners = results.flatMap((result, index) =>
+      result.status === "fulfilled"
+        ? [{ controller: controllers[index]!, handle: result.value }]
+        : [],
+    );
+    expect(winners).toHaveLength(1);
+    const finalLock = JSON.parse(
+      await readFile(join(runDir, "controller.lock"), "utf8"),
+    ) as { controllerId: string };
+    expect(finalLock.controllerId).toBe(winners[0]!.controller.controllerId);
+    await winners[0]!.handle.release();
+  });
+
+  test("reclaims a dead takeover marker and completes the dead-holder takeover", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root, () => false).acquireLease("run-fs", {
+      controllerId: "dead-controller",
+      pid: 101,
+    });
+    const runDir = join(root, "runs", "run-fs");
+    await writeFile(
+      join(runDir, ".controller.takeover.epoch-0"),
+      `${JSON.stringify({ schemaVersion: 1, pid: 102 })}\n`,
+      "utf8",
+    );
+
+    const takeover = await new FsLedger(root, () => false).acquireLease(
+      "run-fs",
+      { controllerId: "controller-2", pid: 202 },
+    );
+
+    expect(
+      JSON.parse(await readFile(join(runDir, "controller.lock"), "utf8")),
+    ).toMatchObject({
+      controllerId: "controller-2",
+      pid: 202,
+      epoch: 1,
+    });
+    await expect(takeover.release()).resolves.toBeUndefined();
+  });
+
+  test("advances beyond accumulated dead reclaim guards", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root, () => false).acquireLease("run-fs", {
+      controllerId: "dead-controller",
+      pid: 100,
+    });
+    const runDir = join(root, "runs", "run-fs");
+    await writeFile(
+      join(runDir, ".controller.takeover.epoch-0"),
+      `${JSON.stringify({ schemaVersion: 1, pid: 101 })}\n`,
+      "utf8",
+    );
+    for (let ordinal = 0; ordinal <= 3; ordinal++) {
+      await writeFile(
+        join(
+          runDir,
+          `.controller.takeover.epoch-0.reclaim-${ordinal}`,
+        ),
+        `${JSON.stringify({ schemaVersion: 1, pid: 110 + ordinal })}\n`,
+        "utf8",
+      );
+    }
+
+    const takeover = await new FsLedger(
+      root,
+      (pid) => pid === 200,
+    ).acquireLease("run-fs", {
+      controllerId: "fresh-controller",
+      pid: 200,
+    });
+
+    expect(
+      JSON.parse(await readFile(join(runDir, "controller.lock"), "utf8")),
+    ).toMatchObject({
+      controllerId: "fresh-controller",
+      pid: 200,
+      epoch: 1,
+    });
+    await expect(takeover.release()).resolves.toBeUndefined();
+  });
+
+  test("fails closed on a non-canonical reclaim guard ordinal", async () => {
+    for (const suffix of ["x", "-1", "01"]) {
+      const root = await tempRoot();
+      await new FsLedger(root, () => false).acquireLease("run-fs", {
+        controllerId: "dead-controller",
+        pid: 100,
+      });
+      const runDir = join(root, "runs", "run-fs");
+      await writeFile(
+        join(runDir, ".controller.takeover.epoch-0"),
+        `${JSON.stringify({ schemaVersion: 1, pid: 101 })}\n`,
+        "utf8",
+      );
+      // A live pid hidden behind a non-canonical name in the reserved guard
+      // namespace must not be silently skipped.
+      await writeFile(
+        join(runDir, `.controller.takeover.epoch-0.reclaim-${suffix}`),
+        `${JSON.stringify({ schemaVersion: 1, pid: 200 })}\n`,
+        "utf8",
+      );
+
+      await expect(
+        new FsLedger(root, (pid) => pid === 200 || pid === 300).acquireLease(
+          "run-fs",
+          { controllerId: "fresh", pid: 300 },
+        ),
+      ).rejects.toThrow(/corrupt controller takeover guard/);
+      expect(
+        (
+          JSON.parse(
+            await readFile(join(runDir, "controller.lock"), "utf8"),
+          ) as { controllerId: string }
+        ).controllerId,
+      ).toBe("dead-controller");
+    }
+  });
+
+  test("refuses takeover while the existing takeover marker holder is alive", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root, () => false).acquireLease("run-fs", {
+      controllerId: "dead-controller",
+      pid: 101,
+    });
+    const runDir = join(root, "runs", "run-fs");
+    const claim = `${JSON.stringify({ schemaVersion: 1, pid: 102 })}\n`;
+    await writeFile(
+      join(runDir, ".controller.takeover.epoch-0"),
+      claim,
+      "utf8",
+    );
+
+    await expect(
+      new FsLedger(root, (pid) => pid === 102).acquireLease("run-fs", {
+        controllerId: "controller-2",
+        pid: 202,
+      }),
+    ).rejects.toThrow('controller lease for run "run-fs" is already held');
+    expect(
+      await readFile(
+        join(runDir, ".controller.takeover.epoch-0"),
+        "utf8",
+      ),
+    ).toBe(claim);
+  });
+
+  test("fails closed on a corrupt takeover marker", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root, () => false).acquireLease("run-fs", {
+      controllerId: "dead-controller",
+      pid: 101,
+    });
+    const runDir = join(root, "runs", "run-fs");
+    await writeFile(
+      join(runDir, ".controller.takeover.epoch-0"),
+      "{corrupt",
+      "utf8",
+    );
+
+    await expect(
+      new FsLedger(root, () => false).acquireLease("run-fs", {
+        controllerId: "controller-2",
+        pid: 202,
+      }),
+    ).rejects.toThrow(/corrupt controller takeover marker/);
+    expect(
+      await readFile(
+        join(runDir, ".controller.takeover.epoch-0"),
+        "utf8",
+      ),
+    ).toBe("{corrupt");
+  });
+
+  test("fails closed on a corrupt existing controller lock", async () => {
+    const root = await tempRoot();
+    const runDir = join(root, "runs", "run-fs");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(join(runDir, "controller.lock"), "{corrupt", "utf8");
+
+    await expect(
+      new FsLedger(root, () => false).acquireLease("run-fs", {
+        controllerId: "controller-2",
+        pid: 202,
+      }),
+    ).rejects.toThrow(/corrupt controller lease/);
+    expect(
+      await readFile(join(runDir, "controller.lock"), "utf8"),
+    ).toBe("{corrupt");
   });
 
   test("load never returns an event exposed inside an active commit", async () => {

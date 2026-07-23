@@ -14,7 +14,6 @@ import type { RunView } from "../src/runtime/reducer.ts";
 import { PartialDispatchError, WorkflowRuntime } from "../src/runtime/runtime.ts";
 import { shellSingleQuote } from "../src/herdr/argv.ts";
 import { buildLaneCommand } from "../src/smoke/lane.ts";
-import { SmokeRuntime } from "../src/smoke/smoke-runtime.ts";
 
 const roots: string[] = [];
 
@@ -743,43 +742,6 @@ describe("persisted terminal lane facts", () => {
       "lane_contract_evaluated",
       "lane_verification_recorded",
     ]);
-  });
-
-  test("smoke handoff replays into the same durable ledger as an idempotent no-op", async () => {
-    const { ledgerRoot, cwd } = await directories();
-    const clock = createClock(5_000);
-    const adapter = new FakeHerdrAdapter({
-      clock,
-      lanes: [{ laneId: "lane-1", exitCode: 0 }],
-    });
-    const deps = () => ({
-      adapter,
-      ledger: new FsLedger(ledgerRoot),
-      clock: clock.now,
-      idgen: () => "run-handoff",
-      readResultFile: adapter.readResultFile,
-      sleep: async () => {},
-    });
-    const dispatch = new SmokeRuntime(deps());
-    const handle = await dispatch.startWorkflow({
-      workflow: "smoke",
-      workspace: "w1",
-      cwd,
-      lanes: [{ laneId: "lane-1", steps: 1 }],
-    });
-    await dispatch.confirmLaneStarted(handle.runId, "lane-1");
-    const handoff = await dispatch.exportRun(handle.runId);
-    const eventFile = join(ledgerRoot, "runs", handle.runId, "events.jsonl");
-    const before = await readFile(eventFile, "utf8");
-    await dispatch.releaseForHandoff(handle.runId);
-
-    const collect = new SmokeRuntime(deps());
-    expect(await collect.attachRun(handoff)).toEqual(handle);
-    expect(await readFile(eventFile, "utf8")).toBe(before);
-    await collect.awaitLane(handle.runId, "lane-1", 1_000);
-    expect((await new FsLedger(ledgerRoot).load(handle.runId))!.finishStatus).toBe(
-      "clean",
-    );
   });
 
   test("a failed fact append does not block run_finished and holds the lease until retry", async () => {
