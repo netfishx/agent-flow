@@ -170,6 +170,12 @@ class IntentCleanupFailureLedger extends FsLedger {
   }
 }
 
+class AppendFailureLedger extends FsLedger {
+  protected override async appendAndSync(): Promise<void> {
+    throw new Error("injected append failure");
+  }
+}
+
 class SnapshotWriteFailureLedger extends FsLedger {
   protected override async writeSnapshotFile(
     path: string,
@@ -256,6 +262,58 @@ class InterleavedReaderLedger extends FsLedger {
 type ControllerTakeoverPhase =
   | "after-dead-marker-read"
   | "before-lock-replace";
+
+type CommitLockPhase = "acquired" | "before-release";
+
+class PausingCommitLockLedger extends FsLedger {
+  private resolveReached!: () => void;
+  private resumeCommit!: () => void;
+  readonly reached = new Promise<void>((resolve) => {
+    this.resolveReached = resolve;
+  });
+  private readonly commitResumed = new Promise<void>((resolve) => {
+    this.resumeCommit = resolve;
+  });
+  private paused = false;
+
+  constructor(
+    root: string,
+    isPidAlive: (pid: number) => boolean = (pid) => pid === process.pid,
+    private readonly pauseAt: CommitLockPhase = "acquired",
+  ) {
+    super(root, isPidAlive);
+  }
+
+  protected override async afterCommitLockPhase(
+    _runId: string,
+    phase: CommitLockPhase,
+  ): Promise<void> {
+    if (this.paused || phase !== this.pauseAt) return;
+    this.paused = true;
+    this.resolveReached();
+    await this.commitResumed;
+  }
+
+  resume(): void {
+    this.resumeCommit();
+  }
+}
+
+class CommitLockReleaseFailureLedger extends AppendFailureLedger {
+  constructor(private readonly ledgerRoot: string) {
+    super(ledgerRoot);
+  }
+
+  protected override async afterCommitLockPhase(
+    runId: string,
+    phase: CommitLockPhase,
+  ): Promise<void> {
+    if (phase !== "before-release") return;
+    const lockFile = join(this.ledgerRoot, "runs", runId, "commit.lock");
+    await unlink(lockFile);
+    await mkdir(lockFile);
+  }
+}
 
 class PausingTakeoverLedger extends FsLedger {
   private resolveReached!: () => void;
@@ -809,6 +867,176 @@ describe("FsLedger public capabilities", () => {
     ).toBe("{corrupt");
   });
 
+  test("serializes racing committers without silently losing either outcome", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root).commit(started());
+    const winnerEvent = registered();
+    const loserEvent = { ...registered(), at: 21 };
+    const winner = new PausingCommitLockLedger(root);
+
+    const winningCommit = winner.commit(winnerEvent);
+    await winner.reached;
+    const losingResult = await Promise.allSettled([
+      new FsLedger(root).commit(loserEvent),
+    ]);
+
+    expect(losingResult[0]!.status).toBe("rejected");
+    expect(
+      (losingResult[0] as PromiseRejectedResult).reason,
+    ).toHaveProperty(
+      "message",
+      expect.stringMatching(/commit lock.*contended|sequence 2 does not follow 2/),
+    );
+    winner.resume();
+    await expect(winningCommit).resolves.toBeUndefined();
+
+    const lines = (
+      await readFile(join(root, "runs", "run-fs", "events.jsonl"), "utf8")
+    ).trim().split("\n").map((line) => JSON.parse(line) as RunEvent);
+    expect(lines).toEqual([started(), winnerEvent]);
+    expect(lines).not.toContainEqual(loserEvent);
+    expect(
+      (await new FsLedger(root).load("run-fs"))!.lastAppliedSequence,
+    ).toBe(2);
+  });
+
+  test("fails fast on live commit contention and permits a later retry", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root).commit(started());
+    const holder = new PausingCommitLockLedger(root);
+    const heldCommit = holder.commit(registered());
+    await holder.reached;
+
+    await expect(new FsLedger(root).commit(exited())).rejects.toThrow(
+      'commit lock for run "run-fs" is contended',
+    );
+    holder.resume();
+    await heldCommit;
+    await expect(new FsLedger(root).commit(exited())).resolves.toBeUndefined();
+
+    const replayed = await new FsLedger(root).load("run-fs");
+    expect(replayed!.lastAppliedSequence).toBe(3);
+    expect(replayed!.lanes["lane-1"]!.runtimeState).toBe("exited");
+  });
+
+  test("reclaims a dead commit lock and refuses a live holder", async () => {
+    const root = await tempRoot();
+    const runDir = join(root, "runs", "run-fs");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(
+      join(runDir, "commit.lock"),
+      `${JSON.stringify({ schemaVersion: 1, pid: 101 })}\n`,
+      "utf8",
+    );
+    const reclaimer = new PausingCommitLockLedger(
+      root,
+      (pid) => pid === process.pid,
+    );
+
+    const reclaimedCommit = reclaimer.commit(started());
+    await reclaimer.reached;
+    expect(
+      JSON.parse(await readFile(join(runDir, "commit.lock"), "utf8")),
+    ).toEqual({ schemaVersion: 1, pid: process.pid });
+    reclaimer.resume();
+    await reclaimedCommit;
+
+    const liveRoot = await tempRoot();
+    const liveRunDir = join(liveRoot, "runs", "run-fs");
+    await mkdir(liveRunDir, { recursive: true });
+    await writeFile(
+      join(liveRunDir, "commit.lock"),
+      `${JSON.stringify({ schemaVersion: 1, pid: 202 })}\n`,
+      "utf8",
+    );
+    await expect(
+      new FsLedger(liveRoot, (pid) => pid === 202).commit(started()),
+    ).rejects.toThrow('commit lock for run "run-fs" is contended');
+  });
+
+  test("a commit-lock reclaim guard loser backs off without replacing the holder", async () => {
+    const root = await tempRoot();
+    const runDir = join(root, "runs", "run-fs");
+    await mkdir(runDir, { recursive: true });
+    const deadHolder = `${JSON.stringify({ schemaVersion: 1, pid: 101 })}\n`;
+    await writeFile(join(runDir, "commit.lock"), deadHolder, "utf8");
+    await writeFile(
+      join(runDir, "commit.lock.reclaim"),
+      `${JSON.stringify({ schemaVersion: 1, pid: 202 })}\n`,
+      "utf8",
+    );
+    const contender = new FsLedger(root, () => false);
+
+    await expect(contender.commit(started())).rejects.toThrow(
+      'commit lock for run "run-fs" is contended',
+    );
+    expect(await readFile(join(runDir, "commit.lock"), "utf8")).toBe(
+      deadHolder,
+    );
+    await unlink(join(runDir, "commit.lock.reclaim"));
+    await expect(contender.commit(started())).resolves.toBeUndefined();
+  });
+
+  test("fails closed on a corrupt commit lock", async () => {
+    const root = await tempRoot();
+    const runDir = join(root, "runs", "run-fs");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(join(runDir, "commit.lock"), "{corrupt", "utf8");
+
+    await expect(new FsLedger(root).commit(started())).rejects.toThrow(
+      'corrupt commit lock for run "run-fs"',
+    );
+    expect(await readFile(join(runDir, "commit.lock"), "utf8")).toBe(
+      "{corrupt",
+    );
+  });
+
+  test("releases the commit lock after reducer rejection", async () => {
+    const root = await tempRoot();
+
+    await expect(new FsLedger(root).commit(registered())).rejects.toThrow(
+      /sequence 2 does not follow 0/,
+    );
+    await expect(
+      readFile(join(root, "runs", "run-fs", "commit.lock"), "utf8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(new FsLedger(root).commit(started())).resolves.toBeUndefined();
+  });
+
+  test("releases the commit lock after append failure", async () => {
+    const root = await tempRoot();
+
+    await expect(new AppendFailureLedger(root).commit(started())).rejects.toThrow(
+      /injected append failure/,
+    );
+    await expect(
+      readFile(join(root, "runs", "run-fs", "commit.lock"), "utf8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(new FsLedger(root).commit(started())).resolves.toBeUndefined();
+  });
+
+  test("releases the commit lock after intent failure", async () => {
+    const root = await tempRoot();
+
+    await expect(
+      new IntentWriteFailureLedger(root).commit(started()),
+    ).rejects.toThrow(/intent fsync failure/);
+    await expect(
+      readFile(join(root, "runs", "run-fs", "commit.lock"), "utf8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(new FsLedger(root).commit(started())).resolves.toBeUndefined();
+  });
+
+  test("aggregates commit and commit-lock release failures", async () => {
+    const root = await tempRoot();
+
+    await expect(
+      new CommitLockReleaseFailureLedger(root).commit(started()),
+    ).rejects.toThrow(
+      /commit failed: injected append failure; commit lock release failed:/,
+    );
+  });
+
   test("load never returns an event exposed inside an active commit", async () => {
     const root = await tempRoot();
     await new FsLedger(root).commit(started());
@@ -923,5 +1151,6 @@ describe("FsLedger public capabilities", () => {
       [],
     );
     expect(await ledger.load("run-fs")).toBeNull();
+    await expect(new FsLedger(root).commit(started())).resolves.toBeUndefined();
   });
 });
