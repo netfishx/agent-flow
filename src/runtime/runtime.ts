@@ -136,8 +136,15 @@ export class WorkflowRuntime {
   private readonly pendingTransitions = new Map<string, Promise<void>>();
   private readonly commitTails = new Map<string, Promise<void>>();
   private readonly leases = new Map<string, LeaseHandle>();
+  private readonly driveSliceMs: number;
 
-  constructor(protected readonly deps: RuntimeDeps) {}
+  constructor(protected readonly deps: RuntimeDeps) {
+    const driveSliceMs = deps.driveSliceMs ?? 2_000;
+    if (!Number.isFinite(driveSliceMs) || driveSliceMs <= 0) {
+      throw new Error("driveSliceMs must be a positive finite number");
+    }
+    this.driveSliceMs = driveSliceMs;
+  }
 
   async startWorkflow(config: StartWorkflowConfig): Promise<RunHandle> {
     const runId = this.deps.idgen();
@@ -337,6 +344,11 @@ export class WorkflowRuntime {
   }
 
   async inspectWorkflow(runId: string): Promise<WorkflowStatus> {
+    if (!this.runs.has(runId)) {
+      const loaded = await this.deps.ledger.load(runId);
+      if (!loaded) throw new Error(`unknown runId "${runId}"`);
+      this.registerReducedView(loaded);
+    }
     await this.flushPending(runId);
     await this.finishIfTerminal(runId);
     let run = this.getRun(runId);
@@ -617,30 +629,61 @@ export class WorkflowRuntime {
     laneId: string,
     timeoutMs: number,
   ): Promise<LaneResult> {
-    await this.flushPending(runId);
-    const lane = this.getLane(this.getRun(runId), laneId);
-    if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
-      await this.finishIfTerminal(runId);
-      await this.recordTerminalFacts(runId, laneId, lane.exitCode);
-      return this.inspectLaneResult(runId, laneId);
-    }
-
-    const outcome = await this.deps.adapter.waitForOutput(
-      { id: lane.paneId },
-      laneSentinelRegex(runId, laneId),
-      timeoutMs,
-    );
-    if (outcome.matched) {
-      const gone = await this.confirmProcessGone({ id: lane.paneId });
-      if (!gone) {
-        throw new Error(
-          `lane "${laneId}" printed its sentinel but its process is still running`,
-        );
+    let remaining = timeoutMs;
+    for (;;) {
+      await this.reloadFromLedger(runId);
+      let lane = this.getLane(this.getRun(runId), laneId);
+      if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
+        await this.finishIfTerminal(runId);
+        await this.recordTerminalFacts(runId, laneId, lane.exitCode);
+        return this.inspectLaneResult(runId, laneId);
       }
-      await this.finalizeLane(runId, laneId, outcome.matched);
+      if (this.autoControlSuppressed(lane)) {
+        return this.inspectLaneResult(runId, laneId);
+      }
+
+      const slice = Math.min(remaining, this.driveSliceMs);
+      if (slice <= 0) {
+        const result = await this.inspectLaneResult(runId, laneId);
+        return { ...result, timedOut: true };
+      }
+
+      await this.onDriveSliceBoundary(runId, laneId);
+      const outcome = await this.deps.adapter.waitForOutput(
+        { id: lane.paneId },
+        laneSentinelRegex(runId, laneId),
+        slice,
+      );
+
+      await this.reloadFromLedger(runId);
+      lane = this.getLane(this.getRun(runId), laneId);
+      if (outcome.matched) {
+        const gone = await this.confirmProcessGone({ id: lane.paneId });
+        if (!gone) {
+          throw new Error(
+            `lane "${laneId}" printed its sentinel but its process is still running`,
+          );
+        }
+        await this.finalizeLane(runId, laneId, true);
+        lane = this.getLane(this.getRun(runId), laneId);
+        if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
+          await this.recordTerminalFacts(runId, laneId, lane.exitCode);
+          return this.inspectLaneResult(runId, laneId);
+        }
+      } else {
+        await this.refreshLane(runId, laneId);
+        lane = this.getLane(this.getRun(runId), laneId);
+      }
+
+      if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
+        await this.recordTerminalFacts(runId, laneId, lane.exitCode);
+        return this.inspectLaneResult(runId, laneId);
+      }
+      if (this.autoControlSuppressed(lane)) {
+        return this.inspectLaneResult(runId, laneId);
+      }
+      remaining -= slice;
     }
-    const result = await this.inspectLaneResult(runId, laneId);
-    return { ...result, timedOut: outcome.timedOut };
   }
 
   async confirmLaneStarted(
@@ -680,6 +723,11 @@ export class WorkflowRuntime {
   protected hasPendingTransition(runId: string): boolean {
     return this.pendingTransitions.has(runId) || this.commitTails.has(runId);
   }
+
+  protected async onDriveSliceBoundary(
+    _runId: string,
+    _laneId: string,
+  ): Promise<void> {}
 
   protected registerReducedView(view: RunView): void {
     this.runs.set(view.runId, view);
@@ -761,6 +809,15 @@ export class WorkflowRuntime {
     if (!pending) return;
     this.pendingTransitions.delete(runId);
     await pending;
+  }
+
+  private async reloadFromLedger(runId: string): Promise<void> {
+    await this.flushPending(runId);
+    const inFlight = this.commitTails.get(runId);
+    if (inFlight) await inFlight;
+    const loaded = await this.deps.ledger.load(runId);
+    if (!loaded) throw new Error(`run not found: "${runId}"`);
+    this.registerReducedView(loaded);
   }
 
   private async confirmProcessGone(pane: PaneRef): Promise<boolean> {
