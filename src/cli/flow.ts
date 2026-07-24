@@ -124,7 +124,10 @@ export async function runFlowCli(
       return 0;
     }
 
-    if (command === "resume") {
+    if (command === "inspect") {
+      const runtime = (options.runtimeFactory ?? createRealRuntime)(ledger);
+      await runtime.inspectWorkflow(runId!);
+    } else if (command === "resume") {
       const runtime = (options.runtimeFactory ?? createRealRuntime)(ledger);
       await runtime.resumeWorkflow(runId!, laneTimeout(environment));
     } else if (command === "takeover") {
