@@ -3,12 +3,16 @@
 // A dispatch child starts short managed lanes plus one long lane and stays
 // alive holding the durable controller lease. The parent takes over the long
 // lane, kills the controller, reconciles without driving the human-owned lane,
-// then releases it and proves a fresh resume can finish the run.
+// observes its self-termination, then releases it and resumes the finished run.
 
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { RealHerdrAdapter } from "../herdr/real-adapter.ts";
-import type { RunEvent, RuntimeState } from "../runtime/events.ts";
+import type {
+  RunEvent,
+  RunnerEvidence,
+  RuntimeState,
+} from "../runtime/events.ts";
 import {
   FsLedger,
   realPidIsAlive,
@@ -17,6 +21,7 @@ import {
 import type { Ledger } from "../runtime/ledger.ts";
 import { WorkflowRuntime } from "../runtime/runtime.ts";
 import type { LaneSpec, RuntimeDeps } from "../runtime/types.ts";
+import { summarizeInspectCollection } from "./takeover-report.ts";
 
 const TERMINAL_RUNTIME: ReadonlySet<RuntimeState> = new Set([
   "exited",
@@ -171,6 +176,24 @@ async function waitForReady(path: string, timeoutMs: number): Promise<void> {
   }
 }
 
+async function waitForLaneGone(
+  adapter: RealHerdrAdapter,
+  paneId: string,
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const info = await adapter.processInfo({ id: paneId });
+    if (info.foregroundProcessGroupId === info.shellPid) return;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `human-owned lane did not self-terminate within ${timeoutMs}ms`,
+      );
+    }
+    await sleep(100);
+  }
+}
+
 function laneStates(run: NonNullable<Awaited<ReturnType<FsLedger["load"]>>>) {
   return run.laneOrder.map((laneId) => ({
     laneId,
@@ -297,6 +320,49 @@ async function parentPhase(): Promise<void> {
     }
     line("first resume reconciled managed lanes and left human-owned lane live");
 
+    await waitForLaneGone(
+      adapter,
+      longAfterFirstResume.paneId,
+      c.laneTimeoutMs,
+    );
+    line("human-owned lane self-terminated");
+
+    const inspect = await flow(
+      c.ledgerRoot,
+      c.laneTimeoutMs,
+      "inspect",
+      c.runId,
+    );
+    if (inspect.exitCode !== 0) {
+      throw new Error(
+        `inspect failed: exit=${inspect.exitCode} stderr=${inspect.stderr.trim()}`,
+      );
+    }
+    const afterInspect = await new FsLedger(c.ledgerRoot).load(c.runId);
+    if (!afterInspect) throw new Error(`run "${c.runId}" disappeared`);
+    const longAfterInspect = afterInspect.lanes[c.longLaneId]!;
+    const inspectEvidence =
+      longAfterInspect.evidenceFile === null
+        ? null
+        : JSON.parse(
+            await readFile(longAfterInspect.evidenceFile, "utf8"),
+          ) as RunnerEvidence;
+    const inspectCollected = summarizeInspectCollection({
+      exitCode: inspect.exitCode,
+      runId: c.runId,
+      laneId: c.longLaneId,
+      runtimeState: longAfterInspect.runtimeState,
+      controlMode: longAfterInspect.controlMode,
+      contractState: longAfterInspect.contractState,
+      verificationState: longAfterInspect.verificationState,
+      evidenceFile: longAfterInspect.evidenceFile,
+      evidence: inspectEvidence,
+    });
+    if (afterInspect.finishStatus === null) {
+      throw new Error("inspect did not finish the self-terminated run");
+    }
+    line("inspect collected the human-owned lane terminal evidence");
+
     const release = await flow(
       c.ledgerRoot,
       c.laneTimeoutMs,
@@ -359,6 +425,12 @@ async function parentPhase(): Promise<void> {
         },
         finishStatus: afterFirstResume.finishStatus,
       },
+      inspectCollected,
+      finishedAfterInspect: {
+        exitCode: inspect.exitCode,
+        finishStatus: afterInspect.finishStatus,
+        breakdown: afterInspect.breakdown,
+      },
       finishedAfterRelease: {
         exitCode: secondResume.exitCode,
         finishStatus: finished.finishStatus,
@@ -366,6 +438,7 @@ async function parentPhase(): Promise<void> {
       },
       lanes: {
         afterFirstResume: laneStates(afterFirstResume),
+        afterInspect: laneStates(afterInspect),
         afterRelease: laneStates(afterRelease),
         finished: laneStates(finished),
       },
