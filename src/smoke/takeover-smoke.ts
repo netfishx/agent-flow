@@ -9,7 +9,7 @@ import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { RealHerdrAdapter } from "../herdr/real-adapter.ts";
 import type { PaneRef, WaitOutcome } from "../herdr/types.ts";
-import type { RunnerEvidence, RuntimeState } from "../runtime/events.ts";
+import type { RunnerEvidence } from "../runtime/events.ts";
 import {
   FsLedger,
   realPidIsAlive,
@@ -23,13 +23,6 @@ import {
   summarizeInspectCollection,
   summarizePostReleaseDrive,
 } from "./takeover-report.ts";
-
-const TERMINAL_RUNTIME: ReadonlySet<RuntimeState> = new Set([
-  "exited",
-  "crashed",
-  "lost",
-  "failed_to_start",
-]);
 
 const env = (key: string, fallback: string): string => {
   const value = process.env[key];
@@ -453,11 +446,15 @@ async function parentPhase(): Promise<void> {
     const managedLaneIds = afterTakeoverDrive.laneOrder.filter((laneId) =>
       laneId.startsWith("short-"),
     );
-    const siblingComplete = managedLaneIds.every((laneId) =>
-      TERMINAL_RUNTIME.has(
-        afterTakeoverDrive.lanes[laneId]!.runtimeState,
-      ),
-    );
+    // A degraded sibling (crashed/lost/failed_to_start) must NOT count as
+    // completion: the managed sibling has to finish clean while the owned lane
+    // is taken over. (The in-slice proof is targetWaitCount===1 in
+    // summarizeInSliceAbort -- a takeover landing before the wait yields 0 and
+    // is rejected there, so the marker-before-block timing cannot false-pass.)
+    const siblingComplete = managedLaneIds.every((laneId) => {
+      const sibling = afterTakeoverDrive.lanes[laneId]!;
+      return sibling.runtimeState === "exited" && sibling.exitCode === 0;
+    });
     const inSliceAbort = summarizeInSliceAbort({
       waitStarted: await Bun.file(c.driveWaitMarker).exists(),
       targetWaitCount: driveResult.targetWaitCount,
@@ -606,7 +603,7 @@ async function parentPhase(): Promise<void> {
     if (!finished) throw new Error(`run "${c.runId}" disappeared`);
     const releasedLane = finished.lanes[c.releaseLaneId]!;
     const postReleaseDrive = summarizePostReleaseDrive({
-      wasRunningBeforeRelease: true,
+      wasRunningBeforeRelease: releaseBeforeFlip.runtimeState === "running",
       waitStarted: await Bun.file(c.releaseWaitMarker).exists(),
       targetWaitCount: releaseDriveResult.targetWaitCount,
       controllerThrew:
