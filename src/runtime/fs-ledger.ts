@@ -99,6 +99,13 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isSafeCommitLockNonce(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[A-Za-z0-9-]{1,128}$/.test(value)
+  );
+}
+
 async function replayFile(path: string): Promise<ReplayResult> {
   let contents: string;
   try {
@@ -808,8 +815,8 @@ export class FsLedger implements Ledger {
 
   private nextCommitLockRecord(): CommitLockRecord {
     const nonce = this.nonceGen();
-    if (typeof nonce !== "string" || nonce.length === 0) {
-      throw new Error("commit lock nonce must not be empty");
+    if (!isSafeCommitLockNonce(nonce)) {
+      throw new Error("commit lock nonce must be a safe path segment");
     }
     return { schemaVersion: 1, pid: process.pid, nonce };
   }
@@ -898,8 +905,7 @@ export class FsLedger implements Ledger {
       (parsed as { schemaVersion?: unknown }).schemaVersion !== 1 ||
       !Number.isSafeInteger((parsed as { pid?: unknown }).pid) ||
       (parsed as { pid: number }).pid <= 0 ||
-      typeof (parsed as { nonce?: unknown }).nonce !== "string" ||
-      (parsed as { nonce: string }).nonce.length === 0
+      !isSafeCommitLockNonce((parsed as { nonce?: unknown }).nonce)
     ) {
       throw new Error(`corrupt commit lock for run "${runId}"`);
     }

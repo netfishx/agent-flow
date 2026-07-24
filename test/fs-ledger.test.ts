@@ -1409,6 +1409,55 @@ describe("FsLedger public capabilities", () => {
     ).toEqual(["commit.lock.reclaim.dead-lock.ord-0"]);
   });
 
+  test("rejects an unsafe generated nonce before writing lock artifacts", async () => {
+    const root = await tempRoot();
+    const runDir = join(root, "runs", "run-fs");
+    const ledger = new FsLedger(
+      root,
+      (pid) => pid === process.pid,
+      noSleep,
+      fixedNonce("../evil"),
+    );
+
+    await expect(ledger.commit(started())).rejects.toThrow(
+      /commit lock nonce/,
+    );
+    expect(await readdir(runDir)).toEqual([]);
+  });
+
+  test("rejects a traversal nonce before reclaim can escape the run directory", async () => {
+    const root = await tempRoot();
+    const runDir = join(root, "runs", "run-fs");
+    const escapedGuard = join(root, "runs", "escaped-guard.ord-0");
+    const escapedSibling = join(root, "escaped-guard.ord-0");
+    await mkdir(runDir, { recursive: true });
+    const craftedLock = `${JSON.stringify({
+      schemaVersion: 1,
+      pid: 101,
+      nonce: "../../../escaped-guard",
+    })}\n`;
+    await writeFile(join(runDir, "commit.lock"), craftedLock, "utf8");
+
+    await expect(
+      new FsLedger(
+        root,
+        () => false,
+        noSleep,
+        fixedNonce("replacement"),
+      ).commit(started()),
+    ).rejects.toThrow('corrupt commit lock for run "run-fs"');
+    await expect(readFile(escapedGuard, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(readFile(escapedSibling, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(await readdir(runDir)).toEqual(["commit.lock"]);
+    expect(await readFile(join(runDir, "commit.lock"), "utf8")).toBe(
+      craftedLock,
+    );
+  });
+
   test("fails closed on a corrupt commit lock", async () => {
     const root = await tempRoot();
     const runDir = join(root, "runs", "run-fs");
