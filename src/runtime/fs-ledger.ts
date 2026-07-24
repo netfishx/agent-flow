@@ -1,4 +1,5 @@
 import {
+  link,
   mkdir,
   open,
   readdir,
@@ -8,9 +9,10 @@ import {
   writeFile,
   type FileHandle,
 } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { RunEvent } from "./events.ts";
 import { assertHandleId } from "./ids.ts";
 import type { LeaseHandle, Ledger } from "./ledger.ts";
@@ -42,14 +44,29 @@ interface ControllerTakeoverMarker {
   readonly pid: number;
 }
 
+interface CommitLockRecord {
+  readonly schemaVersion: 1;
+  readonly pid: number;
+  readonly nonce: string;
+}
+
+type Sleep = (milliseconds: number) => Promise<void>;
+
 let snapshotSequence = 0;
 let commitStateSequence = 0;
 let leaseSequence = 0;
+let commitLockSequence = 0;
 const COMMIT_INTENT_FILE = "commit-intent.json";
 const COMMIT_STATE_FILE = "commit-state.json";
+const COMMIT_LOCK_FILE = "commit.lock";
+const COMMIT_LOCK_BACKOFF_MS = [25, 50, 100, 200, 400] as const;
+const COMMIT_LOCK_RECLAIM_GUARD_ATTEMPTS = 4;
 const TAKEOVER_ATTEMPTS = 4;
 const TAKEOVER_GUARD_ACQUIRE_ATTEMPTS = 4;
 const STABLE_READ_ATTEMPTS = 3;
+
+const realSleep: Sleep = (milliseconds) =>
+  new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
 
 export function realPidIsAlive(pid: number): boolean {
   try {
@@ -80,6 +97,13 @@ function corruption(path: string, line: number, cause: unknown): Error {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isSafeCommitLockNonce(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[A-Za-z0-9-]{1,128}$/.test(value)
+  );
 }
 
 async function replayFile(path: string): Promise<ReplayResult> {
@@ -157,6 +181,8 @@ export class FsLedger implements Ledger {
   constructor(
     private readonly root: string,
     private readonly isPidAlive: (pid: number) => boolean = realPidIsAlive,
+    private readonly sleep: Sleep = realSleep,
+    private readonly nonceGen: () => string = randomUUID,
   ) {
     if (root.length === 0) throw new Error("FsLedger root must not be empty");
   }
@@ -166,150 +192,153 @@ export class FsLedger implements Ledger {
     const prior = this.commitTails.get(event.runId) ?? Promise.resolve();
     const commit = prior.then(async () => {
       const runDir = this.runDir(event.runId);
-      const eventFile = join(runDir, "events.jsonl");
-      const replayed = await this.readStableReplay(event.runId);
-      const duplicate = replayed.byEventId.get(event.eventId);
-      if (duplicate) {
-        if (!isDeepStrictEqual(duplicate, event)) {
-          throw new Error(
-            `eventId "${event.eventId}" already exists with a different payload`,
-          );
-        }
-      }
-
-      const next = duplicate
-        ? replayed.view
-        : reduce(replayed.view ?? undefined, event);
       await mkdir(runDir, { recursive: true });
-      const writingState = await this.enterCommitState(runDir, event.runId);
-      if (duplicate) {
+      return this.withCommitLock(runDir, event.runId, async () => {
+        const eventFile = join(runDir, "events.jsonl");
+        const replayed = await this.readStableReplay(event.runId);
+        await this.afterStableReplayPhase(event.runId);
+        const duplicate = replayed.byEventId.get(event.eventId);
+        if (duplicate) {
+          if (!isDeepStrictEqual(duplicate, event)) {
+            throw new Error(
+              `eventId "${event.eventId}" already exists with a different payload`,
+            );
+          }
+        }
+
+        const next = duplicate
+          ? replayed.view
+          : reduce(replayed.view ?? undefined, event);
+        const writingState = await this.enterCommitState(runDir, event.runId);
+        if (duplicate) {
+          try {
+            await this.truncateTrailingPartial(eventFile, replayed);
+          } finally {
+            await this.leaveCommitState(runDir, writingState);
+          }
+          return;
+        }
+        if (!next) throw new Error("commit reducer produced no run view");
+        let snapshotTemp: string;
         try {
-          await this.truncateTrailingPartial(eventFile, replayed);
+          snapshotTemp = await this.writeSnapshotTemp(runDir, next);
+        } catch (snapshotError) {
+          try {
+            await this.leaveCommitState(runDir, writingState);
+          } catch (stateError) {
+            throw new Error(
+              `snapshot write failed: ${errorMessage(snapshotError)}; commit state cleanup failed: ${errorMessage(stateError)}`,
+              { cause: snapshotError },
+            );
+          }
+          throw snapshotError;
+        }
+        try {
+          await this.writeCommitIntent(runDir, {
+            eventId: event.eventId,
+            lastValidByteLength: replayed.validByteLength,
+          });
+        } catch (error) {
+          await unlink(snapshotTemp).catch(() => {});
+          try {
+            await this.clearCommitIntent(runDir);
+          } catch (cleanupError) {
+            if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") {
+              throw new Error(
+                `commit intent write failed: ${errorMessage(error)}; marker cleanup failed: ${errorMessage(cleanupError)}`,
+                { cause: error },
+              );
+            }
+          }
+          await this.leaveCommitState(runDir, writingState);
+          throw error;
+        }
+
+        let handle: FileHandle | undefined;
+        try {
+          try {
+            handle = await open(eventFile, "a+");
+          } catch (openError) {
+            await unlink(snapshotTemp).catch(() => {});
+            try {
+              await this.clearCommitIntent(runDir);
+            } catch (cleanupError) {
+              throw new Error(
+                `event file open failed: ${errorMessage(openError)}; marker cleanup failed: ${errorMessage(cleanupError)}`,
+                { cause: openError },
+              );
+            }
+            await this.leaveCommitState(runDir, writingState);
+            throw openError;
+          }
+          const currentSize = (await handle.stat()).size;
+          if (currentSize < replayed.validByteLength) {
+            throw new Error(`event stream "${eventFile}" changed during commit`);
+          }
+          const originalSize = replayed.validByteLength;
+          try {
+            if (currentSize > originalSize) {
+              await handle.truncate(originalSize);
+              await handle.sync();
+            }
+            const separator = replayed.needsLeadingNewline ? "\n" : "";
+            await this.appendAndSync(
+              handle,
+              `${separator}${JSON.stringify(event)}\n`,
+            );
+          } catch (appendError) {
+            try {
+              await this.rollbackAppend(handle, originalSize);
+            } catch (rollbackError) {
+              const compound = new Error(
+                `event append failed: ${errorMessage(appendError)}; rollback failed: ${errorMessage(rollbackError)}`,
+                { cause: appendError },
+              );
+              // The write-ahead marker is intentionally retained. A fresh
+              // process will refuse the run rather than replay the orphan.
+              throw compound;
+            }
+            await unlink(snapshotTemp).catch(() => {});
+            try {
+              await this.clearCommitIntent(runDir);
+            } catch (cleanupError) {
+              throw new Error(
+                `event append failed: ${errorMessage(appendError)}; marker cleanup failed: ${errorMessage(cleanupError)}`,
+                { cause: appendError },
+              );
+            }
+            await this.leaveCommitState(runDir, writingState);
+            throw appendError;
+          }
+        } catch (error) {
+          await unlink(snapshotTemp).catch(() => {});
+          throw error;
         } finally {
-          await this.leaveCommitState(runDir, writingState);
+          await handle?.close().catch(() => {});
         }
-        return;
-      }
-      if (!next) throw new Error("commit reducer produced no run view");
-      let snapshotTemp: string;
-      try {
-        snapshotTemp = await this.writeSnapshotTemp(runDir, next);
-      } catch (snapshotError) {
+        // The event fsync above is the commit point. A snapshot is only a cache;
+        // replay must remain authoritative even if materialization is interrupted.
         try {
-          await this.leaveCommitState(runDir, writingState);
-        } catch (stateError) {
-          throw new Error(
-            `snapshot write failed: ${errorMessage(snapshotError)}; commit state cleanup failed: ${errorMessage(stateError)}`,
-            { cause: snapshotError },
-          );
+          await rename(snapshotTemp, join(runDir, "run.json"));
+        } catch {
+          await unlink(snapshotTemp).catch(() => {});
         }
-        throw snapshotError;
-      }
-      try {
-        await this.writeCommitIntent(runDir, {
-          eventId: event.eventId,
-          lastValidByteLength: replayed.validByteLength,
-        });
-      } catch (error) {
-        await unlink(snapshotTemp).catch(() => {});
         try {
           await this.clearCommitIntent(runDir);
-        } catch (cleanupError) {
-          if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") {
-            throw new Error(
-              `commit intent write failed: ${errorMessage(error)}; marker cleanup failed: ${errorMessage(cleanupError)}`,
-              { cause: error },
-            );
-          }
+        } catch {
+          // The durable append is already the commit point. Resolving here keeps
+          // the event from becoming rejected-but-readable; if the marker still
+          // exists, later readers conservatively refuse the run.
+          return;
         }
-        await this.leaveCommitState(runDir, writingState);
-        throw error;
-      }
-
-      let handle: FileHandle | undefined;
-      try {
         try {
-          handle = await open(eventFile, "a+");
-        } catch (openError) {
-          await unlink(snapshotTemp).catch(() => {});
-          try {
-            await this.clearCommitIntent(runDir);
-          } catch (cleanupError) {
-            throw new Error(
-              `event file open failed: ${errorMessage(openError)}; marker cleanup failed: ${errorMessage(cleanupError)}`,
-              { cause: openError },
-            );
-          }
           await this.leaveCommitState(runDir, writingState);
-          throw openError;
+        } catch {
+          // The event is durably committed and the persisted state remains
+          // "writing". Readers fail closed until repair rather than allowing a
+          // rejected event to become visible after this promise settles.
         }
-        const currentSize = (await handle.stat()).size;
-        if (currentSize < replayed.validByteLength) {
-          throw new Error(`event stream "${eventFile}" changed during commit`);
-        }
-        const originalSize = replayed.validByteLength;
-        try {
-          if (currentSize > originalSize) {
-            await handle.truncate(originalSize);
-            await handle.sync();
-          }
-          const separator = replayed.needsLeadingNewline ? "\n" : "";
-          await this.appendAndSync(
-            handle,
-            `${separator}${JSON.stringify(event)}\n`,
-          );
-        } catch (appendError) {
-          try {
-            await this.rollbackAppend(handle, originalSize);
-          } catch (rollbackError) {
-            const compound = new Error(
-              `event append failed: ${errorMessage(appendError)}; rollback failed: ${errorMessage(rollbackError)}`,
-              { cause: appendError },
-            );
-            // The write-ahead marker is intentionally retained. A fresh
-            // process will refuse the run rather than replay the orphan.
-            throw compound;
-          }
-          await unlink(snapshotTemp).catch(() => {});
-          try {
-            await this.clearCommitIntent(runDir);
-          } catch (cleanupError) {
-            throw new Error(
-              `event append failed: ${errorMessage(appendError)}; marker cleanup failed: ${errorMessage(cleanupError)}`,
-              { cause: appendError },
-            );
-          }
-          await this.leaveCommitState(runDir, writingState);
-          throw appendError;
-        }
-      } catch (error) {
-        await unlink(snapshotTemp).catch(() => {});
-        throw error;
-      } finally {
-        await handle?.close().catch(() => {});
-      }
-      // The event fsync above is the commit point. A snapshot is only a cache;
-      // replay must remain authoritative even if materialization is interrupted.
-      try {
-        await rename(snapshotTemp, join(runDir, "run.json"));
-      } catch {
-        await unlink(snapshotTemp).catch(() => {});
-      }
-      try {
-        await this.clearCommitIntent(runDir);
-      } catch {
-        // The durable append is already the commit point. Resolving here keeps
-        // the event from becoming rejected-but-readable; if the marker still
-        // exists, later readers conservatively refuse the run.
-        return;
-      }
-      try {
-        await this.leaveCommitState(runDir, writingState);
-      } catch {
-        // The event is durably committed and the persisted state remains
-        // "writing". Readers fail closed until repair rather than allowing a
-        // rejected event to become visible after this promise settles.
-      }
+      });
     });
     const tail = commit.then(
       () => undefined,
@@ -705,6 +734,354 @@ export class FsLedger implements Ledger {
     return join(this.root, "runs", runId);
   }
 
+  protected async withCommitLock(
+    runDir: string,
+    runId: string,
+    commit: () => Promise<void>,
+  ): Promise<void> {
+    let owned: CommitLockRecord | undefined;
+    let commitError: unknown;
+    try {
+      owned = await this.acquireCommitLock(runDir, runId);
+      await this.afterCommitLockPhase(runId, "acquired");
+      await commit();
+    } catch (error) {
+      commitError = error;
+      throw error;
+    } finally {
+      if (owned) {
+        let cleanupError: unknown;
+        try {
+          await this.afterCommitLockPhase(runId, "before-release");
+        } catch (error) {
+          cleanupError = error;
+        }
+        try {
+          await this.releaseCommitLock(runDir, owned.nonce);
+        } catch (releaseError) {
+          cleanupError = cleanupError
+            ? new Error(
+                `commit lock before-release phase failed: ${errorMessage(cleanupError)}; commit lock release failed: ${errorMessage(releaseError)}`,
+                { cause: cleanupError },
+              )
+            : releaseError;
+        }
+        if (cleanupError) {
+          if (commitError) {
+            throw new Error(
+              `commit failed: ${errorMessage(commitError)}; commit lock release failed: ${errorMessage(cleanupError)}`,
+              { cause: commitError },
+            );
+          }
+          // The commit body resolves only after the event fsync commit point.
+          // Post-commit lock cleanup cannot turn a durable event into rejection.
+        }
+      }
+    }
+  }
+
+  private async acquireCommitLock(
+    runDir: string,
+    runId: string,
+  ): Promise<CommitLockRecord> {
+    const lockFile = join(runDir, COMMIT_LOCK_FILE);
+    const record = this.nextCommitLockRecord();
+    for (
+      let attempt = 0;
+      attempt <= COMMIT_LOCK_BACKOFF_MS.length;
+      attempt++
+    ) {
+      if (await this.createCommitLock(runDir, lockFile, runId, record)) {
+        return record;
+      }
+      const holder = await this.readCommitLock(lockFile, runId);
+      if (holder && !this.isPidAlive(holder.pid)) {
+        const reclaimed = await this.reclaimCommitLock(
+          runDir,
+          lockFile,
+          runId,
+          holder,
+        );
+        if (reclaimed) return reclaimed;
+      }
+      const backoff = COMMIT_LOCK_BACKOFF_MS[attempt];
+      if (backoff === undefined) {
+        throw new Error(`commit lock for run "${runId}" is contended`);
+      }
+      await this.sleep(backoff);
+    }
+    throw new Error(`commit lock for run "${runId}" is contended`);
+  }
+
+  private nextCommitLockRecord(): CommitLockRecord {
+    const nonce = this.nonceGen();
+    if (!isSafeCommitLockNonce(nonce)) {
+      throw new Error("commit lock nonce must be a safe path segment");
+    }
+    return { schemaVersion: 1, pid: process.pid, nonce };
+  }
+
+  private async createCommitLock(
+    runDir: string,
+    lockFile: string,
+    runId: string,
+    record: CommitLockRecord,
+  ): Promise<boolean> {
+    return this.installCommitLockRecord(
+      runDir,
+      lockFile,
+      runId,
+      "lock",
+      record,
+    );
+  }
+
+  private async installCommitLockRecord(
+    runDir: string,
+    targetFile: string,
+    runId: string,
+    target: "lock" | "reclaim-guard",
+    record: CommitLockRecord,
+  ): Promise<boolean> {
+    const temp = join(
+      runDir,
+      `.${COMMIT_LOCK_FILE}.tmp-${process.pid}-${++commitLockSequence}`,
+    );
+    let handle: FileHandle | undefined;
+    let installed = false;
+    let tempExists = false;
+    try {
+      handle = await open(temp, "wx");
+      tempExists = true;
+      await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      await this.afterCommitLockTempPhase(runId, target);
+      try {
+        // A hardlink publishes the already-synced inode without exposing an
+        // empty target between exclusive creation and record initialization.
+        await link(temp, targetFile);
+        installed = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      await unlink(temp);
+      tempExists = false;
+      await this.syncDirectory(runDir);
+      return installed;
+    } catch (error) {
+      await handle?.close().catch(() => {});
+      if (tempExists) await unlink(temp).catch(() => {});
+      if (installed) await unlink(targetFile).catch(() => {});
+      throw error;
+    }
+  }
+
+  private async readCommitLock(
+    lockFile: string,
+    runId: string,
+  ): Promise<CommitLockRecord | null> {
+    let contents: string;
+    try {
+      contents = await readFile(lockFile, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw new Error(`corrupt commit lock for run "${runId}"`, {
+        cause: error,
+      });
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(contents);
+    } catch (error) {
+      throw new Error(`corrupt commit lock for run "${runId}"`, {
+        cause: error,
+      });
+    }
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      (parsed as { schemaVersion?: unknown }).schemaVersion !== 1 ||
+      !Number.isSafeInteger((parsed as { pid?: unknown }).pid) ||
+      (parsed as { pid: number }).pid <= 0 ||
+      !isSafeCommitLockNonce((parsed as { nonce?: unknown }).nonce)
+    ) {
+      throw new Error(`corrupt commit lock for run "${runId}"`);
+    }
+    return parsed as CommitLockRecord;
+  }
+
+  private async reclaimCommitLock(
+    runDir: string,
+    lockFile: string,
+    runId: string,
+    observed: CommitLockRecord,
+  ): Promise<CommitLockRecord | null> {
+    if (
+      !(await this.acquireCommitLockReclaimGuard(
+        runDir,
+        runId,
+        observed.nonce,
+      ))
+    ) {
+      return null;
+    }
+    await this.afterCommitReclaimPhase(runId, "before-lock-replace");
+    const current = await this.readCommitLock(lockFile, runId);
+    if (
+      !current ||
+      !isDeepStrictEqual(current, observed) ||
+      this.isPidAlive(current.pid)
+    ) {
+      return null;
+    }
+    const replacement = this.nextCommitLockRecord();
+    await this.replaceCommitLock(runDir, lockFile, replacement);
+    return replacement;
+  }
+
+  private async acquireCommitLockReclaimGuard(
+    runDir: string,
+    runId: string,
+    nonce: string,
+  ): Promise<boolean> {
+    const record: CommitLockRecord = {
+      schemaVersion: 1,
+      pid: process.pid,
+      nonce,
+    };
+    for (
+      let attempt = 0;
+      attempt < COMMIT_LOCK_RECLAIM_GUARD_ATTEMPTS;
+      attempt++
+    ) {
+      const guards = await this.readCommitLockReclaimGuards(
+        runDir,
+        runId,
+        nonce,
+      );
+      const highest = guards.at(-1);
+      if (
+        highest &&
+        (highest.record.pid === process.pid ||
+          this.isPidAlive(highest.record.pid))
+      ) {
+        return false;
+      }
+      if (highest) {
+        await this.afterCommitReclaimPhase(runId, "after-dead-guard-read");
+      }
+      const ordinal = highest ? highest.ordinal + 1 : 0;
+      if (!Number.isSafeInteger(ordinal)) {
+        throw new Error(
+          `corrupt commit lock reclaim guard ordinal for run "${runId}"`,
+        );
+      }
+      const guardFile = join(
+        runDir,
+        `commit.lock.reclaim.${nonce}.ord-${ordinal}`,
+      );
+      if (
+        await this.installCommitLockRecord(
+          runDir,
+          guardFile,
+          runId,
+          "reclaim-guard",
+          record,
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private async readCommitLockReclaimGuards(
+    runDir: string,
+    runId: string,
+    nonce: string,
+  ): Promise<Array<{ ordinal: number; record: CommitLockRecord }>> {
+    const guards: Array<{
+      ordinal: number;
+      record: CommitLockRecord;
+    }> = [];
+    const prefix = `commit.lock.reclaim.${nonce}.ord-`;
+    for (const name of await readdir(runDir)) {
+      if (!name.startsWith(prefix)) continue;
+      const suffix = name.slice(prefix.length);
+      if (!/^(?:0|[1-9]\d*)$/.test(suffix)) {
+        throw new Error(
+          `corrupt commit lock reclaim guard ordinal for run "${runId}"`,
+        );
+      }
+      const ordinal = Number(suffix);
+      if (!Number.isSafeInteger(ordinal)) {
+        throw new Error(
+          `corrupt commit lock reclaim guard ordinal for run "${runId}"`,
+        );
+      }
+      const record = await this.readCommitLock(join(runDir, name), runId);
+      if (!record || record.nonce !== nonce) {
+        throw new Error(`corrupt commit lock reclaim guard for run "${runId}"`);
+      }
+      guards.push({ ordinal, record });
+    }
+    guards.sort((left, right) => left.ordinal - right.ordinal);
+    return guards;
+  }
+
+  private async replaceCommitLock(
+    runDir: string,
+    lockFile: string,
+    record: CommitLockRecord,
+  ): Promise<void> {
+    const temp = join(
+      runDir,
+      `.${COMMIT_LOCK_FILE}.tmp-${process.pid}-${++commitLockSequence}`,
+    );
+    let handle: FileHandle | undefined;
+    let replaced = false;
+    try {
+      handle = await open(temp, "wx");
+      await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      await rename(temp, lockFile);
+      replaced = true;
+      await this.syncDirectory(runDir);
+    } catch (error) {
+      await handle?.close().catch(() => {});
+      await unlink(temp).catch(() => {});
+      if (replaced) await unlink(lockFile).catch(() => {});
+      throw error;
+    }
+  }
+
+  protected async releaseCommitLock(
+    runDir: string,
+    ownedNonce: string,
+  ): Promise<void> {
+    const lockFile = join(runDir, COMMIT_LOCK_FILE);
+    const current = await this.readCommitLock(lockFile, basename(runDir));
+    if (!current || current.nonce !== ownedNonce) return;
+    try {
+      await unlink(lockFile);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+
+  private async syncDirectory(path: string): Promise<void> {
+    const directory = await open(path, "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
+  }
+
   protected async appendAndSync(
     handle: FileHandle,
     contents: string,
@@ -770,6 +1147,27 @@ export class FsLedger implements Ledger {
   protected async afterStableReadPhase(
     _runId: string,
     _phase: "before-replay" | "after-replay",
+  ): Promise<void> {}
+
+  /** Test seam for deterministically interleaving commit-lock holders. */
+  protected async afterCommitLockPhase(
+    _runId: string,
+    _phase: "acquired" | "before-release",
+  ): Promise<void> {}
+
+  /** Test seam for observing a durable temp before its atomic hardlink. */
+  protected async afterCommitLockTempPhase(
+    _runId: string,
+    _target: "lock" | "reclaim-guard",
+  ): Promise<void> {}
+
+  /** Test seam after a commit captures its stable replay. */
+  protected async afterStableReplayPhase(_runId: string): Promise<void> {}
+
+  /** Test seam for deterministically interleaving commit-lock reclaimers. */
+  protected async afterCommitReclaimPhase(
+    _runId: string,
+    _phase: "after-dead-guard-read" | "before-lock-replace",
   ): Promise<void> {}
 
   /** Test seam for deterministically interleaving controller takeovers. */
