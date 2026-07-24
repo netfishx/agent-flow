@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -133,6 +133,352 @@ class FinishBetweenLoadsLedger implements Ledger {
 }
 
 describe("WorkflowRuntime resume", () => {
+  test("slices a lane wait within the original total timeout budget", async () => {
+    const root = await tempWork();
+    const clock = createClock(1_000);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [
+        {
+          laneId: "slow",
+          exitCode: 0,
+          emitSentinel: false,
+          waitMatches: false,
+        },
+      ],
+    });
+    const runtime = new WorkflowRuntime({
+      adapter,
+      ledger: new FsLedger(join(root, "ledger")),
+      clock: clock.now,
+      idgen: () => "run-sliced-timeout",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await runtime.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd: join(root, "work"),
+      lanes: [{ laneId: "slow", steps: 1 }],
+    });
+    await runtime.confirmLaneStarted(handle.runId, "slow");
+    const startedAt = clock.now();
+
+    const result = await runtime.awaitLane(handle.runId, "slow", 4_500);
+
+    expect(result.timedOut).toBe(true);
+    expect(adapter.waitTimeoutMs).toEqual([2_000, 2_000, 500]);
+    expect(clock.now() - startedAt).toBe(4_500);
+  });
+
+  test("honors an injected drive slice and clamps its final slice", async () => {
+    const root = await tempWork();
+    const clock = createClock(1_500);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [
+        {
+          laneId: "slow",
+          exitCode: 0,
+          emitSentinel: false,
+          waitMatches: false,
+        },
+      ],
+    });
+    const runtime = new WorkflowRuntime({
+      adapter,
+      ledger: new FsLedger(join(root, "ledger")),
+      clock: clock.now,
+      idgen: () => "run-injected-slice",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      driveSliceMs: 1_200,
+    });
+    const handle = await runtime.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd: join(root, "work"),
+      lanes: [{ laneId: "slow", steps: 1 }],
+    });
+    await runtime.confirmLaneStarted(handle.runId, "slow");
+
+    const result = await runtime.awaitLane(handle.runId, "slow", 2_500);
+
+    expect(result.timedOut).toBe(true);
+    expect(adapter.waitTimeoutMs).toEqual([1_200, 1_200, 100]);
+  });
+
+  test("rejects non-positive and non-finite drive slice values", async () => {
+    const root = await tempWork();
+    const clock = createClock();
+    const adapter = new FakeHerdrAdapter({ clock });
+    const ledger = new FsLedger(join(root, "ledger"));
+    const deps = {
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    };
+
+    for (const driveSliceMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(
+        () => new WorkflowRuntime({ ...deps, driveSliceMs }),
+      ).toThrow("driveSliceMs must be a positive finite number");
+    }
+  });
+
+  test("honors a takeover after queue construction but before the first drive wait", async () => {
+    const root = await tempWork();
+    const ledger = new FsLedger(join(root, "ledger"));
+    const clock = createClock(2_000);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "owned", exitCode: 0 }],
+    });
+    const source = new WorkflowRuntime({
+      adapter,
+      ledger: new LeaseFreeLedger(ledger),
+      clock: clock.now,
+      idgen: () => "run-before-first-slice",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await source.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd: join(root, "work"),
+      lanes: [{ laneId: "owned", steps: 1 }],
+    });
+    await source.confirmLaneStarted(handle.runId, "owned");
+    const ownedPaneId = adapter.paneIdForLane("owned")!;
+    const takeover = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    let tookOver = false;
+    class TakeoverBeforeAwaitRuntime extends WorkflowRuntime {
+      override async awaitLane(
+        runId: string,
+        laneId: string,
+        timeoutMs: number,
+      ) {
+        if (!tookOver) {
+          tookOver = true;
+          await takeover.takeoverLane(runId, laneId);
+        }
+        return super.awaitLane(runId, laneId, timeoutMs);
+      }
+    }
+    const processInfoBefore = adapter.processInfoPaneIds.length;
+
+    const status = await new TakeoverBeforeAwaitRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    }).resumeWorkflow(handle.runId, 5_000);
+    const loaded = await ledger.load(handle.runId);
+
+    expect(status.state).toBe("running");
+    expect(loaded!.lanes["owned"]).toMatchObject({
+      runtimeState: "running",
+      controlMode: "human_owned",
+      completedAt: null,
+    });
+    expect(adapter.processInfoPaneIds.slice(processInfoBefore)).toContain(
+      ownedPaneId,
+    );
+    expect(adapter.waitedPaneIds).not.toContain(ownedPaneId);
+    expect(adapter.interruptedPaneIds).not.toContain(ownedPaneId);
+    const reacquired = await ledger.acquireLease(
+      handle.runId,
+      { controllerId: "next-controller", pid: process.pid },
+    );
+    await expect(reacquired.release()).resolves.toBeUndefined();
+  });
+
+  test("stops the next slice after takeover while continuing a managed sibling", async () => {
+    const root = await tempWork();
+    const ledger = new FsLedger(join(root, "ledger"));
+    const clock = createClock(3_000);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [
+        {
+          laneId: "owned",
+          exitCode: 0,
+          emitSentinel: false,
+          waitMatches: false,
+        },
+        { laneId: "managed", exitCode: 0 },
+      ],
+    });
+    const source = new WorkflowRuntime({
+      adapter,
+      ledger: new LeaseFreeLedger(ledger),
+      clock: clock.now,
+      idgen: () => "run-during-slice",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await source.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd: join(root, "work"),
+      lanes: [
+        { laneId: "owned", steps: 1 },
+        { laneId: "managed", steps: 1 },
+      ],
+    });
+    for (const laneId of handle.laneIds) {
+      await source.confirmLaneStarted(handle.runId, laneId);
+    }
+    const takeover = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    let takeoverCommitted = false;
+    class TakeoverDuringSliceRuntime extends WorkflowRuntime {
+      protected override async onDriveSliceBoundary(
+        runId: string,
+        laneId: string,
+      ): Promise<void> {
+        if (laneId === "owned" && !takeoverCommitted) {
+          takeoverCommitted = true;
+          await takeover.takeoverLane(runId, laneId);
+        }
+      }
+    }
+    const ownedPaneId = adapter.paneIdForLane("owned")!;
+    const managedPaneId = adapter.paneIdForLane("managed")!;
+
+    const status = await new TakeoverDuringSliceRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      driveSliceMs: 100,
+    }).resumeWorkflow(handle.runId, 1_000);
+    const loaded = await ledger.load(handle.runId);
+
+    expect(
+      adapter.waitedPaneIds.filter((paneId) => paneId === ownedPaneId),
+    ).toHaveLength(1);
+    expect(adapter.waitedPaneIds).toContain(managedPaneId);
+    expect(adapter.interruptedPaneIds).not.toContain(ownedPaneId);
+    expect(status.state).toBe("running");
+    expect(loaded).toMatchObject({
+      finishStatus: null,
+      lanes: {
+        owned: {
+          runtimeState: "running",
+          controlMode: "human_owned",
+          completedAt: null,
+        },
+        managed: {
+          runtimeState: "exited",
+          controlMode: "managed",
+          exitCode: 0,
+        },
+      },
+    });
+  });
+
+  test("records a genuine exit and terminal facts when takeover lands in the same slice", async () => {
+    const root = await tempWork();
+    const ledger = new FsLedger(join(root, "ledger"));
+    const clock = createClock(4_000);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "owned", exitCode: 0 }],
+    });
+    const source = new WorkflowRuntime({
+      adapter,
+      ledger: new LeaseFreeLedger(ledger),
+      clock: clock.now,
+      idgen: () => "run-takeover-and-exit",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await source.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd: join(root, "work"),
+      lanes: [{ laneId: "owned", steps: 1 }],
+    });
+    await source.confirmLaneStarted(handle.runId, "owned");
+    const takeover = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    let takeoverCommitted = false;
+    class TakeoverAndExitRuntime extends WorkflowRuntime {
+      protected override async onDriveSliceBoundary(
+        runId: string,
+        laneId: string,
+      ): Promise<void> {
+        if (!takeoverCommitted) {
+          takeoverCommitted = true;
+          await takeover.takeoverLane(runId, laneId);
+        }
+      }
+    }
+    const ownedPaneId = adapter.paneIdForLane("owned")!;
+
+    const status = await new TakeoverAndExitRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      driveSliceMs: 100,
+    }).resumeWorkflow(handle.runId, 1_000);
+    const loaded = await ledger.load(handle.runId);
+    const owned = loaded!.lanes["owned"]!;
+
+    expect(status.state).toBe("complete");
+    expect(owned).toMatchObject({
+      runtimeState: "exited",
+      controlMode: "human_owned",
+      exitCode: 0,
+      semanticState: "complete",
+      contractState: "satisfied",
+      verificationState: "verified",
+    });
+    expect(owned.evidenceFile).not.toBeNull();
+    expect(
+      adapter.waitedPaneIds.filter((paneId) => paneId === ownedPaneId),
+    ).toHaveLength(1);
+    expect(adapter.interruptedPaneIds).not.toContain(ownedPaneId);
+    expect(
+      JSON.parse(await readFile(owned.evidenceFile!, "utf8")),
+    ).toMatchObject({
+      runId: handle.runId,
+      laneId: "owned",
+      exitCode: 0,
+      termination: "sentinel-exit",
+    });
+  });
+
   test("reconciles a human-owned live lane without automatically driving it", async () => {
     const cwd = await tempWork();
     const clock = createClock(5_000);

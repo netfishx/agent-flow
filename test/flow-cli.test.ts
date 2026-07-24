@@ -233,6 +233,26 @@ class DurableEventsWithoutLease implements Ledger {
   }
 }
 
+class RejectLeaseLedger implements Ledger {
+  constructor(private readonly delegate: Ledger) {}
+
+  commit(event: RunEvent): Promise<void> {
+    return this.delegate.commit(event);
+  }
+
+  load(runId: string): Promise<RunView | null> {
+    return this.delegate.load(runId);
+  }
+
+  list(): Promise<{ runId: string }[]> {
+    return this.delegate.list();
+  }
+
+  async acquireLease(): Promise<LeaseHandle> {
+    throw new Error("inspect must not acquire a controller lease");
+  }
+}
+
 function sink() {
   let text = "";
   return {
@@ -297,6 +317,87 @@ describe("flow CLI external behavior", () => {
     expect(result.stdout).toContain("checkpoint=/tmp/cli-run/checkpoint.md");
     expect(result.stdout).toContain("result=/tmp/cli-run/result.txt");
     expect(result.stdout).toContain("evidence=/tmp/cli-run/evidence.json");
+  });
+
+  test("fresh inspect reconciles and collects a self-terminated human-owned lane without driving it", async () => {
+    const root = await tempRoot();
+    const ledgerRoot = join(root, "ledger");
+    const cwd = join(root, "work");
+    const ledger = new FsLedger(ledgerRoot);
+    const clock = createClock(500);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "owned", exitCode: 0 }],
+    });
+    const source = new WorkflowRuntime({
+      adapter,
+      ledger: new DurableEventsWithoutLease(ledger),
+      clock: clock.now,
+      idgen: () => "run-inspect-owned",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await source.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd,
+      lanes: [{ laneId: "owned", steps: 1 }],
+    });
+    await source.confirmLaneStarted(handle.runId, "owned");
+    await source.takeoverLane(handle.runId, "owned");
+    adapter.finishLane("owned");
+    const ownedPaneId = adapter.paneIdForLane("owned")!;
+    const processInfoBefore = adapter.processInfoPaneIds.length;
+    const waitsBefore = adapter.waitedPaneIds.length;
+    const interruptsBefore = adapter.interruptedPaneIds.length;
+    const stdout = sink();
+    const stderr = sink();
+
+    const exitCode = await runFlowCli(
+      ["inspect", handle.runId],
+      stdout.output,
+      stderr.output,
+      {
+        environment: { ...process.env, FLOW_LEDGER_ROOT: ledgerRoot },
+        runtimeFactory: (runtimeLedger) =>
+          new WorkflowRuntime({
+            adapter,
+            ledger: new RejectLeaseLedger(runtimeLedger),
+            clock: clock.now,
+            idgen: () => "unused",
+            readResultFile: adapter.readResultFile,
+            sleep: async () => {},
+          }),
+      },
+    );
+    const loaded = await ledger.load(handle.runId);
+    const owned = loaded!.lanes["owned"]!;
+
+    expect(exitCode).toBe(0);
+    expect(stderr.text()).toBe("");
+    expect(stdout.text()).toContain("controlMode=human_owned exitCode=0");
+    expect(owned).toMatchObject({
+      runtimeState: "exited",
+      controlMode: "human_owned",
+      exitCode: 0,
+      semanticState: "complete",
+      contractState: "satisfied",
+      verificationState: "verified",
+    });
+    expect(adapter.processInfoPaneIds.slice(processInfoBefore)).toContain(
+      ownedPaneId,
+    );
+    expect(adapter.waitedPaneIds.slice(waitsBefore)).toEqual([]);
+    expect(adapter.interruptedPaneIds.slice(interruptsBefore)).toEqual([]);
+    expect(owned.evidenceFile).not.toBeNull();
+    expect(
+      JSON.parse(await readFile(owned.evidenceFile!, "utf8")),
+    ).toMatchObject({
+      runId: handle.runId,
+      laneId: "owned",
+      exitCode: 0,
+      termination: "sentinel-exit",
+    });
   });
 
   test("takeover and release durably flip and render lane control mode", async () => {
@@ -474,7 +575,7 @@ describe("flow CLI external behavior", () => {
     expect(adapter.dispatched).toHaveLength(1);
   });
 
-  test("status and inspect render an all-terminal unfinished replay as incomplete", async () => {
+  test("status stays pure while inspect finishes an all-terminal replay", async () => {
     const root = await tempRoot();
     await seedFinishedRun(root, { finished: false });
 
@@ -484,7 +585,8 @@ describe("flow CLI external behavior", () => {
     expect(status.exitCode).toBe(0);
     expect(status.stdout).toContain("state=incomplete");
     expect(inspect.exitCode).toBe(0);
-    expect(inspect.stdout).toContain("state=incomplete");
+    expect(inspect.stdout).toContain("state=complete");
+    expect(inspect.stdout).toContain("finishStatus=clean");
   });
 
   test("usage errors are non-zero", async () => {

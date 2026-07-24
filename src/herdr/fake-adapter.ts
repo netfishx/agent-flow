@@ -36,7 +36,7 @@ export function createClock(start = 0): MutableClock {
 export interface FakeLaneProgram {
   readonly laneId: string;
   readonly exitCode: number;
-  /** Clock advance charged to `waitForOutput` for this lane. */
+  /** Clock advance for a matched wait; unmatched waits consume their timeout. */
   readonly execMs?: number;
   /** Whether the sentinel appears (false exercises the missing-sentinel path). */
   readonly emitSentinel?: boolean;
@@ -144,6 +144,7 @@ export class FakeHerdrAdapter implements HerdrAdapter {
   processInfoCalls = 0;
   readonly processInfoPaneIds: string[] = [];
   readonly waitedPaneIds: string[] = [];
+  readonly waitTimeoutMs: number[] = [];
   readonly interruptedPaneIds: string[] = [];
   readonly dispatched: { paneId: string; command: string }[] = [];
 
@@ -158,6 +159,16 @@ export class FakeHerdrAdapter implements HerdrAdapter {
 
   paneIdForLane(laneId: string): string | undefined {
     return this.paneByLane.get(laneId);
+  }
+
+  /** Simulate a lane exiting on its own without going through wait/interrupt. */
+  finishLane(laneId: string): void {
+    const paneId = this.paneByLane.get(laneId);
+    const state = paneId === undefined ? undefined : this.panes.get(paneId);
+    if (!state || state.role !== "lane") {
+      throw new Error(`fake: unknown lane ${laneId}`);
+    }
+    state.finished = true;
   }
 
   private tick(ms: number | undefined): void {
@@ -254,16 +265,21 @@ export class FakeHerdrAdapter implements HerdrAdapter {
   async waitForOutput(
     pane: PaneRef,
     _regex: string,
-    _timeoutMs: number,
+    timeoutMs: number,
   ): Promise<WaitOutcome> {
     this.waitedPaneIds.push(pane.id);
+    this.waitTimeoutMs.push(timeoutMs);
     const state = this.panes.get(pane.id);
     if (state?.role === "lane") {
-      this.tick(state.program?.execMs);
+      const matched = state.program?.waitMatches ?? true;
+      this.tick(
+        matched
+          ? Math.min(state.program?.execMs ?? 0, timeoutMs)
+          : timeoutMs,
+      );
       if (state.program?.waitErrors) {
         throw new Error("fake: herdr pane wait-output failed");
       }
-      const matched = state.program?.waitMatches ?? true;
       // Normally a matched sentinel means the process has exited; a lane marked
       // staysRunningAfterMatch keeps its foreground group alive, so completion
       // must still be gated on process-info.
