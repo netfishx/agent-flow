@@ -46,7 +46,10 @@ interface ControllerTakeoverMarker {
 interface CommitLockRecord {
   readonly schemaVersion: 1;
   readonly pid: number;
+  readonly generation: number;
 }
+
+type Sleep = (milliseconds: number) => Promise<void>;
 
 let snapshotSequence = 0;
 let commitStateSequence = 0;
@@ -55,12 +58,14 @@ let commitLockSequence = 0;
 const COMMIT_INTENT_FILE = "commit-intent.json";
 const COMMIT_STATE_FILE = "commit-state.json";
 const COMMIT_LOCK_FILE = "commit.lock";
-const COMMIT_LOCK_RECLAIM_FILE = "commit.lock.reclaim";
 const COMMIT_LOCK_BACKOFF_MS = [25, 50, 100, 200, 400] as const;
 const COMMIT_LOCK_RECLAIM_GUARD_ATTEMPTS = 4;
 const TAKEOVER_ATTEMPTS = 4;
 const TAKEOVER_GUARD_ACQUIRE_ATTEMPTS = 4;
 const STABLE_READ_ATTEMPTS = 3;
+
+const realSleep: Sleep = (milliseconds) =>
+  new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
 
 export function realPidIsAlive(pid: number): boolean {
   try {
@@ -168,6 +173,7 @@ export class FsLedger implements Ledger {
   constructor(
     private readonly root: string,
     private readonly isPidAlive: (pid: number) => boolean = realPidIsAlive,
+    private readonly sleep: Sleep = realSleep,
   ) {
     if (root.length === 0) throw new Error("FsLedger root must not be empty");
   }
@@ -261,6 +267,7 @@ export class FsLedger implements Ledger {
           }
           const originalSize = replayed.validByteLength;
           try {
+            await this.beforeAppendPhase(event.runId);
             if (currentSize > originalSize) {
               await handle.truncate(originalSize);
               await handle.sync();
@@ -758,7 +765,8 @@ export class FsLedger implements Ledger {
               { cause: commitError },
             );
           }
-          throw cleanupError;
+          // The commit body resolves only after the event fsync commit point.
+          // Post-commit lock cleanup cannot turn a durable event into rejection.
         }
       }
     }
@@ -772,6 +780,7 @@ export class FsLedger implements Ledger {
     const record: CommitLockRecord = {
       schemaVersion: 1,
       pid: process.pid,
+      generation: 0,
     };
     for (
       let attempt = 0;
@@ -788,7 +797,6 @@ export class FsLedger implements Ledger {
           lockFile,
           runId,
           holder,
-          record,
         ))
       ) {
         return;
@@ -797,7 +805,7 @@ export class FsLedger implements Ledger {
       if (backoff === undefined) {
         throw new Error(`commit lock for run "${runId}" is contended`);
       }
-      await new Promise<void>((resolve) => setTimeout(resolve, backoff));
+      await this.sleep(backoff);
     }
   }
 
@@ -884,7 +892,9 @@ export class FsLedger implements Ledger {
       parsed === null ||
       (parsed as { schemaVersion?: unknown }).schemaVersion !== 1 ||
       !Number.isSafeInteger((parsed as { pid?: unknown }).pid) ||
-      (parsed as { pid: number }).pid <= 0
+      (parsed as { pid: number }).pid <= 0 ||
+      !Number.isSafeInteger((parsed as { generation?: unknown }).generation) ||
+      (parsed as { generation: number }).generation < 0
     ) {
       throw new Error(`corrupt commit lock for run "${runId}"`);
     }
@@ -896,64 +906,78 @@ export class FsLedger implements Ledger {
     lockFile: string,
     runId: string,
     observed: CommitLockRecord,
-    replacement: CommitLockRecord,
   ): Promise<boolean> {
-    const guardFile = join(runDir, COMMIT_LOCK_RECLAIM_FILE);
     if (
       !(await this.acquireCommitLockReclaimGuard(
         runDir,
-        guardFile,
         runId,
-        replacement,
+        observed.generation,
       ))
     ) {
       return false;
     }
-
-    let result = false;
-    let reclaimError: unknown;
-    try {
-      const current = await this.readCommitLock(lockFile, runId);
-      if (
-        !current ||
-        current.pid !== observed.pid ||
-        this.isPidAlive(current.pid)
-      ) {
-        return false;
-      }
-      await this.replaceCommitLock(runDir, lockFile, replacement);
-      result = true;
-      return true;
-    } catch (error) {
-      reclaimError = error;
-      throw error;
-    } finally {
-      try {
-        await unlink(guardFile);
-      } catch (guardError) {
-        if (result) await unlink(lockFile).catch(() => {});
-        if (reclaimError) {
-          throw new Error(
-            `commit lock reclaim failed: ${errorMessage(reclaimError)}; reclaim guard cleanup failed: ${errorMessage(guardError)}`,
-            { cause: reclaimError },
-          );
-        }
-        throw guardError;
-      }
+    await this.afterCommitReclaimPhase(runId, "before-lock-replace");
+    const current = await this.readCommitLock(lockFile, runId);
+    if (
+      !current ||
+      !isDeepStrictEqual(current, observed) ||
+      this.isPidAlive(current.pid)
+    ) {
+      return false;
     }
+    const nextGeneration = observed.generation + 1;
+    if (!Number.isSafeInteger(nextGeneration)) {
+      throw new Error(`corrupt commit lock for run "${runId}"`);
+    }
+    await this.replaceCommitLock(runDir, lockFile, {
+      schemaVersion: 1,
+      pid: process.pid,
+      generation: nextGeneration,
+    });
+    return true;
   }
 
   private async acquireCommitLockReclaimGuard(
     runDir: string,
-    guardFile: string,
     runId: string,
-    record: CommitLockRecord,
+    generation: number,
   ): Promise<boolean> {
+    const record: CommitLockRecord = {
+      schemaVersion: 1,
+      pid: process.pid,
+      generation,
+    };
     for (
       let attempt = 0;
       attempt < COMMIT_LOCK_RECLAIM_GUARD_ATTEMPTS;
       attempt++
     ) {
+      const guards = await this.readCommitLockReclaimGuards(
+        runDir,
+        runId,
+        generation,
+      );
+      const highest = guards.at(-1);
+      if (
+        highest &&
+        (highest.record.pid === process.pid ||
+          this.isPidAlive(highest.record.pid))
+      ) {
+        return false;
+      }
+      if (highest) {
+        await this.afterCommitReclaimPhase(runId, "after-dead-guard-read");
+      }
+      const ordinal = highest ? highest.ordinal + 1 : 0;
+      if (!Number.isSafeInteger(ordinal)) {
+        throw new Error(
+          `corrupt commit lock reclaim guard ordinal for run "${runId}"`,
+        );
+      }
+      const guardFile = join(
+        runDir,
+        `commit.lock.reclaim.gen-${generation}.ord-${ordinal}`,
+      );
       if (
         await this.installCommitLockRecord(
           runDir,
@@ -965,34 +989,48 @@ export class FsLedger implements Ledger {
       ) {
         return true;
       }
-
-      let holder: CommitLockRecord | null;
-      try {
-        holder = await this.readCommitLock(guardFile, runId);
-      } catch {
-        // Atomic creators never publish partial records. A malformed guard is
-        // therefore an orphaned legacy/crash artifact and is safe to reclaim.
-        await this.removeOrphanedCommitLockReclaimGuard(runDir, guardFile);
-        continue;
-      }
-      if (!holder) continue;
-      if (this.isPidAlive(holder.pid)) return false;
-      await this.removeOrphanedCommitLockReclaimGuard(runDir, guardFile);
     }
     return false;
   }
 
-  private async removeOrphanedCommitLockReclaimGuard(
+  private async readCommitLockReclaimGuards(
     runDir: string,
-    guardFile: string,
-  ): Promise<void> {
-    try {
-      await unlink(guardFile);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-      throw error;
+    runId: string,
+    generation: number,
+  ): Promise<Array<{ ordinal: number; record: CommitLockRecord }>> {
+    const guards: Array<{
+      ordinal: number;
+      record: CommitLockRecord;
+    }> = [];
+    const pattern =
+      /^commit\.lock\.reclaim\.gen-(0|[1-9]\d*)\.ord-(0|[1-9]\d*)$/;
+    for (const name of await readdir(runDir)) {
+      if (!name.startsWith("commit.lock.reclaim.gen-")) continue;
+      const match = pattern.exec(name);
+      if (!match) {
+        throw new Error(
+          `corrupt commit lock reclaim guard ordinal for run "${runId}"`,
+        );
+      }
+      const guardGeneration = Number(match[1]);
+      const ordinal = Number(match[2]);
+      if (
+        !Number.isSafeInteger(guardGeneration) ||
+        !Number.isSafeInteger(ordinal)
+      ) {
+        throw new Error(
+          `corrupt commit lock reclaim guard ordinal for run "${runId}"`,
+        );
+      }
+      if (guardGeneration !== generation) continue;
+      const record = await this.readCommitLock(join(runDir, name), runId);
+      if (!record || record.generation !== generation) {
+        throw new Error(`corrupt commit lock reclaim guard for run "${runId}"`);
+      }
+      guards.push({ ordinal, record });
     }
-    await this.syncDirectory(runDir);
+    guards.sort((left, right) => left.ordinal - right.ordinal);
+    return guards;
   }
 
   private async replaceCommitLock(
@@ -1023,7 +1061,7 @@ export class FsLedger implements Ledger {
     }
   }
 
-  private async releaseCommitLock(runDir: string): Promise<void> {
+  protected async releaseCommitLock(runDir: string): Promise<void> {
     await unlink(join(runDir, COMMIT_LOCK_FILE));
   }
 
@@ -1113,6 +1151,15 @@ export class FsLedger implements Ledger {
   protected async afterCommitLockTempPhase(
     _runId: string,
     _target: "lock" | "reclaim-guard",
+  ): Promise<void> {}
+
+  /** Test seam for the captured replay immediately before append/truncate. */
+  protected async beforeAppendPhase(_runId: string): Promise<void> {}
+
+  /** Test seam for deterministically interleaving commit-lock reclaimers. */
+  protected async afterCommitReclaimPhase(
+    _runId: string,
+    _phase: "after-dead-guard-read" | "before-lock-replace",
   ): Promise<void> {}
 
   /** Test seam for deterministically interleaving controller takeovers. */
