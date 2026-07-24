@@ -144,4 +144,9 @@ export interface RuntimeDeps {
   readonly processGoneTimeoutMs?: number;
   /** Poll interval for the process-gone confirmation (default 100ms). */
   readonly processGoneIntervalMs?: number;
+  /**
+   * Maximum duration of one automatic drive wait (default 2000ms).
+   * Must be a positive, finite number.
+   */
+  readonly driveSliceMs?: number;
 }

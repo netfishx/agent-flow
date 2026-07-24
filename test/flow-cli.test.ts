@@ -15,7 +15,10 @@ import {
   FakeHerdrAdapter,
 } from "../src/herdr/fake-adapter.ts";
 import { FsLedger } from "../src/runtime/fs-ledger.ts";
-import type { RunEvent } from "../src/runtime/events.ts";
+import type {
+  RunEvent,
+  RunnerEvidence,
+} from "../src/runtime/events.ts";
 import type { LeaseHandle, Ledger } from "../src/runtime/ledger.ts";
 import type { RunView } from "../src/runtime/reducer.ts";
 import { WorkflowRuntime } from "../src/runtime/runtime.ts";
@@ -233,6 +236,26 @@ class DurableEventsWithoutLease implements Ledger {
   }
 }
 
+class RejectLeaseLedger implements Ledger {
+  constructor(private readonly delegate: Ledger) {}
+
+  commit(event: RunEvent): Promise<void> {
+    return this.delegate.commit(event);
+  }
+
+  load(runId: string): Promise<RunView | null> {
+    return this.delegate.load(runId);
+  }
+
+  list(): Promise<{ runId: string }[]> {
+    return this.delegate.list();
+  }
+
+  async acquireLease(): Promise<LeaseHandle> {
+    throw new Error("inspect must not acquire a controller lease");
+  }
+}
+
 function sink() {
   let text = "";
   return {
@@ -297,6 +320,334 @@ describe("flow CLI external behavior", () => {
     expect(result.stdout).toContain("checkpoint=/tmp/cli-run/checkpoint.md");
     expect(result.stdout).toContain("result=/tmp/cli-run/result.txt");
     expect(result.stdout).toContain("evidence=/tmp/cli-run/evidence.json");
+  });
+
+  test("fresh inspect reconciles and collects a self-terminated human-owned lane without driving it", async () => {
+    const root = await tempRoot();
+    const ledgerRoot = join(root, "ledger");
+    const cwd = join(root, "work");
+    const ledger = new FsLedger(ledgerRoot);
+    const clock = createClock(500);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "owned", exitCode: 0 }],
+    });
+    const source = new WorkflowRuntime({
+      adapter,
+      ledger: new DurableEventsWithoutLease(ledger),
+      clock: clock.now,
+      idgen: () => "run-inspect-owned",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await source.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd,
+      lanes: [{ laneId: "owned", steps: 1 }],
+    });
+    await source.confirmLaneStarted(handle.runId, "owned");
+    await source.takeoverLane(handle.runId, "owned");
+    adapter.finishLane("owned");
+    const ownedPaneId = adapter.paneIdForLane("owned")!;
+    const processInfoBefore = adapter.processInfoPaneIds.length;
+    const waitsBefore = adapter.waitedPaneIds.length;
+    const interruptsBefore = adapter.interruptedPaneIds.length;
+    const stdout = sink();
+    const stderr = sink();
+
+    const exitCode = await runFlowCli(
+      ["inspect", handle.runId],
+      stdout.output,
+      stderr.output,
+      {
+        environment: { ...process.env, FLOW_LEDGER_ROOT: ledgerRoot },
+        runtimeFactory: (runtimeLedger) =>
+          new WorkflowRuntime({
+            adapter,
+            ledger: new RejectLeaseLedger(runtimeLedger),
+            clock: clock.now,
+            idgen: () => "unused",
+            readResultFile: adapter.readResultFile,
+            sleep: async () => {},
+          }),
+      },
+    );
+    const loaded = await ledger.load(handle.runId);
+    const owned = loaded!.lanes["owned"]!;
+
+    expect(exitCode).toBe(0);
+    expect(stderr.text()).toBe("");
+    expect(stdout.text()).toContain("controlMode=human_owned exitCode=0");
+    expect(owned).toMatchObject({
+      runtimeState: "exited",
+      controlMode: "human_owned",
+      exitCode: 0,
+      semanticState: "complete",
+      contractState: "satisfied",
+      verificationState: "verified",
+    });
+    expect(adapter.processInfoPaneIds.slice(processInfoBefore)).toContain(
+      ownedPaneId,
+    );
+    expect(adapter.waitedPaneIds.slice(waitsBefore)).toEqual([]);
+    expect(adapter.interruptedPaneIds.slice(interruptsBefore)).toEqual([]);
+    expect(owned.evidenceFile).not.toBeNull();
+    expect(
+      JSON.parse(await readFile(owned.evidenceFile!, "utf8")),
+    ).toMatchObject({
+      runId: handle.runId,
+      laneId: "owned",
+      exitCode: 0,
+      termination: "sentinel-exit",
+    });
+  });
+
+  test("inspect renders a crashed human-owned lane and still reconciles following lanes", async () => {
+    const root = await tempRoot();
+    const ledgerRoot = join(root, "ledger");
+    const cwd = join(root, "work");
+    const ledger = new FsLedger(ledgerRoot);
+    const clock = createClock(750);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [
+        {
+          laneId: "owned-crashed",
+          exitCode: 1,
+          emitSentinel: false,
+        },
+        { laneId: "following", exitCode: 0 },
+      ],
+    });
+    const source = new WorkflowRuntime({
+      adapter,
+      ledger: new DurableEventsWithoutLease(ledger),
+      clock: clock.now,
+      idgen: () => "run-inspect-crashed",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await source.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd,
+      lanes: [
+        { laneId: "owned-crashed", steps: 1 },
+        { laneId: "following", steps: 1 },
+      ],
+    });
+    for (const laneId of handle.laneIds) {
+      await source.confirmLaneStarted(handle.runId, laneId);
+      adapter.finishLane(laneId);
+    }
+    await source.takeoverLane(handle.runId, "owned-crashed");
+    const crashedPaneId = adapter.paneIdForLane("owned-crashed")!;
+    const followingPaneId = adapter.paneIdForLane("following")!;
+    const processInfoBefore = adapter.processInfoPaneIds.length;
+    const waitsBefore = adapter.waitedPaneIds.length;
+    const interruptsBefore = adapter.interruptedPaneIds.length;
+    const stdout = sink();
+    const stderr = sink();
+
+    const exitCode = await runFlowCli(
+      ["inspect", handle.runId],
+      stdout.output,
+      stderr.output,
+      {
+        environment: { ...process.env, FLOW_LEDGER_ROOT: ledgerRoot },
+        runtimeFactory: (runtimeLedger) =>
+          new WorkflowRuntime({
+            adapter,
+            ledger: new RejectLeaseLedger(runtimeLedger),
+            clock: clock.now,
+            idgen: () => "unused",
+            readResultFile: adapter.readResultFile,
+            sleep: async () => {},
+          }),
+      },
+    );
+    const loaded = await ledger.load(handle.runId);
+    const crashed = loaded!.lanes["owned-crashed"]!;
+    const following = loaded!.lanes["following"]!;
+
+    expect(exitCode).toBe(0);
+    expect(stderr.text()).toBe("");
+    expect(stdout.text()).toContain("runtimeState=crashed");
+    expect(crashed).toMatchObject({
+      runtimeState: "crashed",
+      controlMode: "human_owned",
+      contractState: "violated",
+      verificationState: "failed",
+    });
+    expect(following).toMatchObject({
+      runtimeState: "exited",
+      contractState: "satisfied",
+      verificationState: "verified",
+      exitCode: 0,
+    });
+    expect(adapter.processInfoPaneIds.slice(processInfoBefore)).toEqual([
+      crashedPaneId,
+      followingPaneId,
+    ]);
+    expect(adapter.waitedPaneIds.slice(waitsBefore)).toEqual([]);
+    expect(adapter.interruptedPaneIds.slice(interruptsBefore)).toEqual([]);
+    expect(
+      JSON.parse(await readFile(crashed.evidenceFile!, "utf8")),
+    ).toMatchObject({
+      runId: handle.runId,
+      laneId: "owned-crashed",
+      termination: "crashed",
+    });
+    expect(
+      JSON.parse(await readFile(following.evidenceFile!, "utf8")),
+    ).toMatchObject({
+      runId: handle.runId,
+      laneId: "following",
+      termination: "sentinel-exit",
+    });
+  });
+
+  test("inspect fails closed on evidence-write failure and completes facts on retry", async () => {
+    const root = await tempRoot();
+    const ledgerRoot = join(root, "ledger");
+    const cwd = join(root, "work");
+    const ledger = new FsLedger(ledgerRoot);
+    const clock = createClock(900);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "owned-crashed", exitCode: 1, emitSentinel: false }],
+    });
+    const source = new WorkflowRuntime({
+      adapter,
+      ledger: new DurableEventsWithoutLease(ledger),
+      clock: clock.now,
+      idgen: () => "run-inspect-evidence-failure",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await source.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd,
+      lanes: [{ laneId: "owned-crashed", steps: 1 }],
+    });
+    await source.confirmLaneStarted(handle.runId, "owned-crashed");
+    await source.takeoverLane(handle.runId, "owned-crashed");
+    adapter.finishLane("owned-crashed");
+    let failuresRemaining = 2;
+
+    class FailingEvidenceRuntime extends WorkflowRuntime {
+      protected override async writeRunnerEvidenceFile(
+        path: string,
+        evidence: RunnerEvidence,
+      ): Promise<void> {
+        if (failuresRemaining > 0) {
+          failuresRemaining -= 1;
+          throw new Error("injected evidence write failure");
+        }
+        await super.writeRunnerEvidenceFile(path, evidence);
+      }
+    }
+
+    const createFailingRuntime = (runtimeLedger: Ledger) =>
+      new FailingEvidenceRuntime({
+        adapter,
+        ledger: new RejectLeaseLedger(runtimeLedger),
+        clock: clock.now,
+        idgen: () => "unused",
+        readResultFile: adapter.readResultFile,
+        sleep: async () => {},
+      });
+    await expect(
+      createFailingRuntime(ledger).inspectWorkflow(handle.runId),
+    ).rejects.toThrow("injected evidence write failure");
+
+    const failedStdout = sink();
+    const failedStderr = sink();
+    const failedExitCode = await runFlowCli(
+      ["inspect", handle.runId],
+      failedStdout.output,
+      failedStderr.output,
+      {
+        environment: { ...process.env, FLOW_LEDGER_ROOT: ledgerRoot },
+        runtimeFactory: createFailingRuntime,
+      },
+    );
+    const incomplete = await ledger.load(handle.runId);
+
+    expect(failedExitCode).not.toBe(0);
+    expect(failedStdout.text()).toBe("");
+    expect(failedStderr.text()).toContain("injected evidence write failure");
+    expect(incomplete!.lanes["owned-crashed"]).toMatchObject({
+      runtimeState: "crashed",
+      verificationRecordedAt: null,
+      verificationState: "unverified",
+      evidenceFile: null,
+    });
+
+    const recoveredStdout = sink();
+    const recoveredStderr = sink();
+    const recoveredExitCode = await runFlowCli(
+      ["inspect", handle.runId],
+      recoveredStdout.output,
+      recoveredStderr.output,
+      {
+        environment: { ...process.env, FLOW_LEDGER_ROOT: ledgerRoot },
+        runtimeFactory: (runtimeLedger) =>
+          new WorkflowRuntime({
+            adapter,
+            ledger: new RejectLeaseLedger(runtimeLedger),
+            clock: clock.now,
+            idgen: () => "unused",
+            readResultFile: adapter.readResultFile,
+            sleep: async () => {},
+          }),
+      },
+    );
+    const recovered = await ledger.load(handle.runId);
+
+    expect(recoveredExitCode).toBe(0);
+    expect(recoveredStderr.text()).toBe("");
+    expect(recoveredStdout.text()).toContain("runtimeState=crashed");
+    expect(recovered!.lanes["owned-crashed"]).toMatchObject({
+      runtimeState: "crashed",
+      contractState: "violated",
+      verificationState: "failed",
+    });
+    expect(
+      JSON.parse(
+        await readFile(
+          recovered!.lanes["owned-crashed"]!.evidenceFile!,
+          "utf8",
+        ),
+      ),
+    ).toMatchObject({
+      runId: handle.runId,
+      laneId: "owned-crashed",
+      termination: "crashed",
+    });
+  });
+
+  test("takeover and release durably flip and render lane control mode", async () => {
+    const root = await tempRoot();
+    await seedFinishedRun(root, { finished: false });
+
+    const takeover = await flow(root, "takeover", "run-cli", "lane-1");
+    const takenOver = await new FsLedger(root).load("run-cli");
+    const release = await flow(root, "release", "run-cli", "lane-1");
+    const released = await new FsLedger(root).load("run-cli");
+    await flow(root, "takeover", "run-cli", "lane-1");
+    const inspect = await flow(root, "inspect", "run-cli");
+
+    expect(takeover.exitCode).toBe(0);
+    expect(takeover.stdout).toContain("controlMode=human_owned");
+    expect(takenOver!.lanes["lane-1"]!.controlMode).toBe("human_owned");
+    expect(release.exitCode).toBe(0);
+    expect(release.stdout).toContain("controlMode=managed");
+    expect(released!.lanes["lane-1"]!.controlMode).toBe("managed");
+    expect(inspect.exitCode).toBe(0);
+    expect(inspect.stdout).toContain("controlMode=human_owned");
   });
 
   test("resume reports an already-finished run without changing its event history", async () => {
@@ -453,7 +804,7 @@ describe("flow CLI external behavior", () => {
     expect(adapter.dispatched).toHaveLength(1);
   });
 
-  test("status and inspect render an all-terminal unfinished replay as incomplete", async () => {
+  test("status stays pure while inspect finishes an all-terminal replay", async () => {
     const root = await tempRoot();
     await seedFinishedRun(root, { finished: false });
 
@@ -463,13 +814,16 @@ describe("flow CLI external behavior", () => {
     expect(status.exitCode).toBe(0);
     expect(status.stdout).toContain("state=incomplete");
     expect(inspect.exitCode).toBe(0);
-    expect(inspect.stdout).toContain("state=incomplete");
+    expect(inspect.stdout).toContain("state=complete");
+    expect(inspect.stdout).toContain("finishStatus=clean");
   });
 
   test("usage errors are non-zero", async () => {
     const root = await tempRoot();
     expect((await flow(root, "inspect")).exitCode).not.toBe(0);
     expect((await flow(root, "unknown")).exitCode).not.toBe(0);
+    expect((await flow(root, "takeover", "run-cli")).exitCode).toBe(2);
+    expect((await flow(root, "release")).exitCode).toBe(2);
   });
 
   test("an unusable ledger root fails loudly without an in-memory fallback", async () => {

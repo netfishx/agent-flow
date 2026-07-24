@@ -45,6 +45,7 @@ const TERMINAL_RUNTIME: ReadonlySet<RuntimeState> = new Set([
   "lost",
   "failed_to_start",
 ]);
+const CONDITIONAL_COMMIT_ATTEMPTS = 3;
 
 interface LaneArtifactPaths {
   readonly logFile: string;
@@ -114,6 +115,13 @@ function runnerTermination(lane: LaneView): Pick<
   }
 }
 
+class LaneTerminalAnomaly extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LaneTerminalAnomaly";
+  }
+}
+
 /**
  * Raised after durable run creation when pre-dispatch registration or physical
  * dispatch fails. Any lanes that did start remain controllable via `runId`.
@@ -136,8 +144,15 @@ export class WorkflowRuntime {
   private readonly pendingTransitions = new Map<string, Promise<void>>();
   private readonly commitTails = new Map<string, Promise<void>>();
   private readonly leases = new Map<string, LeaseHandle>();
+  private readonly driveSliceMs: number;
 
-  constructor(protected readonly deps: RuntimeDeps) {}
+  constructor(protected readonly deps: RuntimeDeps) {
+    const driveSliceMs = deps.driveSliceMs ?? 2_000;
+    if (!Number.isFinite(driveSliceMs) || driveSliceMs <= 0) {
+      throw new Error("driveSliceMs must be a positive finite number");
+    }
+    this.driveSliceMs = driveSliceMs;
+  }
 
   async startWorkflow(config: StartWorkflowConfig): Promise<RunHandle> {
     const runId = this.deps.idgen();
@@ -338,15 +353,67 @@ export class WorkflowRuntime {
 
   async inspectWorkflow(runId: string): Promise<WorkflowStatus> {
     await this.flushPending(runId);
+    const loaded = await this.deps.ledger.load(runId);
+    if (!loaded) throw new Error(`unknown runId "${runId}"`);
+    this.registerReducedView(loaded);
     await this.finishIfTerminal(runId);
     let run = this.getRun(runId);
     for (const laneId of run.laneOrder) {
-      await this.refreshLane(runId, laneId);
+      try {
+        await this.refreshLane(runId, laneId);
+      } catch (error) {
+        if (!(error instanceof LaneTerminalAnomaly)) throw error;
+      }
       run = this.getRun(runId);
     }
     await this.finishIfTerminal(runId);
     run = this.getRun(runId);
     return this.workflowStatus(run);
+  }
+
+  // Ownership flips intentionally commit lease-free so a human can take control
+  // from a live managed controller. Use takeover -> controller loss -> resume;
+  // concurrent controller commits may race ledger state (issue #20).
+  async takeoverLane(
+    runId: string,
+    laneId: string,
+  ): Promise<WorkflowStatus> {
+    const loaded = await this.deps.ledger.load(runId);
+    if (!loaded) throw new Error(`run not found: "${runId}"`);
+    this.registerReducedView(loaded);
+    await this.commitEventConditionally(runId, (current) => {
+      if (!current) throw new Error(`unknown runId "${runId}"`);
+      const lane = this.getLane(current, laneId);
+      if (lane.controlMode === "human_owned") return null;
+      return {
+        type: "lane_takeover",
+        actor: "human",
+        laneId,
+        data: {},
+      };
+    });
+    return this.workflowStatus(this.getRun(runId));
+  }
+
+  async releaseLane(
+    runId: string,
+    laneId: string,
+  ): Promise<WorkflowStatus> {
+    const loaded = await this.deps.ledger.load(runId);
+    if (!loaded) throw new Error(`run not found: "${runId}"`);
+    this.registerReducedView(loaded);
+    await this.commitEventConditionally(runId, (current) => {
+      if (!current) throw new Error(`unknown runId "${runId}"`);
+      const lane = this.getLane(current, laneId);
+      if (lane.controlMode === "managed") return null;
+      return {
+        type: "lane_release",
+        actor: "human",
+        laneId,
+        data: {},
+      };
+    });
+    return this.workflowStatus(this.getRun(runId));
   }
 
   async resumeWorkflow(
@@ -392,7 +459,7 @@ export class WorkflowRuntime {
               data: {},
             });
           }
-          liveLaneIds.push(laneId);
+          if (!this.autoControlSuppressed(lane)) liveLaneIds.push(laneId);
           continue;
         }
 
@@ -430,10 +497,7 @@ export class WorkflowRuntime {
         try {
           await this.awaitLane(runId, laneId, perLaneTimeoutMs);
         } catch (error) {
-          const lane = this.getLane(this.getRun(runId), laneId);
-          if (lane.runtimeState !== "crashed" && lane.runtimeState !== "lost") {
-            throw error;
-          }
+          if (!(error instanceof LaneTerminalAnomaly)) throw error;
         }
       }
       await this.finishIfTerminal(runId);
@@ -445,15 +509,24 @@ export class WorkflowRuntime {
       }
       const completed = this.getRun(runId);
       if (completed.finishStatus === null) {
-        const incompleteLaneIds = completed.laneOrder.filter(
-          (laneId) =>
-            !TERMINAL_RUNTIME.has(this.getLane(completed, laneId).runtimeState),
+        const nonTerminal = completed.laneOrder
+          .map((laneId) => this.getLane(completed, laneId))
+          .filter((lane) => !TERMINAL_RUNTIME.has(lane.runtimeState));
+        const drivable = nonTerminal.filter(
+          (lane) => !this.autoControlSuppressed(lane),
         );
-        throw new Error(
-          `resume did not reach run_finished; lanes did not terminate: ${incompleteLaneIds.join(", ")}`,
-        );
+        if (drivable.length > 0) {
+          throw new Error(
+            `resume did not reach run_finished; lanes did not terminate: ${drivable
+              .map((lane) => lane.laneId)
+              .join(", ")}`,
+          );
+        }
+        // Every remaining non-terminal lane is human_owned: reconciled, never auto-driven.
+        // The controller detaches; the human-owned lane keeps running in its pane.
+        await this.releaseControllerLease(runId);
       }
-      return this.workflowStatus(completed);
+      return this.workflowStatus(this.getRun(runId));
     } catch (error) {
       try {
         await this.releaseControllerLease(runId);
@@ -563,30 +636,67 @@ export class WorkflowRuntime {
     laneId: string,
     timeoutMs: number,
   ): Promise<LaneResult> {
-    await this.flushPending(runId);
-    const lane = this.getLane(this.getRun(runId), laneId);
-    if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
-      await this.finishIfTerminal(runId);
-      await this.recordTerminalFacts(runId, laneId, lane.exitCode);
-      return this.inspectLaneResult(runId, laneId);
-    }
-
-    const outcome = await this.deps.adapter.waitForOutput(
-      { id: lane.paneId },
-      laneSentinelRegex(runId, laneId),
-      timeoutMs,
-    );
-    if (outcome.matched) {
-      const gone = await this.confirmProcessGone({ id: lane.paneId });
-      if (!gone) {
-        throw new Error(
-          `lane "${laneId}" printed its sentinel but its process is still running`,
-        );
+    let remaining = timeoutMs;
+    for (;;) {
+      await this.reloadFromLedger(runId);
+      let lane = this.getLane(this.getRun(runId), laneId);
+      if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
+        await this.finishIfTerminal(runId);
+        await this.recordTerminalFacts(runId, laneId, lane.exitCode);
+        return this.inspectLaneResult(runId, laneId);
       }
-      await this.finalizeLane(runId, laneId, outcome.matched);
+      if (this.autoControlSuppressed(lane)) {
+        return this.inspectLaneResult(runId, laneId);
+      }
+
+      const slice = Math.min(remaining, this.driveSliceMs);
+      if (slice <= 0) {
+        const result = await this.inspectLaneResult(runId, laneId);
+        return { ...result, timedOut: true };
+      }
+
+      await this.onDriveSliceBoundary(runId, laneId);
+      const outcome = await this.deps.adapter.waitForOutput(
+        { id: lane.paneId },
+        laneSentinelRegex(runId, laneId),
+        slice,
+      );
+
+      await this.reloadFromLedger(runId);
+      lane = this.getLane(this.getRun(runId), laneId);
+      if (outcome.matched) {
+        const gone = await this.confirmProcessGone({ id: lane.paneId });
+        await this.reloadFromLedger(runId);
+        lane = this.getLane(this.getRun(runId), laneId);
+        if (!gone) {
+          if (this.autoControlSuppressed(lane)) {
+            return this.inspectLaneResult(runId, laneId);
+          }
+          throw new Error(
+            `lane "${laneId}" printed its sentinel but its process is still running`,
+          );
+        }
+        await this.finalizeLane(runId, laneId, true);
+        lane = this.getLane(this.getRun(runId), laneId);
+        if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
+          await this.recordTerminalFacts(runId, laneId, lane.exitCode);
+          return this.inspectLaneResult(runId, laneId);
+        }
+      } else {
+        await this.refreshLane(runId, laneId);
+        await this.reloadFromLedger(runId);
+        lane = this.getLane(this.getRun(runId), laneId);
+      }
+
+      if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
+        await this.recordTerminalFacts(runId, laneId, lane.exitCode);
+        return this.inspectLaneResult(runId, laneId);
+      }
+      if (this.autoControlSuppressed(lane)) {
+        return this.inspectLaneResult(runId, laneId);
+      }
+      remaining -= slice;
     }
-    const result = await this.inspectLaneResult(runId, laneId);
-    return { ...result, timedOut: outcome.timedOut };
   }
 
   async confirmLaneStarted(
@@ -627,6 +737,11 @@ export class WorkflowRuntime {
     return this.pendingTransitions.has(runId) || this.commitTails.has(runId);
   }
 
+  protected async onDriveSliceBoundary(
+    _runId: string,
+    _laneId: string,
+  ): Promise<void> {}
+
   protected registerReducedView(view: RunView): void {
     this.runs.set(view.runId, view);
   }
@@ -642,6 +757,10 @@ export class WorkflowRuntime {
 
   private controllerId(): string {
     return `runtime-${process.pid}`;
+  }
+
+  private autoControlSuppressed(lane: LaneView): boolean {
+    return lane.controlMode === "human_owned";
   }
 
   protected async releaseControllerLease(runId: string): Promise<void> {
@@ -669,23 +788,45 @@ export class WorkflowRuntime {
   ): Promise<RunView | null> {
     const prior = this.commitTails.get(runId) ?? Promise.resolve();
     const transition = prior.then(async () => {
-      const current = this.runs.get(runId);
-      const input = selectEvent(current);
-      if (input === null) return null;
-      const sequence = (current?.lastAppliedSequence ?? 0) + 1;
-      const event = {
-        schemaVersion: 1,
-        eventId: `${runId}#${sequence}`,
-        runId,
-        sequence,
-        at,
-        controllerEpoch: current?.controllerEpoch ?? 0,
-        ...input,
-      } as RunEvent;
-      await this.deps.ledger.commit(event);
-      const next = reduce(current, event);
-      this.runs.set(runId, next);
-      return next;
+      let current = this.runs.get(runId);
+      for (
+        let attempt = 0;
+        attempt < CONDITIONAL_COMMIT_ATTEMPTS;
+        attempt++
+      ) {
+        const input = selectEvent(current);
+        if (input === null) return null;
+        const sequence = (current?.lastAppliedSequence ?? 0) + 1;
+        const event = {
+          schemaVersion: 1,
+          eventId: `${runId}#${sequence}`,
+          runId,
+          sequence,
+          at,
+          controllerEpoch: current?.controllerEpoch ?? 0,
+          ...input,
+        } as RunEvent;
+        try {
+          await this.deps.ledger.commit(event);
+        } catch (error) {
+          if (attempt === CONDITIONAL_COMMIT_ATTEMPTS - 1) throw error;
+          // This transition is itself the run's commit tail. Reload directly:
+          // reloadFromLedger would await this transition and deadlock.
+          const authoritative = await this.deps.ledger.load(runId);
+          if (!authoritative) throw error;
+          const previousSequence = current?.lastAppliedSequence ?? 0;
+          if (authoritative.lastAppliedSequence <= previousSequence) {
+            throw error;
+          }
+          this.registerReducedView(authoritative);
+          current = authoritative;
+          continue;
+        }
+        const next = reduce(current, event);
+        this.runs.set(runId, next);
+        return next;
+      }
+      throw new Error("conditional commit retry bound exhausted");
     });
     const tail = transition.then(
       () => undefined,
@@ -705,6 +846,15 @@ export class WorkflowRuntime {
     await pending;
   }
 
+  private async reloadFromLedger(runId: string): Promise<void> {
+    await this.flushPending(runId);
+    const inFlight = this.commitTails.get(runId);
+    if (inFlight) await inFlight;
+    const loaded = await this.deps.ledger.load(runId);
+    if (!loaded) throw new Error(`run not found: "${runId}"`);
+    this.registerReducedView(loaded);
+  }
+
   private async confirmProcessGone(pane: PaneRef): Promise<boolean> {
     const timeoutMs = this.deps.processGoneTimeoutMs ?? 2_000;
     const intervalMs = this.deps.processGoneIntervalMs ?? 100;
@@ -718,7 +868,7 @@ export class WorkflowRuntime {
   }
 
   private async refreshLane(runId: string, laneId: string): Promise<void> {
-    const lane = this.getLane(this.getRun(runId), laneId);
+    let lane = this.getLane(this.getRun(runId), laneId);
     if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
       if (
         (lane.contractEvaluatedAt === null || lane.verificationRecordedAt === null)
@@ -731,6 +881,16 @@ export class WorkflowRuntime {
       return;
     }
     const info = await this.deps.adapter.processInfo({ id: lane.paneId });
+    await this.reloadFromLedger(runId);
+    lane = this.getLane(this.getRun(runId), laneId);
+    if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
+      if (
+        (lane.contractEvaluatedAt === null || lane.verificationRecordedAt === null)
+      ) {
+        await this.recordTerminalFacts(runId, laneId, lane.exitCode);
+      }
+      return;
+    }
     if (info.foregroundProcessGroupId === info.shellPid) {
       await this.finalizeLane(runId, laneId, false);
     } else {
@@ -787,11 +947,11 @@ export class WorkflowRuntime {
         finalizedLane.runtimeState === "lost" &&
         finalizedLane.lostCause === "dispatch-outcome-unknown"
       ) {
-        throw new Error(
+        throw new LaneTerminalAnomaly(
           `lane "${laneId}" was lost (dispatch-outcome-unknown): its process is gone without positive execution evidence or a sentinel`,
         );
       }
-      throw new Error(
+      throw new LaneTerminalAnomaly(
         `lane "${laneId}" produced no sentinel ${lane.sentinelToken} in its durable log`,
       );
     }
