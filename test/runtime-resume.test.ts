@@ -89,6 +89,42 @@ class LeaseFreeLedger implements Ledger {
   }
 }
 
+class InterleavingCommitLedger implements Ledger {
+  beforeLaneExitedCommit:
+    | ((event: RunEvent) => Promise<void>)
+    | null = null;
+  private interleaved = false;
+
+  constructor(private readonly delegate: Ledger) {}
+
+  async commit(event: RunEvent): Promise<void> {
+    if (
+      event.type === "lane_exited" &&
+      !this.interleaved &&
+      this.beforeLaneExitedCommit
+    ) {
+      this.interleaved = true;
+      await this.beforeLaneExitedCommit(event);
+    }
+    await this.delegate.commit(event);
+  }
+
+  load(runId: string): Promise<RunView | null> {
+    return this.delegate.load(runId);
+  }
+
+  list(): Promise<{ runId: string }[]> {
+    return this.delegate.list();
+  }
+
+  acquireLease(
+    runId: string,
+    controller: { controllerId: string; pid: number },
+  ): Promise<LeaseHandle> {
+    return this.delegate.acquireLease(runId, controller);
+  }
+}
+
 class FinishBetweenLoadsLedger implements Ledger {
   readonly committedTypes: RunEvent["type"][] = [];
   private loadCount = 0;
@@ -398,6 +434,98 @@ describe("WorkflowRuntime resume", () => {
     });
   });
 
+  test("stops a matched-but-live human-owned lane and continues a managed sibling", async () => {
+    const root = await tempWork();
+    const ledger = new FsLedger(join(root, "ledger"));
+    const clock = createClock(3_500);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [
+        {
+          laneId: "owned",
+          exitCode: 0,
+          staysRunningAfterMatch: true,
+        },
+        { laneId: "managed", exitCode: 0 },
+      ],
+    });
+    const source = new WorkflowRuntime({
+      adapter,
+      ledger: new LeaseFreeLedger(ledger),
+      clock: clock.now,
+      idgen: () => "run-matched-live-takeover",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await source.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd: join(root, "work"),
+      lanes: [
+        { laneId: "owned", steps: 1 },
+        { laneId: "managed", steps: 1 },
+      ],
+    });
+    for (const laneId of handle.laneIds) {
+      await source.confirmLaneStarted(handle.runId, laneId);
+    }
+    const takeover = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    let takeoverCommitted = false;
+    class TakeoverDuringMatchedSliceRuntime extends WorkflowRuntime {
+      protected override async onDriveSliceBoundary(
+        runId: string,
+        laneId: string,
+      ): Promise<void> {
+        if (laneId === "owned" && !takeoverCommitted) {
+          takeoverCommitted = true;
+          await takeover.takeoverLane(runId, laneId);
+        }
+      }
+    }
+    const ownedPaneId = adapter.paneIdForLane("owned")!;
+    const managedPaneId = adapter.paneIdForLane("managed")!;
+
+    const status = await new TakeoverDuringMatchedSliceRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      driveSliceMs: 100,
+    }).resumeWorkflow(handle.runId, 1_000);
+    const loaded = await ledger.load(handle.runId);
+
+    expect(
+      adapter.waitedPaneIds.filter((paneId) => paneId === ownedPaneId),
+    ).toHaveLength(1);
+    expect(adapter.waitedPaneIds).toContain(managedPaneId);
+    expect(adapter.interruptedPaneIds).not.toContain(ownedPaneId);
+    expect(status.state).toBe("running");
+    expect(loaded).toMatchObject({
+      finishStatus: null,
+      lanes: {
+        owned: {
+          runtimeState: "running",
+          controlMode: "human_owned",
+          completedAt: null,
+        },
+        managed: {
+          runtimeState: "exited",
+          controlMode: "managed",
+          exitCode: 0,
+        },
+      },
+    });
+  });
+
   test("records a genuine exit and terminal facts when takeover lands in the same slice", async () => {
     const root = await tempWork();
     const ledger = new FsLedger(join(root, "ledger"));
@@ -477,6 +605,71 @@ describe("WorkflowRuntime resume", () => {
       exitCode: 0,
       termination: "sentinel-exit",
     });
+  });
+
+  test("retries an observer fact after a concurrent takeover wins the durable sequence", async () => {
+    const root = await tempWork();
+    const ledgerRoot = join(root, "ledger");
+    const durableLedger = new FsLedger(ledgerRoot);
+    const interleavingLedger = new InterleavingCommitLedger(durableLedger);
+    const clock = createClock(4_500);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "owned", exitCode: 0 }],
+    });
+    const observer = new WorkflowRuntime({
+      adapter,
+      ledger: interleavingLedger,
+      clock: clock.now,
+      idgen: () => "run-observer-race",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await observer.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd: join(root, "work"),
+      lanes: [{ laneId: "owned", steps: 1 }],
+    });
+    await observer.confirmLaneStarted(handle.runId, "owned");
+    adapter.finishLane("owned");
+    const takeover = new WorkflowRuntime({
+      adapter,
+      ledger: durableLedger,
+      clock: clock.now,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    interleavingLedger.beforeLaneExitedCommit = async () => {
+      await takeover.takeoverLane(handle.runId, "owned");
+    };
+
+    const status = await observer.inspectWorkflow(handle.runId);
+    const loaded = await durableLedger.load(handle.runId);
+    const events = (await readFile(
+      join(ledgerRoot, "runs", handle.runId, "events.jsonl"),
+      "utf8",
+    ))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as RunEvent);
+
+    expect(status.state).toBe("complete");
+    expect(loaded!.lanes["owned"]).toMatchObject({
+      runtimeState: "exited",
+      controlMode: "human_owned",
+      exitCode: 0,
+      contractState: "satisfied",
+      verificationState: "verified",
+    });
+    expect(
+      events.filter((event) => event.type === "lane_takeover"),
+    ).toHaveLength(1);
+    expect(
+      events.filter((event) => event.type === "lane_exited"),
+    ).toHaveLength(1);
+    expect(loaded!.lastAppliedSequence).toBe(events.length);
   });
 
   test("reconciles a human-owned live lane without automatically driving it", async () => {

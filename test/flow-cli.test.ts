@@ -400,6 +400,111 @@ describe("flow CLI external behavior", () => {
     });
   });
 
+  test("inspect renders a crashed human-owned lane and still reconciles following lanes", async () => {
+    const root = await tempRoot();
+    const ledgerRoot = join(root, "ledger");
+    const cwd = join(root, "work");
+    const ledger = new FsLedger(ledgerRoot);
+    const clock = createClock(750);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [
+        {
+          laneId: "owned-crashed",
+          exitCode: 1,
+          emitSentinel: false,
+        },
+        { laneId: "following", exitCode: 0 },
+      ],
+    });
+    const source = new WorkflowRuntime({
+      adapter,
+      ledger: new DurableEventsWithoutLease(ledger),
+      clock: clock.now,
+      idgen: () => "run-inspect-crashed",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await source.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd,
+      lanes: [
+        { laneId: "owned-crashed", steps: 1 },
+        { laneId: "following", steps: 1 },
+      ],
+    });
+    for (const laneId of handle.laneIds) {
+      await source.confirmLaneStarted(handle.runId, laneId);
+      adapter.finishLane(laneId);
+    }
+    await source.takeoverLane(handle.runId, "owned-crashed");
+    const crashedPaneId = adapter.paneIdForLane("owned-crashed")!;
+    const followingPaneId = adapter.paneIdForLane("following")!;
+    const processInfoBefore = adapter.processInfoPaneIds.length;
+    const waitsBefore = adapter.waitedPaneIds.length;
+    const interruptsBefore = adapter.interruptedPaneIds.length;
+    const stdout = sink();
+    const stderr = sink();
+
+    const exitCode = await runFlowCli(
+      ["inspect", handle.runId],
+      stdout.output,
+      stderr.output,
+      {
+        environment: { ...process.env, FLOW_LEDGER_ROOT: ledgerRoot },
+        runtimeFactory: (runtimeLedger) =>
+          new WorkflowRuntime({
+            adapter,
+            ledger: new RejectLeaseLedger(runtimeLedger),
+            clock: clock.now,
+            idgen: () => "unused",
+            readResultFile: adapter.readResultFile,
+            sleep: async () => {},
+          }),
+      },
+    );
+    const loaded = await ledger.load(handle.runId);
+    const crashed = loaded!.lanes["owned-crashed"]!;
+    const following = loaded!.lanes["following"]!;
+
+    expect(exitCode).toBe(0);
+    expect(stderr.text()).toBe("");
+    expect(stdout.text()).toContain("runtimeState=crashed");
+    expect(crashed).toMatchObject({
+      runtimeState: "crashed",
+      controlMode: "human_owned",
+      contractState: "violated",
+      verificationState: "failed",
+    });
+    expect(following).toMatchObject({
+      runtimeState: "exited",
+      contractState: "satisfied",
+      verificationState: "verified",
+      exitCode: 0,
+    });
+    expect(adapter.processInfoPaneIds.slice(processInfoBefore)).toEqual([
+      crashedPaneId,
+      followingPaneId,
+    ]);
+    expect(adapter.waitedPaneIds.slice(waitsBefore)).toEqual([]);
+    expect(adapter.interruptedPaneIds.slice(interruptsBefore)).toEqual([]);
+    expect(
+      JSON.parse(await readFile(crashed.evidenceFile!, "utf8")),
+    ).toMatchObject({
+      runId: handle.runId,
+      laneId: "owned-crashed",
+      termination: "crashed",
+    });
+    expect(
+      JSON.parse(await readFile(following.evidenceFile!, "utf8")),
+    ).toMatchObject({
+      runId: handle.runId,
+      laneId: "following",
+      termination: "sentinel-exit",
+    });
+  });
+
   test("takeover and release durably flip and render lane control mode", async () => {
     const root = await tempRoot();
     await seedFinishedRun(root, { finished: false });

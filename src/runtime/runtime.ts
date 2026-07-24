@@ -45,6 +45,7 @@ const TERMINAL_RUNTIME: ReadonlySet<RuntimeState> = new Set([
   "lost",
   "failed_to_start",
 ]);
+const CONDITIONAL_COMMIT_ATTEMPTS = 3;
 
 interface LaneArtifactPaths {
   readonly logFile: string;
@@ -344,16 +345,21 @@ export class WorkflowRuntime {
   }
 
   async inspectWorkflow(runId: string): Promise<WorkflowStatus> {
-    if (!this.runs.has(runId)) {
-      const loaded = await this.deps.ledger.load(runId);
-      if (!loaded) throw new Error(`unknown runId "${runId}"`);
-      this.registerReducedView(loaded);
-    }
     await this.flushPending(runId);
+    const loaded = await this.deps.ledger.load(runId);
+    if (!loaded) throw new Error(`unknown runId "${runId}"`);
+    this.registerReducedView(loaded);
     await this.finishIfTerminal(runId);
     let run = this.getRun(runId);
     for (const laneId of run.laneOrder) {
-      await this.refreshLane(runId, laneId);
+      try {
+        await this.refreshLane(runId, laneId);
+      } catch (error) {
+        const lane = this.getLane(this.getRun(runId), laneId);
+        if (lane.runtimeState !== "crashed" && lane.runtimeState !== "lost") {
+          throw error;
+        }
+      }
       run = this.getRun(runId);
     }
     await this.finishIfTerminal(runId);
@@ -660,6 +666,9 @@ export class WorkflowRuntime {
       if (outcome.matched) {
         const gone = await this.confirmProcessGone({ id: lane.paneId });
         if (!gone) {
+          if (this.autoControlSuppressed(lane)) {
+            return this.inspectLaneResult(runId, laneId);
+          }
           throw new Error(
             `lane "${laneId}" printed its sentinel but its process is still running`,
           );
@@ -775,23 +784,45 @@ export class WorkflowRuntime {
   ): Promise<RunView | null> {
     const prior = this.commitTails.get(runId) ?? Promise.resolve();
     const transition = prior.then(async () => {
-      const current = this.runs.get(runId);
-      const input = selectEvent(current);
-      if (input === null) return null;
-      const sequence = (current?.lastAppliedSequence ?? 0) + 1;
-      const event = {
-        schemaVersion: 1,
-        eventId: `${runId}#${sequence}`,
-        runId,
-        sequence,
-        at,
-        controllerEpoch: current?.controllerEpoch ?? 0,
-        ...input,
-      } as RunEvent;
-      await this.deps.ledger.commit(event);
-      const next = reduce(current, event);
-      this.runs.set(runId, next);
-      return next;
+      let current = this.runs.get(runId);
+      for (
+        let attempt = 0;
+        attempt < CONDITIONAL_COMMIT_ATTEMPTS;
+        attempt++
+      ) {
+        const input = selectEvent(current);
+        if (input === null) return null;
+        const sequence = (current?.lastAppliedSequence ?? 0) + 1;
+        const event = {
+          schemaVersion: 1,
+          eventId: `${runId}#${sequence}`,
+          runId,
+          sequence,
+          at,
+          controllerEpoch: current?.controllerEpoch ?? 0,
+          ...input,
+        } as RunEvent;
+        try {
+          await this.deps.ledger.commit(event);
+        } catch (error) {
+          if (attempt === CONDITIONAL_COMMIT_ATTEMPTS - 1) throw error;
+          // This transition is itself the run's commit tail. Reload directly:
+          // reloadFromLedger would await this transition and deadlock.
+          const authoritative = await this.deps.ledger.load(runId);
+          if (!authoritative) throw error;
+          const previousSequence = current?.lastAppliedSequence ?? 0;
+          if (authoritative.lastAppliedSequence <= previousSequence) {
+            throw error;
+          }
+          this.registerReducedView(authoritative);
+          current = authoritative;
+          continue;
+        }
+        const next = reduce(current, event);
+        this.runs.set(runId, next);
+        return next;
+      }
+      throw new Error("conditional commit retry bound exhausted");
     });
     const tail = transition.then(
       () => undefined,
