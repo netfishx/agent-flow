@@ -1,27 +1,28 @@
 // Unattended real-stack human-ownership recovery smoke.
 //
-// A dispatch child starts short managed lanes plus one long lane and stays
-// alive holding the durable controller lease. The parent takes over the long
-// lane, kills the controller, reconciles without driving the human-owned lane,
-// observes its self-termination, then releases it and resumes the finished run.
+// The first controller is killed only after a takeover lands during a real
+// awaitLane wait slice and the managed sibling finishes. A fresh CLI resume
+// preserves both owned lanes, inspect collects a self-terminated lane, and a
+// second tracked controller proves release restores a real managed wait/exit.
 
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { RealHerdrAdapter } from "../herdr/real-adapter.ts";
-import type {
-  RunEvent,
-  RunnerEvidence,
-  RuntimeState,
-} from "../runtime/events.ts";
+import type { PaneRef, WaitOutcome } from "../herdr/types.ts";
+import type { RunnerEvidence, RuntimeState } from "../runtime/events.ts";
 import {
   FsLedger,
   realPidIsAlive,
   resolveLedgerRoot,
 } from "../runtime/fs-ledger.ts";
-import type { Ledger } from "../runtime/ledger.ts";
+import type { LeaseHandle, Ledger } from "../runtime/ledger.ts";
 import { WorkflowRuntime } from "../runtime/runtime.ts";
 import type { LaneSpec, RuntimeDeps } from "../runtime/types.ts";
-import { summarizeInspectCollection } from "./takeover-report.ts";
+import {
+  summarizeInSliceAbort,
+  summarizeInspectCollection,
+  summarizePostReleaseDrive,
+} from "./takeover-report.ts";
 
 const TERMINAL_RUNTIME: ReadonlySet<RuntimeState> = new Set([
   "exited",
@@ -65,79 +66,117 @@ function config() {
     ),
     managedLaneCount: num("FLOW_MANAGED_LANES", 3),
     shortSteps: num("FLOW_SHORT_STEPS", 3),
-    longSteps: num("FLOW_LONG_STEPS", 30),
+    ownedLongSteps: num("FLOW_LONG_STEPS", 12),
+    releaseLongSteps: num("FLOW_RELEASE_LONG_STEPS", 30),
     delay: num("FLOW_DELAY", 1),
+    driveSliceMs: num("FLOW_DRIVE_SLICE_MS", 2_000),
     evidenceDir,
-    readyFile: env("FLOW_READY_FILE", join(evidenceDir, "controller-ready")),
+    driveWaitMarker: env(
+      "FLOW_DRIVE_WAIT_MARKER",
+      join(evidenceDir, "drive-wait-started.json"),
+    ),
+    driveResultFile: env(
+      "FLOW_DRIVE_RESULT",
+      join(evidenceDir, "drive-result.json"),
+    ),
+    releaseWaitMarker: env(
+      "FLOW_RELEASE_WAIT_MARKER",
+      join(evidenceDir, "release-wait-started.json"),
+    ),
+    releaseResultFile: env(
+      "FLOW_RELEASE_RESULT",
+      join(evidenceDir, "release-drive-result.json"),
+    ),
     readyTimeoutMs: num("FLOW_CONTROLLER_READY_TIMEOUT_MS", 30_000),
-    unobservedMs: num("FLOW_UNOBSERVED_MS", 5_000),
     laneTimeoutMs: num("FLOW_LANE_TIMEOUT_MS", 90_000),
     ledgerRoot: resolveLedgerRoot(),
-    longLaneId: "long",
+    ownedLaneId: "long-owned",
+    releaseLaneId: "long-release",
   };
 }
 
-function makeDeps(ledger: Ledger, runId: string): RuntimeDeps {
+class LeaseFreeLedger implements Ledger {
+  constructor(private readonly delegate: Ledger) {}
+
+  commit(event: Parameters<Ledger["commit"]>[0]): Promise<void> {
+    return this.delegate.commit(event);
+  }
+
+  load(runId: string) {
+    return this.delegate.load(runId);
+  }
+
+  list() {
+    return this.delegate.list();
+  }
+
+  async acquireLease(): Promise<LeaseHandle> {
+    return { release: async () => {} };
+  }
+}
+
+class TrackingRealHerdrAdapter extends RealHerdrAdapter {
+  targetWaitCount = 0;
+  private markerWritten = false;
+
+  constructor(
+    private readonly targetPaneId: string,
+    private readonly waitMarker: string,
+  ) {
+    super();
+  }
+
+  override async waitForOutput(
+    pane: PaneRef,
+    regex: string,
+    timeoutMs: number,
+  ): Promise<WaitOutcome> {
+    if (pane.id === this.targetPaneId) {
+      this.targetWaitCount += 1;
+      if (!this.markerWritten) {
+        this.markerWritten = true;
+        await Bun.write(
+          this.waitMarker,
+          `${JSON.stringify({
+            paneId: pane.id,
+            targetWaitCount: this.targetWaitCount,
+            at: Date.now(),
+          })}\n`,
+        );
+      }
+    }
+    return super.waitForOutput(pane, regex, timeoutMs);
+  }
+}
+
+function makeDeps(
+  ledger: Ledger,
+  runId: string,
+  adapter: RealHerdrAdapter,
+  driveSliceMs: number,
+): RuntimeDeps {
   return {
-    adapter: new RealHerdrAdapter(),
+    adapter,
     ledger,
     clock: () => Date.now(),
     idgen: () => runId,
     readResultFile: (path) => Bun.file(path).text(),
     sleep,
+    driveSliceMs,
   };
-}
-
-async function dispatchPhase(): Promise<void> {
-  const c = config();
-  await mkdir(c.evidenceDir, { recursive: true });
-  const runtime = new WorkflowRuntime(
-    makeDeps(new FsLedger(c.ledgerRoot), c.runId),
-  );
-  const managedLanes: LaneSpec[] = Array.from(
-    { length: c.managedLaneCount },
-    (_, index) => ({
-      laneId: `short-${index + 1}`,
-      role: "simulated",
-      steps: c.shortSteps,
-      stepDelaySeconds: c.delay,
-    }),
-  );
-  const lanes: LaneSpec[] = [
-    ...managedLanes,
-    {
-      laneId: c.longLaneId,
-      role: "simulated",
-      steps: c.longSteps,
-      stepDelaySeconds: c.delay,
-    },
-  ];
-
-  line(
-    `[dispatch pid=${process.pid}] runId=${c.runId} workspace=${c.workspace} managed=${c.managedLaneCount} long=${c.longLaneId}`,
-  );
-  const handle = await runtime.startWorkflow({
-    workflow: "flow-takeover-smoke",
-    workspace: c.workspace,
-    cwd: c.evidenceDir,
-    lanes,
-    splitDirection: "down",
-    startupSettleMs: 1_000,
-  });
-  for (const laneId of handle.laneIds) {
-    const live = await runtime.confirmLaneStarted(handle.runId, laneId);
-    if (!live) throw new Error(`lane "${laneId}" did not become live`);
-  }
-  await Bun.write(c.readyFile, `${handle.runId}\n`);
-  line("[dispatch] controller ready and holding lease");
-
-  for (;;) await sleep(60_000);
 }
 
 interface CliResult {
   readonly exitCode: number;
   readonly stdout: string;
   readonly stderr: string;
+}
+
+interface DriveResult {
+  readonly targetWaitCount: number;
+  readonly controllerThrew: boolean;
+  readonly statusState: string | null;
+  readonly error: string | null;
 }
 
 async function flow(
@@ -163,14 +202,16 @@ async function flow(
   return { exitCode, stdout, stderr };
 }
 
-async function waitForReady(path: string, timeoutMs: number): Promise<void> {
+async function waitForFile(
+  path: string,
+  timeoutMs: number,
+  description: string,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     if (await Bun.file(path).exists()) return;
     if (Date.now() >= deadline) {
-      throw new Error(
-        `dispatch controller did not become ready within ${timeoutMs}ms`,
-      );
+      throw new Error(`${description} did not appear within ${timeoutMs}ms`);
     }
     await sleep(100);
   }
@@ -194,6 +235,17 @@ async function waitForLaneGone(
   }
 }
 
+async function assertLaneLive(
+  adapter: RealHerdrAdapter,
+  paneId: string,
+  message: string,
+): Promise<void> {
+  const info = await adapter.processInfo({ id: paneId });
+  if (info.foregroundProcessGroupId === info.shellPid) {
+    throw new Error(message);
+  }
+}
+
 function laneStates(run: NonNullable<Awaited<ReturnType<FsLedger["load"]>>>) {
   return run.laneOrder.map((laneId) => ({
     laneId,
@@ -202,130 +254,271 @@ function laneStates(run: NonNullable<Awaited<ReturnType<FsLedger["load"]>>>) {
   }));
 }
 
-async function parentPhase(): Promise<void> {
+async function closeHerdrTab(tabId: string): Promise<void> {
+  const child = Bun.spawn(["herdr", "tab", "close", tabId], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(
+      `herdr tab close failed (exit ${exitCode}): ${stderr.trim() || stdout.trim()}`,
+    );
+  }
+}
+
+async function setupRun(): Promise<string> {
   const c = config();
   await mkdir(c.evidenceDir, { recursive: true });
-  line("== agent-flow preserve-human-ownership smoke ==");
-  line(`runId=${c.runId} evidence=${c.evidenceDir}`);
+  const ledger = new FsLedger(c.ledgerRoot);
+  const adapter = new RealHerdrAdapter();
+  const runtime = new WorkflowRuntime(
+    makeDeps(
+      new LeaseFreeLedger(ledger),
+      c.runId,
+      adapter,
+      c.driveSliceMs,
+    ),
+  );
+  const managedLanes: LaneSpec[] = Array.from(
+    { length: c.managedLaneCount },
+    (_, index) => ({
+      laneId: `short-${index + 1}`,
+      role: "simulated",
+      steps: c.shortSteps,
+      stepDelaySeconds: c.delay,
+    }),
+  );
+  const lanes: LaneSpec[] = [
+    {
+      laneId: c.ownedLaneId,
+      role: "simulated",
+      steps: c.ownedLongSteps,
+      stepDelaySeconds: c.delay,
+    },
+    ...managedLanes,
+    {
+      laneId: c.releaseLaneId,
+      role: "simulated",
+      steps: c.releaseLongSteps,
+      stepDelaySeconds: c.delay,
+    },
+  ];
 
-  const controller = Bun.spawn(["bun", "run", import.meta.path, "__dispatch__"], {
+  const handle = await runtime.startWorkflow({
+    workflow: "flow-takeover-smoke",
+    workspace: c.workspace,
+    cwd: c.evidenceDir,
+    lanes,
+    splitDirection: "down",
+    startupSettleMs: 1_000,
+  });
+  for (const laneId of handle.laneIds) {
+    const live = await runtime.confirmLaneStarted(handle.runId, laneId);
+    if (!live) throw new Error(`lane "${laneId}" did not become live`);
+  }
+  await runtime.takeoverLane(handle.runId, c.releaseLaneId);
+  const loaded = await ledger.load(handle.runId);
+  if (!loaded) throw new Error(`run "${handle.runId}" disappeared`);
+  return loaded.tabId;
+}
+
+async function drivePhase(): Promise<void> {
+  const c = config();
+  const ledger = new FsLedger(c.ledgerRoot);
+  const run = await ledger.load(c.runId);
+  if (!run) throw new Error(`unknown runId "${c.runId}"`);
+  const targetLaneId = env("FLOW_TRACK_LANE", c.ownedLaneId);
+  const targetLane = run.lanes[targetLaneId];
+  if (!targetLane) throw new Error(`unknown laneId "${targetLaneId}"`);
+  const marker = env("FLOW_WAIT_MARKER", c.driveWaitMarker);
+  const resultFile = env("FLOW_TRACK_RESULT", c.driveResultFile);
+  const adapter = new TrackingRealHerdrAdapter(targetLane.paneId, marker);
+  const runtime = new WorkflowRuntime(
+    makeDeps(ledger, c.runId, adapter, c.driveSliceMs),
+  );
+  let result: DriveResult;
+  try {
+    const status = await runtime.resumeWorkflow(c.runId, c.laneTimeoutMs);
+    result = {
+      targetWaitCount: adapter.targetWaitCount,
+      controllerThrew: false,
+      statusState: status.state,
+      error: null,
+    };
+  } catch (error) {
+    result = {
+      targetWaitCount: adapter.targetWaitCount,
+      controllerThrew: true,
+      statusState: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+  await Bun.write(resultFile, `${JSON.stringify(result, null, 2)}\n`);
+  if (result.controllerThrew) throw new Error(result.error ?? "drive failed");
+  if (env("FLOW_HOLD_AFTER_DRIVE", "0") === "1") {
+    for (;;) await sleep(60_000);
+  }
+}
+
+function spawnTrackedController(options: {
+  readonly c: ReturnType<typeof config>;
+  readonly targetLaneId: string;
+  readonly marker: string;
+  readonly resultFile: string;
+  readonly holdAfterDrive: boolean;
+}) {
+  return Bun.spawn(["bun", "run", import.meta.path, "__drive__"], {
     env: {
       ...process.env,
-      FLOW_RUN_ID: c.runId,
-      FLOW_EVIDENCE_DIR: c.evidenceDir,
-      FLOW_READY_FILE: c.readyFile,
-      FLOW_LEDGER_ROOT: c.ledgerRoot,
-      FLOW_WORKSPACE: c.workspace,
-      FLOW_MANAGED_LANES: String(c.managedLaneCount),
-      FLOW_SHORT_STEPS: String(c.shortSteps),
-      FLOW_LONG_STEPS: String(c.longSteps),
-      FLOW_DELAY: String(c.delay),
+      FLOW_RUN_ID: options.c.runId,
+      FLOW_EVIDENCE_DIR: options.c.evidenceDir,
+      FLOW_LEDGER_ROOT: options.c.ledgerRoot,
+      FLOW_WORKSPACE: options.c.workspace,
+      FLOW_MANAGED_LANES: String(options.c.managedLaneCount),
+      FLOW_SHORT_STEPS: String(options.c.shortSteps),
+      FLOW_LONG_STEPS: String(options.c.ownedLongSteps),
+      FLOW_RELEASE_LONG_STEPS: String(options.c.releaseLongSteps),
+      FLOW_DELAY: String(options.c.delay),
+      FLOW_DRIVE_SLICE_MS: String(options.c.driveSliceMs),
+      FLOW_LANE_TIMEOUT_MS: String(options.c.laneTimeoutMs),
+      FLOW_TRACK_LANE: options.targetLaneId,
+      FLOW_WAIT_MARKER: options.marker,
+      FLOW_TRACK_RESULT: options.resultFile,
+      FLOW_HOLD_AFTER_DRIVE: options.holdAfterDrive ? "1" : "0",
     },
     stdout: "inherit",
     stderr: "inherit",
   });
-  const controllerPid = controller.pid;
+}
+
+async function parentPhase(): Promise<void> {
+  const c = config();
+  await mkdir(c.evidenceDir, { recursive: true });
+  line("== agent-flow live ownership smoke ==");
+  line(`runId=${c.runId} evidence=${c.evidenceDir}`);
+
+  let tabId: string | null = null;
+  let tabClosed = false;
+  let controller:
+    | ReturnType<typeof spawnTrackedController>
+    | null = null;
   let controllerReaped = false;
   try {
-    await waitForReady(c.readyFile, c.readyTimeoutMs);
+    tabId = await setupRun();
+    controller = spawnTrackedController({
+      c,
+      targetLaneId: c.ownedLaneId,
+      marker: c.driveWaitMarker,
+      resultFile: c.driveResultFile,
+      holdAfterDrive: true,
+    });
+    const controllerPid = controller.pid;
 
+    await waitForFile(
+      c.driveWaitMarker,
+      c.readyTimeoutMs,
+      "owned-lane wait marker",
+    );
     const takeover = await flow(
       c.ledgerRoot,
       c.laneTimeoutMs,
       "takeover",
       c.runId,
-      c.longLaneId,
+      c.ownedLaneId,
     );
     if (takeover.exitCode !== 0) {
       throw new Error(
         `takeover failed: exit=${takeover.exitCode} stderr=${takeover.stderr.trim()}`,
       );
     }
-    const afterTakeover = await new FsLedger(c.ledgerRoot).load(c.runId);
-    if (!afterTakeover) throw new Error(`run "${c.runId}" disappeared`);
-    if (afterTakeover.lanes[c.longLaneId]!.controlMode !== "human_owned") {
-      throw new Error("takeover was not durably reconstructed as human_owned");
-    }
-    line(`takeover proven (exit=${takeover.exitCode})`);
+    await waitForFile(
+      c.driveResultFile,
+      c.laneTimeoutMs,
+      "first controller result",
+    );
+    const driveResult = JSON.parse(
+      await readFile(c.driveResultFile, "utf8"),
+    ) as DriveResult;
+    const afterTakeoverDrive = await new FsLedger(c.ledgerRoot).load(c.runId);
+    if (!afterTakeoverDrive) throw new Error(`run "${c.runId}" disappeared`);
+    const ownedAfterDrive = afterTakeoverDrive.lanes[c.ownedLaneId]!;
+    const managedLaneIds = afterTakeoverDrive.laneOrder.filter((laneId) =>
+      laneId.startsWith("short-"),
+    );
+    const siblingComplete = managedLaneIds.every((laneId) =>
+      TERMINAL_RUNTIME.has(
+        afterTakeoverDrive.lanes[laneId]!.runtimeState,
+      ),
+    );
+    const inSliceAbort = summarizeInSliceAbort({
+      waitStarted: await Bun.file(c.driveWaitMarker).exists(),
+      targetWaitCount: driveResult.targetWaitCount,
+      controllerThrew: driveResult.controllerThrew,
+      ownedRuntimeState: ownedAfterDrive.runtimeState,
+      ownedControlMode: ownedAfterDrive.controlMode,
+      siblingComplete,
+    });
+    await assertLaneLive(
+      new RealHerdrAdapter(),
+      ownedAfterDrive.paneId,
+      "owned lane was not left live after in-slice takeover",
+    );
+    line("takeover landed during a real wait; sibling managed lanes completed");
 
     controller.kill("SIGKILL");
-    const controllerExit = await controller.exited;
+    const controllerExitCode = await controller.exited;
     controllerReaped = true;
     await sleep(100);
     if (realPidIsAlive(controllerPid)) {
       throw new Error(`SIGKILLed controller pid ${controllerPid} is still alive`);
     }
-    line(`controller SIGKILLed and reaped (exit=${controllerExit})`);
 
-    await sleep(c.unobservedMs);
-    const beforeResume = await new FsLedger(c.ledgerRoot).load(c.runId);
-    if (!beforeResume) throw new Error(`run "${c.runId}" disappeared`);
-    const adapter = new RealHerdrAdapter();
-    let goneBeforeResume = 0;
-    let aliveBeforeResume = 0;
-    for (const laneId of beforeResume.laneOrder) {
-      const lane = beforeResume.lanes[laneId]!;
-      const info = await adapter.processInfo({ id: lane.paneId });
-      if (info.foregroundProcessGroupId === info.shellPid) goneBeforeResume++;
-      else aliveBeforeResume++;
-    }
-    if (goneBeforeResume === 0 || aliveBeforeResume === 0) {
-      throw new Error(
-        `unobserved window must contain both exited and live lanes; exited=${goneBeforeResume} live=${aliveBeforeResume}`,
-      );
-    }
-    line(
-      `unobserved window: exited=${goneBeforeResume} live=${aliveBeforeResume}`,
-    );
-
-    const firstResume = await flow(
+    const resumeAfterLoss = await flow(
       c.ledgerRoot,
       c.laneTimeoutMs,
       "resume",
       c.runId,
     );
-    if (firstResume.exitCode !== 0) {
+    if (resumeAfterLoss.exitCode !== 0) {
       throw new Error(
-        `human-owned resume failed: exit=${firstResume.exitCode} stderr=${firstResume.stderr.trim()}`,
+        `resume after controller loss failed: exit=${resumeAfterLoss.exitCode} stderr=${resumeAfterLoss.stderr.trim()}`,
       );
     }
-    const afterFirstResume = await new FsLedger(c.ledgerRoot).load(c.runId);
-    if (!afterFirstResume) throw new Error(`run "${c.runId}" disappeared`);
-    const longAfterFirstResume = afterFirstResume.lanes[c.longLaneId]!;
-    const managedLaneIds = afterFirstResume.laneOrder.filter(
-      (laneId) => laneId !== c.longLaneId,
-    );
+    const afterLossResume = await new FsLedger(c.ledgerRoot).load(c.runId);
+    if (!afterLossResume) throw new Error(`run "${c.runId}" disappeared`);
+    const ownedAfterLoss = afterLossResume.lanes[c.ownedLaneId]!;
+    const releaseAfterLoss = afterLossResume.lanes[c.releaseLaneId]!;
     if (
-      longAfterFirstResume.controlMode !== "human_owned" ||
-      longAfterFirstResume.runtimeState !== "running" ||
-      longAfterFirstResume.liveAt === null ||
-      TERMINAL_RUNTIME.has(longAfterFirstResume.runtimeState) ||
-      afterFirstResume.finishStatus !== null ||
-      !managedLaneIds.every((laneId) =>
-        TERMINAL_RUNTIME.has(afterFirstResume.lanes[laneId]!.runtimeState),
-      ) ||
-      afterFirstResume.controllerEpoch < 1
+      ownedAfterLoss.controlMode !== "human_owned" ||
+      ownedAfterLoss.runtimeState !== "running" ||
+      releaseAfterLoss.controlMode !== "human_owned" ||
+      releaseAfterLoss.runtimeState !== "running"
     ) {
-      throw new Error(
-        "first resume failed reconcile-without-auto-drive integrity",
-      );
+      throw new Error("resume after controller loss did not preserve ownership");
     }
-    const eventFile = join(c.ledgerRoot, "runs", c.runId, "events.jsonl");
-    const events = (await readFile(eventFile, "utf8"))
-      .trim()
-      .split("\n")
-      .map((eventLine) => JSON.parse(eventLine) as RunEvent);
-    if (!events.some((event) => event.type === "controller_attached")) {
-      throw new Error("event history has no controller_attached");
-    }
-    line("first resume reconciled managed lanes and left human-owned lane live");
+    await assertLaneLive(
+      new RealHerdrAdapter(),
+      ownedAfterLoss.paneId,
+      "fresh resume drove the human-owned lane",
+    );
+    line("fresh flow resume preserved and reconciled owned lanes without drive");
 
+    const adapter = new RealHerdrAdapter();
     await waitForLaneGone(
       adapter,
-      longAfterFirstResume.paneId,
+      ownedAfterLoss.paneId,
       c.laneTimeoutMs,
     );
-    line("human-owned lane self-terminated");
+    await assertLaneLive(
+      adapter,
+      releaseAfterLoss.paneId,
+      "release proof lane terminated before release",
+    );
 
     const inspect = await flow(
       c.ledgerRoot,
@@ -340,126 +533,165 @@ async function parentPhase(): Promise<void> {
     }
     const afterInspect = await new FsLedger(c.ledgerRoot).load(c.runId);
     if (!afterInspect) throw new Error(`run "${c.runId}" disappeared`);
-    const longAfterInspect = afterInspect.lanes[c.longLaneId]!;
+    const ownedAfterInspect = afterInspect.lanes[c.ownedLaneId]!;
     const inspectEvidence =
-      longAfterInspect.evidenceFile === null
+      ownedAfterInspect.evidenceFile === null
         ? null
         : JSON.parse(
-            await readFile(longAfterInspect.evidenceFile, "utf8"),
+            await readFile(ownedAfterInspect.evidenceFile, "utf8"),
           ) as RunnerEvidence;
     const inspectCollected = summarizeInspectCollection({
       exitCode: inspect.exitCode,
       runId: c.runId,
-      laneId: c.longLaneId,
-      runtimeState: longAfterInspect.runtimeState,
-      controlMode: longAfterInspect.controlMode,
-      contractState: longAfterInspect.contractState,
-      verificationState: longAfterInspect.verificationState,
-      evidenceFile: longAfterInspect.evidenceFile,
+      laneId: c.ownedLaneId,
+      runtimeState: ownedAfterInspect.runtimeState,
+      controlMode: ownedAfterInspect.controlMode,
+      contractState: ownedAfterInspect.contractState,
+      verificationState: ownedAfterInspect.verificationState,
+      evidenceFile: ownedAfterInspect.evidenceFile,
       evidence: inspectEvidence,
     });
-    if (afterInspect.finishStatus === null) {
-      throw new Error("inspect did not finish the self-terminated run");
-    }
-    line("inspect collected the human-owned lane terminal evidence");
+    line("flow inspect collected self-terminated owned-lane evidence");
 
+    const releaseBeforeFlip = afterInspect.lanes[c.releaseLaneId]!;
+    if (
+      releaseBeforeFlip.runtimeState !== "running" ||
+      releaseBeforeFlip.controlMode !== "human_owned"
+    ) {
+      throw new Error("release proof lane was not live and human_owned");
+    }
+    await assertLaneLive(
+      adapter,
+      releaseBeforeFlip.paneId,
+      "release proof lane was not running before release",
+    );
     const release = await flow(
       c.ledgerRoot,
       c.laneTimeoutMs,
       "release",
       c.runId,
-      c.longLaneId,
+      c.releaseLaneId,
     );
     if (release.exitCode !== 0) {
       throw new Error(
         `release failed: exit=${release.exitCode} stderr=${release.stderr.trim()}`,
       );
     }
-    const afterRelease = await new FsLedger(c.ledgerRoot).load(c.runId);
-    if (!afterRelease) throw new Error(`run "${c.runId}" disappeared`);
-    if (afterRelease.lanes[c.longLaneId]!.controlMode !== "managed") {
-      throw new Error("release was not durably reconstructed as managed");
-    }
-    line(`release proven (exit=${release.exitCode})`);
 
-    const secondResume = await flow(
-      c.ledgerRoot,
-      c.laneTimeoutMs,
-      "resume",
-      c.runId,
+    const releaseController = spawnTrackedController({
+      c,
+      targetLaneId: c.releaseLaneId,
+      marker: c.releaseWaitMarker,
+      resultFile: c.releaseResultFile,
+      holdAfterDrive: false,
+    });
+    await waitForFile(
+      c.releaseWaitMarker,
+      c.readyTimeoutMs,
+      "post-release wait marker",
     );
-    if (secondResume.exitCode !== 0) {
-      throw new Error(
-        `managed resume failed: exit=${secondResume.exitCode} stderr=${secondResume.stderr.trim()}`,
-      );
-    }
+    const releaseControllerExit = await releaseController.exited;
+    await waitForFile(
+      c.releaseResultFile,
+      c.laneTimeoutMs,
+      "post-release controller result",
+    );
+    const releaseDriveResult = JSON.parse(
+      await readFile(c.releaseResultFile, "utf8"),
+    ) as DriveResult;
     const finished = await new FsLedger(c.ledgerRoot).load(c.runId);
     if (!finished) throw new Error(`run "${c.runId}" disappeared`);
-    if (
-      finished.finishStatus === null ||
-      !TERMINAL_RUNTIME.has(finished.lanes[c.longLaneId]!.runtimeState)
-    ) {
-      throw new Error("release did not restore managed drive to run_finished");
+    const releasedLane = finished.lanes[c.releaseLaneId]!;
+    const postReleaseDrive = summarizePostReleaseDrive({
+      wasRunningBeforeRelease: true,
+      waitStarted: await Bun.file(c.releaseWaitMarker).exists(),
+      targetWaitCount: releaseDriveResult.targetWaitCount,
+      controllerThrew:
+        releaseDriveResult.controllerThrew || releaseControllerExit !== 0,
+      runtimeState: releasedLane.runtimeState,
+      exitCode: releasedLane.exitCode,
+    });
+    if (finished.finishStatus === null) {
+      throw new Error("post-release drive did not finish the run");
     }
+    line("release restored a real managed wait and exit");
 
+    const reportPath = join(c.evidenceDir, "smoke-result.json");
     const report = {
       runId: c.runId,
+      waitStarted: {
+        marker: c.driveWaitMarker,
+        observed: true,
+      },
+      takeover: {
+        exitCode: takeover.exitCode,
+        laneId: c.ownedLaneId,
+      },
+      inSliceAbort,
+      siblingCompletion: {
+        laneIds: managedLaneIds,
+        complete: siblingComplete,
+      },
       controller: {
         pid: controllerPid,
         killedWith: "SIGKILL",
+        exitCode: controllerExitCode,
         reaped: controllerReaped,
       },
-      takeover: { exitCode: takeover.exitCode },
-      release: { exitCode: release.exitCode },
-      unobservedWindow: {
-        exited: goneBeforeResume,
-        live: aliveBeforeResume,
+      resumeAfterControllerLoss: {
+        exitCode: resumeAfterLoss.exitCode,
+        ownedRuntimeState: ownedAfterLoss.runtimeState,
+        ownedControlMode: ownedAfterLoss.controlMode,
+        releaseRuntimeState: releaseAfterLoss.runtimeState,
+        releaseControlMode: releaseAfterLoss.controlMode,
       },
-      notFinishedAfterFirstResume: {
-        exitCode: firstResume.exitCode,
-        controllerEpoch: afterFirstResume.controllerEpoch,
-        longLane: {
-          laneId: c.longLaneId,
-          runtimeState: longAfterFirstResume.runtimeState,
-          liveAt: longAfterFirstResume.liveAt,
-        },
-        finishStatus: afterFirstResume.finishStatus,
+      inspectEvidence: inspectCollected,
+      release: {
+        exitCode: release.exitCode,
+        laneId: c.releaseLaneId,
       },
-      inspectCollected,
-      finishedAfterInspect: {
-        exitCode: inspect.exitCode,
-        finishStatus: afterInspect.finishStatus,
-        breakdown: afterInspect.breakdown,
-      },
-      finishedAfterRelease: {
-        exitCode: secondResume.exitCode,
-        finishStatus: finished.finishStatus,
-        breakdown: finished.breakdown,
-      },
+      postReleaseDrive,
+      finishStatus: finished.finishStatus,
       lanes: {
-        afterFirstResume: laneStates(afterFirstResume),
+        afterTakeoverDrive: laneStates(afterTakeoverDrive),
+        afterControllerLossResume: laneStates(afterLossResume),
         afterInspect: laneStates(afterInspect),
-        afterRelease: laneStates(afterRelease),
         finished: laneStates(finished),
       },
       ok: true,
     };
-    await Bun.write(
-      join(c.evidenceDir, "smoke-result.json"),
-      `${JSON.stringify(report, null, 2)}\n`,
-    );
+    await Bun.write(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+
+    await closeHerdrTab(tabId);
+    tabClosed = true;
+    line(`smoke-result path=${reportPath}`);
     line("FLOW_TAKEOVER_SMOKE_DONE=0");
   } finally {
-    if (!controllerReaped && realPidIsAlive(controllerPid)) {
+    if (
+      controller !== null &&
+      !controllerReaped &&
+      realPidIsAlive(controller.pid)
+    ) {
       controller.kill("SIGKILL");
       await controller.exited;
+    }
+    if (tabId !== null && !tabClosed) {
+      try {
+        await closeHerdrTab(tabId);
+      } catch (error) {
+        line(
+          `FLOW_TAKEOVER_SMOKE_CLEANUP_ERROR: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
     }
   }
 }
 
 async function main(): Promise<void> {
-  if (process.argv.includes("__dispatch__")) {
-    await dispatchPhase();
+  if (process.argv.includes("__drive__")) {
+    await drivePhase();
     return;
   }
   await parentPhase();
@@ -467,7 +699,9 @@ async function main(): Promise<void> {
 
 main().catch((error) => {
   line(
-    `FLOW_TAKEOVER_SMOKE_ERROR: ${error instanceof Error ? error.message : String(error)}`,
+    `FLOW_TAKEOVER_SMOKE_ERROR: ${
+      error instanceof Error ? error.message : String(error)
+    }`,
   );
   process.exitCode = 2;
 });

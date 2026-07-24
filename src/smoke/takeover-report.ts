@@ -70,3 +70,62 @@ export function summarizeInspectCollection(
     },
   };
 }
+
+interface InSliceAbortInput {
+  readonly waitStarted: boolean;
+  readonly targetWaitCount: number;
+  readonly controllerThrew: boolean;
+  readonly ownedRuntimeState: RuntimeState;
+  readonly ownedControlMode: ControlMode;
+  readonly siblingComplete: boolean;
+}
+
+export interface InSliceAbortSummary extends InSliceAbortInput {
+  readonly noFurtherWait: true;
+}
+
+export function summarizeInSliceAbort(
+  input: InSliceAbortInput,
+): InSliceAbortSummary {
+  if (
+    !input.waitStarted ||
+    input.targetWaitCount !== 1 ||
+    input.controllerThrew ||
+    input.ownedRuntimeState !== "running" ||
+    input.ownedControlMode !== "human_owned" ||
+    !input.siblingComplete
+  ) {
+    throw new Error("smoke did not prove an in-slice ownership abort");
+  }
+  return {
+    ...input,
+    noFurtherWait: true,
+  };
+}
+
+interface PostReleaseDriveInput {
+  readonly wasRunningBeforeRelease: boolean;
+  readonly waitStarted: boolean;
+  readonly targetWaitCount: number;
+  readonly controllerThrew: boolean;
+  readonly runtimeState: RuntimeState;
+  readonly exitCode: number | null;
+}
+
+export type PostReleaseDriveSummary = PostReleaseDriveInput;
+
+export function summarizePostReleaseDrive(
+  input: PostReleaseDriveInput,
+): PostReleaseDriveSummary {
+  if (
+    !input.wasRunningBeforeRelease ||
+    !input.waitStarted ||
+    input.targetWaitCount < 1 ||
+    input.controllerThrew ||
+    input.runtimeState !== "exited" ||
+    input.exitCode !== 0
+  ) {
+    throw new Error("smoke did not prove post-release managed drive");
+  }
+  return { ...input };
+}
