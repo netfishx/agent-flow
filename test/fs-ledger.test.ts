@@ -4,6 +4,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  rename,
   rm,
   symlink,
   unlink,
@@ -19,6 +20,7 @@ import { reduce } from "../src/runtime/reducer.ts";
 
 const roots: string[] = [];
 const noSleep = async (): Promise<void> => {};
+const fixedNonce = (nonce: string): (() => string) => () => nonce;
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true })));
@@ -268,30 +270,45 @@ type CommitLockPhase = "acquired" | "before-release";
 type CommitLockInstallTarget = "lock" | "reclaim-guard";
 type CommitReclaimPhase = "after-dead-guard-read" | "before-lock-replace";
 
-class PausingBeforeAppendLedger extends FsLedger {
+class PausingStableReplayLedger extends FsLedger {
   private resolveReached!: () => void;
-  private resumeAppend!: () => void;
+  private resumeReplay!: () => void;
   readonly reached = new Promise<void>((resolve) => {
     this.resolveReached = resolve;
   });
-  private readonly appendResumed = new Promise<void>((resolve) => {
-    this.resumeAppend = resolve;
+  private readonly replayResumed = new Promise<void>((resolve) => {
+    this.resumeReplay = resolve;
   });
   private paused = false;
 
-  constructor(root: string) {
-    super(root, (pid) => pid === process.pid, noSleep);
+  constructor(root: string, nonce: string) {
+    super(
+      root,
+      (pid) => pid === process.pid,
+      noSleep,
+      fixedNonce(nonce),
+    );
   }
 
-  protected override async beforeAppendPhase(): Promise<void> {
+  protected override async afterStableReplayPhase(): Promise<void> {
     if (this.paused) return;
     this.paused = true;
     this.resolveReached();
-    await this.appendResumed;
+    await this.replayResumed;
   }
 
   resume(): void {
-    this.resumeAppend();
+    this.resumeReplay();
+  }
+}
+
+class MutexBypassedStableReplayLedger extends PausingStableReplayLedger {
+  protected override async withCommitLock(
+    _runDir: string,
+    _runId: string,
+    commit: () => Promise<void>,
+  ): Promise<void> {
+    await commit();
   }
 }
 
@@ -310,8 +327,9 @@ class PausingCommitLockInstallLedger extends FsLedger {
     root: string,
     isPidAlive: (pid: number) => boolean = (pid) => pid === process.pid,
     private readonly pauseAt: CommitLockInstallTarget = "lock",
+    nonce = "install-nonce",
   ) {
-    super(root, isPidAlive, noSleep);
+    super(root, isPidAlive, noSleep, fixedNonce(nonce));
   }
 
   protected override async afterCommitLockTempPhase(
@@ -344,8 +362,9 @@ class PausingCommitLockLedger extends FsLedger {
     root: string,
     isPidAlive: (pid: number) => boolean = (pid) => pid === process.pid,
     private readonly pauseAt: CommitLockPhase = "acquired",
+    nonce = "holder-nonce",
   ) {
-    super(root, isPidAlive, noSleep);
+    super(root, isPidAlive, noSleep, fixedNonce(nonce));
   }
 
   protected override async afterCommitLockPhase(
@@ -390,8 +409,9 @@ class PausingCommitReclaimLedger extends FsLedger {
     root: string,
     isPidAlive: (pid: number) => boolean,
     private readonly pauseAt: CommitReclaimPhase,
+    nonce = "reclaimer-nonce",
   ) {
-    super(root, isPidAlive, noSleep);
+    super(root, isPidAlive, noSleep, fixedNonce(nonce));
   }
 
   protected override async afterCommitReclaimPhase(
@@ -998,12 +1018,39 @@ describe("FsLedger public capabilities", () => {
     ).toBe(2);
   });
 
-  test("serializes the stale-validByteLength interleave before append", async () => {
+  test("without the mutex, two stable replays capture one length and silently lose an event", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root).commit(started());
+    const firstEvent = registered();
+    const secondEvent = {
+      ...registered(),
+      at: 21,
+    };
+    const first = new MutexBypassedStableReplayLedger(root, "bypass-first");
+    const second = new MutexBypassedStableReplayLedger(root, "bypass-second");
+
+    const firstCommit = first.commit(firstEvent);
+    const secondCommit = second.commit(secondEvent);
+    await Promise.all([first.reached, second.reached]);
+    first.resume();
+    await expect(firstCommit).resolves.toBeUndefined();
+    second.resume();
+    await expect(secondCommit).resolves.toBeUndefined();
+
+    const events = (
+      await readFile(join(root, "runs", "run-fs", "events.jsonl"), "utf8")
+    ).trim().split("\n").map((line) => JSON.parse(line) as RunEvent);
+    expect(events).toEqual([started(), secondEvent]);
+    expect(events).not.toContainEqual(firstEvent);
+    expect((await new FsLedger(root).load("run-fs"))!.lastAppliedSequence).toBe(2);
+  });
+
+  test("the mutex serializes the same stable-replay interleave without loss", async () => {
     const root = await tempRoot();
     await new FsLedger(root).commit(started());
     const committedEvent = registered();
     const losingEvent = { ...registered(), at: 21 };
-    const paused = new PausingBeforeAppendLedger(root);
+    const paused = new PausingStableReplayLedger(root, "stable-holder");
 
     const firstCommit = paused.commit(committedEvent);
     await paused.reached;
@@ -1012,6 +1059,7 @@ describe("FsLedger public capabilities", () => {
         root,
         (pid) => pid === process.pid,
         noSleep,
+        fixedNonce("stable-contender"),
       ).commit(losingEvent),
     ).rejects.toThrow('commit lock for run "run-fs" is contended');
     paused.resume();
@@ -1054,19 +1102,25 @@ describe("FsLedger public capabilities", () => {
     await mkdir(runDir, { recursive: true });
     await writeFile(
       join(runDir, "commit.lock"),
-      `${JSON.stringify({ schemaVersion: 1, pid: 101, generation: 0 })}\n`,
+      `${JSON.stringify({ schemaVersion: 1, pid: 101, nonce: "dead-lock" })}\n`,
       "utf8",
     );
     const reclaimer = new PausingCommitLockLedger(
       root,
       (pid) => pid === process.pid,
+      "acquired",
+      "reclaimed-lock",
     );
 
     const reclaimedCommit = reclaimer.commit(started());
     await reclaimer.reached;
     expect(
       JSON.parse(await readFile(join(runDir, "commit.lock"), "utf8")),
-    ).toEqual({ schemaVersion: 1, pid: process.pid, generation: 1 });
+    ).toEqual({
+      schemaVersion: 1,
+      pid: process.pid,
+      nonce: "reclaimed-lock",
+    });
     reclaimer.resume();
     await reclaimedCommit;
 
@@ -1075,11 +1129,16 @@ describe("FsLedger public capabilities", () => {
     await mkdir(liveRunDir, { recursive: true });
     await writeFile(
       join(liveRunDir, "commit.lock"),
-      `${JSON.stringify({ schemaVersion: 1, pid: 202, generation: 0 })}\n`,
+      `${JSON.stringify({ schemaVersion: 1, pid: 202, nonce: "live-lock" })}\n`,
       "utf8",
     );
     await expect(
-      new FsLedger(liveRoot, (pid) => pid === 202, noSleep).commit(started()),
+      new FsLedger(
+        liveRoot,
+        (pid) => pid === 202,
+        noSleep,
+        fixedNonce("contender"),
+      ).commit(started()),
     ).rejects.toThrow('commit lock for run "run-fs" is contended');
   });
 
@@ -1089,12 +1148,12 @@ describe("FsLedger public capabilities", () => {
     await mkdir(runDir, { recursive: true });
     await writeFile(
       join(runDir, "commit.lock"),
-      `${JSON.stringify({ schemaVersion: 1, pid: 101, generation: 5 })}\n`,
+      `${JSON.stringify({ schemaVersion: 1, pid: 101, nonce: "dead-lock" })}\n`,
       "utf8",
     );
     await writeFile(
-      join(runDir, "commit.lock.reclaim.gen-5.ord-0"),
-      `${JSON.stringify({ schemaVersion: 1, pid: 102, generation: 5 })}\n`,
+      join(runDir, "commit.lock.reclaim.dead-lock.ord-0"),
+      `${JSON.stringify({ schemaVersion: 1, pid: 102, nonce: "dead-lock" })}\n`,
       "utf8",
     );
     const isPidAlive = (pid: number) => pid === process.pid;
@@ -1102,11 +1161,13 @@ describe("FsLedger public capabilities", () => {
       root,
       isPidAlive,
       "after-dead-guard-read",
+      "stale-reclaimer",
     );
     const winner = new PausingCommitLockLedger(
       root,
       isPidAlive,
       "before-release",
+      "winning-reclaimer",
     );
 
     const staleCommit = staleReader.commit(started());
@@ -1123,7 +1184,11 @@ describe("FsLedger public capabilities", () => {
     );
     expect(
       JSON.parse(await readFile(join(runDir, "commit.lock"), "utf8")),
-    ).toEqual({ schemaVersion: 1, pid: process.pid, generation: 6 });
+    ).toEqual({
+      schemaVersion: 1,
+      pid: process.pid,
+      nonce: "winning-reclaimer",
+    });
     winner.resume();
     const results = await Promise.allSettled([staleCommit, winningCommit]);
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(
@@ -1142,15 +1207,20 @@ describe("FsLedger public capabilities", () => {
     const deadHolder = `${JSON.stringify({
       schemaVersion: 1,
       pid: 101,
-      generation: 0,
+      nonce: "dead-lock",
     })}\n`;
     await writeFile(join(runDir, "commit.lock"), deadHolder, "utf8");
     await writeFile(
-      join(runDir, "commit.lock.reclaim.gen-0.ord-0"),
-      `${JSON.stringify({ schemaVersion: 1, pid: 202, generation: 0 })}\n`,
+      join(runDir, "commit.lock.reclaim.dead-lock.ord-0"),
+      `${JSON.stringify({ schemaVersion: 1, pid: 202, nonce: "dead-lock" })}\n`,
       "utf8",
     );
-    const contender = new FsLedger(root, (pid) => pid === 202, noSleep);
+    const contender = new FsLedger(
+      root,
+      (pid) => pid === 202,
+      noSleep,
+      fixedNonce("contender"),
+    );
 
     await expect(contender.commit(started())).rejects.toThrow(
       'commit lock for run "run-fs" is contended',
@@ -1160,18 +1230,13 @@ describe("FsLedger public capabilities", () => {
     );
   });
 
-  test("supersedes a dead reclaim ordinal guard without deleting it", async () => {
+  test("stale live reclaim guards cannot block a later lock lifetime", async () => {
     const root = await tempRoot();
     const runDir = join(root, "runs", "run-fs");
     await mkdir(runDir, { recursive: true });
     await writeFile(
       join(runDir, "commit.lock"),
-      `${JSON.stringify({ schemaVersion: 1, pid: 101, generation: 3 })}\n`,
-      "utf8",
-    );
-    await writeFile(
-      join(runDir, "commit.lock.reclaim.gen-3.ord-0"),
-      `${JSON.stringify({ schemaVersion: 1, pid: 202, generation: 3 })}\n`,
+      `${JSON.stringify({ schemaVersion: 1, pid: 101, nonce: "n1" })}\n`,
       "utf8",
     );
 
@@ -1180,15 +1245,75 @@ describe("FsLedger public capabilities", () => {
         root,
         (pid) => pid === process.pid,
         noSleep,
+        fixedNonce("n1-replacement"),
+      ).commit(started()),
+    ).resolves.toBeUndefined();
+    expect(
+      await readFile(join(runDir, "commit.lock.reclaim.n1.ord-0"), "utf8"),
+    ).toContain(`"pid":${process.pid}`);
+
+    const nextOwner = new PausingCommitLockLedger(
+      root,
+      (pid) => pid === process.pid,
+      "acquired",
+      "n2",
+    );
+    const ownerCommit = nextOwner.commit(registered());
+    await nextOwner.reached;
+    expect(
+      JSON.parse(await readFile(join(runDir, "commit.lock"), "utf8")),
+    ).toEqual({ schemaVersion: 1, pid: process.pid, nonce: "n2" });
+
+    await expect(
+      new FsLedger(
+        root,
+        () => false,
+        noSleep,
+        fixedNonce("n2-replacement"),
+      ).commit(registered()),
+    ).resolves.toBeUndefined();
+    expect(
+      await readFile(join(runDir, "commit.lock.reclaim.n1.ord-0"), "utf8"),
+    ).toContain(`"pid":${process.pid}`);
+    expect(
+      await readFile(join(runDir, "commit.lock.reclaim.n2.ord-0"), "utf8"),
+    ).toContain(`"nonce":"n2"`);
+
+    nextOwner.resume();
+    await expect(ownerCommit).resolves.toBeUndefined();
+    expect((await new FsLedger(root).load("run-fs"))!.lastAppliedSequence).toBe(2);
+  });
+
+  test("supersedes a dead reclaim ordinal guard without deleting it", async () => {
+    const root = await tempRoot();
+    const runDir = join(root, "runs", "run-fs");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(
+      join(runDir, "commit.lock"),
+      `${JSON.stringify({ schemaVersion: 1, pid: 101, nonce: "dead-lock" })}\n`,
+      "utf8",
+    );
+    await writeFile(
+      join(runDir, "commit.lock.reclaim.dead-lock.ord-0"),
+      `${JSON.stringify({ schemaVersion: 1, pid: 202, nonce: "dead-lock" })}\n`,
+      "utf8",
+    );
+
+    await expect(
+      new FsLedger(
+        root,
+        (pid) => pid === process.pid,
+        noSleep,
+        fixedNonce("replacement"),
       ).commit(started()),
     ).resolves.toBeUndefined();
     expect(
       (await readdir(runDir)).filter((name) =>
-        name.startsWith("commit.lock.reclaim.gen-3.ord-")
+        name.startsWith("commit.lock.reclaim.dead-lock.ord-")
       ).sort(),
     ).toEqual([
-      "commit.lock.reclaim.gen-3.ord-0",
-      "commit.lock.reclaim.gen-3.ord-1",
+      "commit.lock.reclaim.dead-lock.ord-0",
+      "commit.lock.reclaim.dead-lock.ord-1",
     ]);
     expect((await new FsLedger(root).load("run-fs"))!.lastAppliedSequence).toBe(1);
   });
@@ -1199,17 +1324,22 @@ describe("FsLedger public capabilities", () => {
     await mkdir(runDir, { recursive: true });
     await writeFile(
       join(runDir, "commit.lock"),
-      `${JSON.stringify({ schemaVersion: 1, pid: 101, generation: 0 })}\n`,
+      `${JSON.stringify({ schemaVersion: 1, pid: 101, nonce: "dead-lock" })}\n`,
       "utf8",
     );
     await writeFile(
-      join(runDir, "commit.lock.reclaim.gen-0.ord-01"),
-      `${JSON.stringify({ schemaVersion: 1, pid: 202, generation: 0 })}\n`,
+      join(runDir, "commit.lock.reclaim.dead-lock.ord-01"),
+      `${JSON.stringify({ schemaVersion: 1, pid: 202, nonce: "dead-lock" })}\n`,
       "utf8",
     );
 
     await expect(
-      new FsLedger(root, () => false, noSleep).commit(started()),
+      new FsLedger(
+        root,
+        () => false,
+        noSleep,
+        fixedNonce("replacement"),
+      ).commit(started()),
     ).rejects.toThrow(/corrupt commit lock reclaim guard ordinal/);
   });
 
@@ -1229,7 +1359,7 @@ describe("FsLedger public capabilities", () => {
       );
       expect(temps).toHaveLength(1);
       expect(JSON.parse(await readFile(join(runDir, temps[0]!), "utf8"))).toEqual(
-        { schemaVersion: 1, pid: process.pid, generation: 0 },
+        { schemaVersion: 1, pid: process.pid, nonce: "install-nonce" },
       );
     } finally {
       ledger.resume();
@@ -1243,13 +1373,14 @@ describe("FsLedger public capabilities", () => {
     await mkdir(runDir, { recursive: true });
     await writeFile(
       join(runDir, "commit.lock"),
-      `${JSON.stringify({ schemaVersion: 1, pid: 101, generation: 0 })}\n`,
+      `${JSON.stringify({ schemaVersion: 1, pid: 101, nonce: "dead-lock" })}\n`,
       "utf8",
     );
     const ledger = new PausingCommitLockInstallLedger(
       root,
       (pid) => pid === process.pid,
       "reclaim-guard",
+      "replacement",
     );
     const commit = ledger.commit(started());
     await ledger.reached;
@@ -1257,7 +1388,7 @@ describe("FsLedger public capabilities", () => {
     try {
       expect(
         (await readdir(runDir)).filter((name) =>
-          name.startsWith("commit.lock.reclaim.gen-0.ord-")
+          name.startsWith("commit.lock.reclaim.dead-lock.ord-")
         ),
       ).toEqual([]);
       const temps = (await readdir(runDir)).filter((name) =>
@@ -1265,7 +1396,7 @@ describe("FsLedger public capabilities", () => {
       );
       expect(temps).toHaveLength(1);
       expect(JSON.parse(await readFile(join(runDir, temps[0]!), "utf8"))).toEqual(
-        { schemaVersion: 1, pid: process.pid, generation: 0 },
+        { schemaVersion: 1, pid: process.pid, nonce: "dead-lock" },
       );
     } finally {
       ledger.resume();
@@ -1273,9 +1404,9 @@ describe("FsLedger public capabilities", () => {
     await expect(commit).resolves.toBeUndefined();
     expect(
       (await readdir(runDir)).filter((name) =>
-        name.startsWith("commit.lock.reclaim.gen-0.ord-")
+        name.startsWith("commit.lock.reclaim.dead-lock.ord-")
       ),
-    ).toEqual(["commit.lock.reclaim.gen-0.ord-0"]);
+    ).toEqual(["commit.lock.reclaim.dead-lock.ord-0"]);
   });
 
   test("fails closed on a corrupt commit lock", async () => {
@@ -1336,6 +1467,37 @@ describe("FsLedger public capabilities", () => {
     ).rejects.toThrow(
       /commit failed: injected append failure; commit lock release failed:/,
     );
+  });
+
+  test("an owner does not release a lock with a different nonce", async () => {
+    const root = await tempRoot();
+    const runDir = join(root, "runs", "run-fs");
+    const owner = new PausingCommitLockLedger(
+      root,
+      (pid) => pid === process.pid,
+      "before-release",
+      "owned-lock",
+    );
+    const commit = owner.commit(started());
+    await owner.reached;
+    const replacement = {
+      schemaVersion: 1,
+      pid: 202,
+      nonce: "replacement-lock",
+    };
+    const replacementTemp = join(runDir, ".replacement-commit-lock");
+    await writeFile(
+      replacementTemp,
+      `${JSON.stringify(replacement)}\n`,
+      "utf8",
+    );
+    await rename(replacementTemp, join(runDir, "commit.lock"));
+
+    owner.resume();
+    await expect(commit).resolves.toBeUndefined();
+    expect(
+      JSON.parse(await readFile(join(runDir, "commit.lock"), "utf8")),
+    ).toEqual(replacement);
   });
 
   test("resolves after a post-commit lock-release failure", async () => {

@@ -9,9 +9,10 @@ import {
   writeFile,
   type FileHandle,
 } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { RunEvent } from "./events.ts";
 import { assertHandleId } from "./ids.ts";
 import type { LeaseHandle, Ledger } from "./ledger.ts";
@@ -46,7 +47,7 @@ interface ControllerTakeoverMarker {
 interface CommitLockRecord {
   readonly schemaVersion: 1;
   readonly pid: number;
-  readonly generation: number;
+  readonly nonce: string;
 }
 
 type Sleep = (milliseconds: number) => Promise<void>;
@@ -174,6 +175,7 @@ export class FsLedger implements Ledger {
     private readonly root: string,
     private readonly isPidAlive: (pid: number) => boolean = realPidIsAlive,
     private readonly sleep: Sleep = realSleep,
+    private readonly nonceGen: () => string = randomUUID,
   ) {
     if (root.length === 0) throw new Error("FsLedger root must not be empty");
   }
@@ -187,6 +189,7 @@ export class FsLedger implements Ledger {
       return this.withCommitLock(runDir, event.runId, async () => {
         const eventFile = join(runDir, "events.jsonl");
         const replayed = await this.readStableReplay(event.runId);
+        await this.afterStableReplayPhase(event.runId);
         const duplicate = replayed.byEventId.get(event.eventId);
         if (duplicate) {
           if (!isDeepStrictEqual(duplicate, event)) {
@@ -267,7 +270,6 @@ export class FsLedger implements Ledger {
           }
           const originalSize = replayed.validByteLength;
           try {
-            await this.beforeAppendPhase(event.runId);
             if (currentSize > originalSize) {
               await handle.truncate(originalSize);
               await handle.sync();
@@ -725,23 +727,22 @@ export class FsLedger implements Ledger {
     return join(this.root, "runs", runId);
   }
 
-  private async withCommitLock(
+  protected async withCommitLock(
     runDir: string,
     runId: string,
     commit: () => Promise<void>,
   ): Promise<void> {
-    let acquired = false;
+    let owned: CommitLockRecord | undefined;
     let commitError: unknown;
     try {
-      await this.acquireCommitLock(runDir, runId);
-      acquired = true;
+      owned = await this.acquireCommitLock(runDir, runId);
       await this.afterCommitLockPhase(runId, "acquired");
       await commit();
     } catch (error) {
       commitError = error;
       throw error;
     } finally {
-      if (acquired) {
+      if (owned) {
         let cleanupError: unknown;
         try {
           await this.afterCommitLockPhase(runId, "before-release");
@@ -749,7 +750,7 @@ export class FsLedger implements Ledger {
           cleanupError = error;
         }
         try {
-          await this.releaseCommitLock(runDir);
+          await this.releaseCommitLock(runDir, owned.nonce);
         } catch (releaseError) {
           cleanupError = cleanupError
             ? new Error(
@@ -775,31 +776,26 @@ export class FsLedger implements Ledger {
   private async acquireCommitLock(
     runDir: string,
     runId: string,
-  ): Promise<void> {
+  ): Promise<CommitLockRecord> {
     const lockFile = join(runDir, COMMIT_LOCK_FILE);
-    const record: CommitLockRecord = {
-      schemaVersion: 1,
-      pid: process.pid,
-      generation: 0,
-    };
+    const record = this.nextCommitLockRecord();
     for (
       let attempt = 0;
       attempt <= COMMIT_LOCK_BACKOFF_MS.length;
       attempt++
     ) {
-      if (await this.createCommitLock(runDir, lockFile, runId, record)) return;
+      if (await this.createCommitLock(runDir, lockFile, runId, record)) {
+        return record;
+      }
       const holder = await this.readCommitLock(lockFile, runId);
-      if (
-        holder &&
-        !this.isPidAlive(holder.pid) &&
-        (await this.reclaimCommitLock(
+      if (holder && !this.isPidAlive(holder.pid)) {
+        const reclaimed = await this.reclaimCommitLock(
           runDir,
           lockFile,
           runId,
           holder,
-        ))
-      ) {
-        return;
+        );
+        if (reclaimed) return reclaimed;
       }
       const backoff = COMMIT_LOCK_BACKOFF_MS[attempt];
       if (backoff === undefined) {
@@ -807,6 +803,15 @@ export class FsLedger implements Ledger {
       }
       await this.sleep(backoff);
     }
+    throw new Error(`commit lock for run "${runId}" is contended`);
+  }
+
+  private nextCommitLockRecord(): CommitLockRecord {
+    const nonce = this.nonceGen();
+    if (typeof nonce !== "string" || nonce.length === 0) {
+      throw new Error("commit lock nonce must not be empty");
+    }
+    return { schemaVersion: 1, pid: process.pid, nonce };
   }
 
   private async createCommitLock(
@@ -893,8 +898,8 @@ export class FsLedger implements Ledger {
       (parsed as { schemaVersion?: unknown }).schemaVersion !== 1 ||
       !Number.isSafeInteger((parsed as { pid?: unknown }).pid) ||
       (parsed as { pid: number }).pid <= 0 ||
-      !Number.isSafeInteger((parsed as { generation?: unknown }).generation) ||
-      (parsed as { generation: number }).generation < 0
+      typeof (parsed as { nonce?: unknown }).nonce !== "string" ||
+      (parsed as { nonce: string }).nonce.length === 0
     ) {
       throw new Error(`corrupt commit lock for run "${runId}"`);
     }
@@ -906,15 +911,15 @@ export class FsLedger implements Ledger {
     lockFile: string,
     runId: string,
     observed: CommitLockRecord,
-  ): Promise<boolean> {
+  ): Promise<CommitLockRecord | null> {
     if (
       !(await this.acquireCommitLockReclaimGuard(
         runDir,
         runId,
-        observed.generation,
+        observed.nonce,
       ))
     ) {
-      return false;
+      return null;
     }
     await this.afterCommitReclaimPhase(runId, "before-lock-replace");
     const current = await this.readCommitLock(lockFile, runId);
@@ -923,29 +928,22 @@ export class FsLedger implements Ledger {
       !isDeepStrictEqual(current, observed) ||
       this.isPidAlive(current.pid)
     ) {
-      return false;
+      return null;
     }
-    const nextGeneration = observed.generation + 1;
-    if (!Number.isSafeInteger(nextGeneration)) {
-      throw new Error(`corrupt commit lock for run "${runId}"`);
-    }
-    await this.replaceCommitLock(runDir, lockFile, {
-      schemaVersion: 1,
-      pid: process.pid,
-      generation: nextGeneration,
-    });
-    return true;
+    const replacement = this.nextCommitLockRecord();
+    await this.replaceCommitLock(runDir, lockFile, replacement);
+    return replacement;
   }
 
   private async acquireCommitLockReclaimGuard(
     runDir: string,
     runId: string,
-    generation: number,
+    nonce: string,
   ): Promise<boolean> {
     const record: CommitLockRecord = {
       schemaVersion: 1,
       pid: process.pid,
-      generation,
+      nonce,
     };
     for (
       let attempt = 0;
@@ -955,7 +953,7 @@ export class FsLedger implements Ledger {
       const guards = await this.readCommitLockReclaimGuards(
         runDir,
         runId,
-        generation,
+        nonce,
       );
       const highest = guards.at(-1);
       if (
@@ -976,7 +974,7 @@ export class FsLedger implements Ledger {
       }
       const guardFile = join(
         runDir,
-        `commit.lock.reclaim.gen-${generation}.ord-${ordinal}`,
+        `commit.lock.reclaim.${nonce}.ord-${ordinal}`,
       );
       if (
         await this.installCommitLockRecord(
@@ -996,35 +994,29 @@ export class FsLedger implements Ledger {
   private async readCommitLockReclaimGuards(
     runDir: string,
     runId: string,
-    generation: number,
+    nonce: string,
   ): Promise<Array<{ ordinal: number; record: CommitLockRecord }>> {
     const guards: Array<{
       ordinal: number;
       record: CommitLockRecord;
     }> = [];
-    const pattern =
-      /^commit\.lock\.reclaim\.gen-(0|[1-9]\d*)\.ord-(0|[1-9]\d*)$/;
+    const prefix = `commit.lock.reclaim.${nonce}.ord-`;
     for (const name of await readdir(runDir)) {
-      if (!name.startsWith("commit.lock.reclaim.gen-")) continue;
-      const match = pattern.exec(name);
-      if (!match) {
+      if (!name.startsWith(prefix)) continue;
+      const suffix = name.slice(prefix.length);
+      if (!/^(?:0|[1-9]\d*)$/.test(suffix)) {
         throw new Error(
           `corrupt commit lock reclaim guard ordinal for run "${runId}"`,
         );
       }
-      const guardGeneration = Number(match[1]);
-      const ordinal = Number(match[2]);
-      if (
-        !Number.isSafeInteger(guardGeneration) ||
-        !Number.isSafeInteger(ordinal)
-      ) {
+      const ordinal = Number(suffix);
+      if (!Number.isSafeInteger(ordinal)) {
         throw new Error(
           `corrupt commit lock reclaim guard ordinal for run "${runId}"`,
         );
       }
-      if (guardGeneration !== generation) continue;
       const record = await this.readCommitLock(join(runDir, name), runId);
-      if (!record || record.generation !== generation) {
+      if (!record || record.nonce !== nonce) {
         throw new Error(`corrupt commit lock reclaim guard for run "${runId}"`);
       }
       guards.push({ ordinal, record });
@@ -1061,8 +1053,18 @@ export class FsLedger implements Ledger {
     }
   }
 
-  protected async releaseCommitLock(runDir: string): Promise<void> {
-    await unlink(join(runDir, COMMIT_LOCK_FILE));
+  protected async releaseCommitLock(
+    runDir: string,
+    ownedNonce: string,
+  ): Promise<void> {
+    const lockFile = join(runDir, COMMIT_LOCK_FILE);
+    const current = await this.readCommitLock(lockFile, basename(runDir));
+    if (!current || current.nonce !== ownedNonce) return;
+    try {
+      await unlink(lockFile);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
   }
 
   private async syncDirectory(path: string): Promise<void> {
@@ -1153,8 +1155,8 @@ export class FsLedger implements Ledger {
     _target: "lock" | "reclaim-guard",
   ): Promise<void> {}
 
-  /** Test seam for the captured replay immediately before append/truncate. */
-  protected async beforeAppendPhase(_runId: string): Promise<void> {}
+  /** Test seam after a commit captures its stable replay. */
+  protected async afterStableReplayPhase(_runId: string): Promise<void> {}
 
   /** Test seam for deterministically interleaving commit-lock reclaimers. */
   protected async afterCommitReclaimPhase(
