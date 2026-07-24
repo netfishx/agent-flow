@@ -398,6 +398,9 @@ function spawnTrackedController(options: {
 
 async function parentPhase(): Promise<void> {
   const c = config();
+  // config() generates a fresh random runId when FLOW_RUN_ID is unset; pin it
+  // so setupRun() and the drive children all resolve the SAME run.
+  process.env.FLOW_RUN_ID = c.runId;
   await mkdir(c.evidenceDir, { recursive: true });
   line("== agent-flow live ownership smoke ==");
   line(`runId=${c.runId} evidence=${c.evidenceDir}`);
