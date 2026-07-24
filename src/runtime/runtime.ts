@@ -115,6 +115,13 @@ function runnerTermination(lane: LaneView): Pick<
   }
 }
 
+class LaneTerminalAnomaly extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LaneTerminalAnomaly";
+  }
+}
+
 /**
  * Raised after durable run creation when pre-dispatch registration or physical
  * dispatch fails. Any lanes that did start remain controllable via `runId`.
@@ -355,10 +362,7 @@ export class WorkflowRuntime {
       try {
         await this.refreshLane(runId, laneId);
       } catch (error) {
-        const lane = this.getLane(this.getRun(runId), laneId);
-        if (lane.runtimeState !== "crashed" && lane.runtimeState !== "lost") {
-          throw error;
-        }
+        if (!(error instanceof LaneTerminalAnomaly)) throw error;
       }
       run = this.getRun(runId);
     }
@@ -493,10 +497,7 @@ export class WorkflowRuntime {
         try {
           await this.awaitLane(runId, laneId, perLaneTimeoutMs);
         } catch (error) {
-          const lane = this.getLane(this.getRun(runId), laneId);
-          if (lane.runtimeState !== "crashed" && lane.runtimeState !== "lost") {
-            throw error;
-          }
+          if (!(error instanceof LaneTerminalAnomaly)) throw error;
         }
       }
       await this.finishIfTerminal(runId);
@@ -665,6 +666,8 @@ export class WorkflowRuntime {
       lane = this.getLane(this.getRun(runId), laneId);
       if (outcome.matched) {
         const gone = await this.confirmProcessGone({ id: lane.paneId });
+        await this.reloadFromLedger(runId);
+        lane = this.getLane(this.getRun(runId), laneId);
         if (!gone) {
           if (this.autoControlSuppressed(lane)) {
             return this.inspectLaneResult(runId, laneId);
@@ -681,6 +684,7 @@ export class WorkflowRuntime {
         }
       } else {
         await this.refreshLane(runId, laneId);
+        await this.reloadFromLedger(runId);
         lane = this.getLane(this.getRun(runId), laneId);
       }
 
@@ -864,7 +868,7 @@ export class WorkflowRuntime {
   }
 
   private async refreshLane(runId: string, laneId: string): Promise<void> {
-    const lane = this.getLane(this.getRun(runId), laneId);
+    let lane = this.getLane(this.getRun(runId), laneId);
     if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
       if (
         (lane.contractEvaluatedAt === null || lane.verificationRecordedAt === null)
@@ -877,6 +881,16 @@ export class WorkflowRuntime {
       return;
     }
     const info = await this.deps.adapter.processInfo({ id: lane.paneId });
+    await this.reloadFromLedger(runId);
+    lane = this.getLane(this.getRun(runId), laneId);
+    if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
+      if (
+        (lane.contractEvaluatedAt === null || lane.verificationRecordedAt === null)
+      ) {
+        await this.recordTerminalFacts(runId, laneId, lane.exitCode);
+      }
+      return;
+    }
     if (info.foregroundProcessGroupId === info.shellPid) {
       await this.finalizeLane(runId, laneId, false);
     } else {
@@ -933,11 +947,11 @@ export class WorkflowRuntime {
         finalizedLane.runtimeState === "lost" &&
         finalizedLane.lostCause === "dispatch-outcome-unknown"
       ) {
-        throw new Error(
+        throw new LaneTerminalAnomaly(
           `lane "${laneId}" was lost (dispatch-outcome-unknown): its process is gone without positive execution evidence or a sentinel`,
         );
       }
-      throw new Error(
+      throw new LaneTerminalAnomaly(
         `lane "${laneId}" produced no sentinel ${lane.sentinelToken} in its durable log`,
       );
     }

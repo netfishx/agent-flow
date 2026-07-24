@@ -15,7 +15,10 @@ import {
   FakeHerdrAdapter,
 } from "../src/herdr/fake-adapter.ts";
 import { FsLedger } from "../src/runtime/fs-ledger.ts";
-import type { RunEvent } from "../src/runtime/events.ts";
+import type {
+  RunEvent,
+  RunnerEvidence,
+} from "../src/runtime/events.ts";
 import type { LeaseHandle, Ledger } from "../src/runtime/ledger.ts";
 import type { RunView } from "../src/runtime/reducer.ts";
 import { WorkflowRuntime } from "../src/runtime/runtime.ts";
@@ -502,6 +505,127 @@ describe("flow CLI external behavior", () => {
       runId: handle.runId,
       laneId: "following",
       termination: "sentinel-exit",
+    });
+  });
+
+  test("inspect fails closed on evidence-write failure and completes facts on retry", async () => {
+    const root = await tempRoot();
+    const ledgerRoot = join(root, "ledger");
+    const cwd = join(root, "work");
+    const ledger = new FsLedger(ledgerRoot);
+    const clock = createClock(900);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "owned-crashed", exitCode: 1, emitSentinel: false }],
+    });
+    const source = new WorkflowRuntime({
+      adapter,
+      ledger: new DurableEventsWithoutLease(ledger),
+      clock: clock.now,
+      idgen: () => "run-inspect-evidence-failure",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await source.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd,
+      lanes: [{ laneId: "owned-crashed", steps: 1 }],
+    });
+    await source.confirmLaneStarted(handle.runId, "owned-crashed");
+    await source.takeoverLane(handle.runId, "owned-crashed");
+    adapter.finishLane("owned-crashed");
+    let failuresRemaining = 2;
+
+    class FailingEvidenceRuntime extends WorkflowRuntime {
+      protected override async writeRunnerEvidenceFile(
+        path: string,
+        evidence: RunnerEvidence,
+      ): Promise<void> {
+        if (failuresRemaining > 0) {
+          failuresRemaining -= 1;
+          throw new Error("injected evidence write failure");
+        }
+        await super.writeRunnerEvidenceFile(path, evidence);
+      }
+    }
+
+    const createFailingRuntime = (runtimeLedger: Ledger) =>
+      new FailingEvidenceRuntime({
+        adapter,
+        ledger: new RejectLeaseLedger(runtimeLedger),
+        clock: clock.now,
+        idgen: () => "unused",
+        readResultFile: adapter.readResultFile,
+        sleep: async () => {},
+      });
+    await expect(
+      createFailingRuntime(ledger).inspectWorkflow(handle.runId),
+    ).rejects.toThrow("injected evidence write failure");
+
+    const failedStdout = sink();
+    const failedStderr = sink();
+    const failedExitCode = await runFlowCli(
+      ["inspect", handle.runId],
+      failedStdout.output,
+      failedStderr.output,
+      {
+        environment: { ...process.env, FLOW_LEDGER_ROOT: ledgerRoot },
+        runtimeFactory: createFailingRuntime,
+      },
+    );
+    const incomplete = await ledger.load(handle.runId);
+
+    expect(failedExitCode).not.toBe(0);
+    expect(failedStdout.text()).toBe("");
+    expect(failedStderr.text()).toContain("injected evidence write failure");
+    expect(incomplete!.lanes["owned-crashed"]).toMatchObject({
+      runtimeState: "crashed",
+      verificationRecordedAt: null,
+      verificationState: "unverified",
+      evidenceFile: null,
+    });
+
+    const recoveredStdout = sink();
+    const recoveredStderr = sink();
+    const recoveredExitCode = await runFlowCli(
+      ["inspect", handle.runId],
+      recoveredStdout.output,
+      recoveredStderr.output,
+      {
+        environment: { ...process.env, FLOW_LEDGER_ROOT: ledgerRoot },
+        runtimeFactory: (runtimeLedger) =>
+          new WorkflowRuntime({
+            adapter,
+            ledger: new RejectLeaseLedger(runtimeLedger),
+            clock: clock.now,
+            idgen: () => "unused",
+            readResultFile: adapter.readResultFile,
+            sleep: async () => {},
+          }),
+      },
+    );
+    const recovered = await ledger.load(handle.runId);
+
+    expect(recoveredExitCode).toBe(0);
+    expect(recoveredStderr.text()).toBe("");
+    expect(recoveredStdout.text()).toContain("runtimeState=crashed");
+    expect(recovered!.lanes["owned-crashed"]).toMatchObject({
+      runtimeState: "crashed",
+      contractState: "violated",
+      verificationState: "failed",
+    });
+    expect(
+      JSON.parse(
+        await readFile(
+          recovered!.lanes["owned-crashed"]!.evidenceFile!,
+          "utf8",
+        ),
+      ),
+    ).toMatchObject({
+      runId: handle.runId,
+      laneId: "owned-crashed",
+      termination: "crashed",
     });
   });
 
