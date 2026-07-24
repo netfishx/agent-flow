@@ -129,3 +129,49 @@ export function summarizePostReleaseDrive(
   }
   return { ...input };
 }
+
+export interface OwnedLaneResumeObservation {
+  readonly laneId: string;
+  readonly waitForOutputCount: number;
+  readonly interruptPaneCount: number;
+  readonly controlMode: ControlMode;
+  readonly runtimeState: RuntimeState;
+  readonly processLive: boolean;
+}
+
+interface ControllerLossResumeInput {
+  readonly controllerThrew: boolean;
+  readonly ownedLanes: readonly OwnedLaneResumeObservation[];
+}
+
+export interface ControllerLossResumeSummary
+  extends ControllerLossResumeInput {
+  readonly reconciledWithoutDrive: true;
+}
+
+export function summarizeControllerLossResume(
+  input: ControllerLossResumeInput,
+): ControllerLossResumeSummary {
+  const laneIds = new Set(input.ownedLanes.map((lane) => lane.laneId));
+  if (
+    input.controllerThrew ||
+    input.ownedLanes.length !== 2 ||
+    laneIds.size !== 2 ||
+    input.ownedLanes.some(
+      (lane) =>
+        lane.waitForOutputCount !== 0 ||
+        lane.interruptPaneCount !== 0 ||
+        lane.controlMode !== "human_owned" ||
+        lane.runtimeState !== "running" ||
+        !lane.processLive,
+    )
+  ) {
+    throw new Error(
+      "smoke did not prove controller-loss reconcile without drive",
+    );
+  }
+  return {
+    ...input,
+    reconciledWithoutDrive: true,
+  };
+}

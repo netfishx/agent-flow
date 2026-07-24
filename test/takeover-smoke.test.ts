@@ -1,9 +1,49 @@
 import { describe, expect, test } from "bun:test";
+import { FakeHerdrAdapter } from "../src/herdr/fake-adapter.ts";
+import type { PaneRef, WaitOutcome } from "../src/herdr/types.ts";
 import {
+  summarizeControllerLossResume,
   summarizeInSliceAbort,
   summarizeInspectCollection,
   summarizePostReleaseDrive,
 } from "../src/smoke/takeover-report.ts";
+import { TrackingHerdrAdapter } from "../src/smoke/tracking-adapter.ts";
+
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+class ControlledWaitAdapter extends FakeHerdrAdapter {
+  readonly entered = deferred<void>();
+  private readonly outcome = deferred<WaitOutcome>();
+
+  constructor(private readonly order: string[]) {
+    super();
+  }
+
+  release(outcome: WaitOutcome): void {
+    this.outcome.resolve(outcome);
+  }
+
+  override waitForOutput(
+    _pane: PaneRef,
+    _regex: string,
+    _timeoutMs: number,
+  ): Promise<WaitOutcome> {
+    this.order.push("entered");
+    this.entered.resolve();
+    return this.outcome.promise;
+  }
+}
 
 describe("takeover smoke inspect collection", () => {
   test("reports the terminal and runner evidence collected by inspect", () => {
@@ -70,6 +110,38 @@ describe("takeover smoke inspect collection", () => {
 });
 
 describe("takeover smoke live-drive proof", () => {
+  test("publishes the marker only after the base wait has started", async () => {
+    const order: string[] = [];
+    const base = new ControlledWaitAdapter(order);
+    const markerPublished = deferred<void>();
+    const adapter = new TrackingHerdrAdapter(
+      base,
+      "pane-owned",
+      async () => {
+        order.push("marker");
+        markerPublished.resolve();
+      },
+    );
+    const expected = { matched: false, timedOut: true } as const;
+
+    const pending = adapter.waitForOutput(
+      { id: "pane-owned" },
+      "sentinel",
+      2_000,
+    );
+    await markerPublished.promise;
+    await base.entered.promise;
+    base.release(expected);
+
+    expect(order).toEqual(["entered", "marker"]);
+    expect(await pending).toEqual(expected);
+    await adapter.interruptPane({ id: "pane-owned" });
+    expect(adapter.waitCount("pane-owned")).toBe(1);
+    expect(adapter.interruptCount("pane-owned")).toBe(1);
+    expect(adapter.waitCount("pane-other")).toBe(0);
+    expect(adapter.interruptCount("pane-other")).toBe(0);
+  });
+
   test("accepts one active wait followed by ownership abort and sibling completion", () => {
     expect(
       summarizeInSliceAbort({
@@ -135,5 +207,135 @@ describe("takeover smoke live-drive proof", () => {
         exitCode: 0,
       }),
     ).toThrow("smoke did not prove post-release managed drive");
+  });
+
+  test("accepts controller-loss resume with zero drive on both owned lanes", () => {
+    expect(
+      summarizeControllerLossResume({
+        controllerThrew: false,
+        ownedLanes: [
+          {
+            laneId: "long-owned",
+            waitForOutputCount: 0,
+            interruptPaneCount: 0,
+            controlMode: "human_owned",
+            runtimeState: "running",
+            processLive: true,
+          },
+          {
+            laneId: "long-release",
+            waitForOutputCount: 0,
+            interruptPaneCount: 0,
+            controlMode: "human_owned",
+            runtimeState: "running",
+            processLive: true,
+          },
+        ],
+      }),
+    ).toEqual({
+      controllerThrew: false,
+      ownedLanes: [
+        {
+          laneId: "long-owned",
+          waitForOutputCount: 0,
+          interruptPaneCount: 0,
+          controlMode: "human_owned",
+          runtimeState: "running",
+          processLive: true,
+        },
+        {
+          laneId: "long-release",
+          waitForOutputCount: 0,
+          interruptPaneCount: 0,
+          controlMode: "human_owned",
+          runtimeState: "running",
+          processLive: true,
+        },
+      ],
+      reconciledWithoutDrive: true,
+    });
+  });
+
+  test("rejects controller-loss resume after any owned-lane wait", () => {
+    expect(() =>
+      summarizeControllerLossResume({
+        controllerThrew: false,
+        ownedLanes: [
+          {
+            laneId: "long-owned",
+            waitForOutputCount: 1,
+            interruptPaneCount: 0,
+            controlMode: "human_owned",
+            runtimeState: "running",
+            processLive: true,
+          },
+          {
+            laneId: "long-release",
+            waitForOutputCount: 0,
+            interruptPaneCount: 0,
+            controlMode: "human_owned",
+            runtimeState: "running",
+            processLive: true,
+          },
+        ],
+      }),
+    ).toThrow("smoke did not prove controller-loss reconcile without drive");
+  });
+
+  test("rejects controller-loss resume after any owned-lane interrupt", () => {
+    expect(() =>
+      summarizeControllerLossResume({
+        controllerThrew: false,
+        ownedLanes: [
+          {
+            laneId: "long-owned",
+            waitForOutputCount: 0,
+            interruptPaneCount: 0,
+            controlMode: "human_owned",
+            runtimeState: "running",
+            processLive: true,
+          },
+          {
+            laneId: "long-release",
+            waitForOutputCount: 0,
+            interruptPaneCount: 1,
+            controlMode: "human_owned",
+            runtimeState: "running",
+            processLive: true,
+          },
+        ],
+      }),
+    ).toThrow("smoke did not prove controller-loss reconcile without drive");
+  });
+
+  test("rejects controller-loss resume when ownership or liveness is lost", () => {
+    const validLane = {
+      laneId: "long-release",
+      waitForOutputCount: 0,
+      interruptPaneCount: 0,
+      controlMode: "human_owned" as const,
+      runtimeState: "running" as const,
+      processLive: true,
+    };
+    for (const invalidLane of [
+      {
+        ...validLane,
+        laneId: "managed",
+        controlMode: "managed" as const,
+      },
+      {
+        ...validLane,
+        laneId: "terminal",
+        runtimeState: "exited" as const,
+        processLive: false,
+      },
+    ]) {
+      expect(() =>
+        summarizeControllerLossResume({
+          controllerThrew: false,
+          ownedLanes: [invalidLane, validLane],
+        }),
+      ).toThrow("smoke did not prove controller-loss reconcile without drive");
+    }
   });
 });

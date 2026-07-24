@@ -7,8 +7,8 @@
 
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { HerdrAdapter } from "../herdr/adapter.ts";
 import { RealHerdrAdapter } from "../herdr/real-adapter.ts";
-import type { PaneRef, WaitOutcome } from "../herdr/types.ts";
 import type { RunnerEvidence } from "../runtime/events.ts";
 import {
   FsLedger,
@@ -19,10 +19,12 @@ import type { LeaseHandle, Ledger } from "../runtime/ledger.ts";
 import { WorkflowRuntime } from "../runtime/runtime.ts";
 import type { LaneSpec, RuntimeDeps } from "../runtime/types.ts";
 import {
+  summarizeControllerLossResume,
   summarizeInSliceAbort,
   summarizeInspectCollection,
   summarizePostReleaseDrive,
 } from "./takeover-report.ts";
+import { TrackingHerdrAdapter } from "./tracking-adapter.ts";
 
 const env = (key: string, fallback: string): string => {
   const value = process.env[key];
@@ -108,44 +110,10 @@ class LeaseFreeLedger implements Ledger {
   }
 }
 
-class TrackingRealHerdrAdapter extends RealHerdrAdapter {
-  targetWaitCount = 0;
-  private markerWritten = false;
-
-  constructor(
-    private readonly targetPaneId: string,
-    private readonly waitMarker: string,
-  ) {
-    super();
-  }
-
-  override async waitForOutput(
-    pane: PaneRef,
-    regex: string,
-    timeoutMs: number,
-  ): Promise<WaitOutcome> {
-    if (pane.id === this.targetPaneId) {
-      this.targetWaitCount += 1;
-      if (!this.markerWritten) {
-        this.markerWritten = true;
-        await Bun.write(
-          this.waitMarker,
-          `${JSON.stringify({
-            paneId: pane.id,
-            targetWaitCount: this.targetWaitCount,
-            at: Date.now(),
-          })}\n`,
-        );
-      }
-    }
-    return super.waitForOutput(pane, regex, timeoutMs);
-  }
-}
-
 function makeDeps(
   ledger: Ledger,
   runId: string,
-  adapter: RealHerdrAdapter,
+  adapter: HerdrAdapter,
   driveSliceMs: number,
 ): RuntimeDeps {
   return {
@@ -330,7 +298,16 @@ async function drivePhase(): Promise<void> {
   if (!targetLane) throw new Error(`unknown laneId "${targetLaneId}"`);
   const marker = env("FLOW_WAIT_MARKER", c.driveWaitMarker);
   const resultFile = env("FLOW_TRACK_RESULT", c.driveResultFile);
-  const adapter = new TrackingRealHerdrAdapter(targetLane.paneId, marker);
+  const adapter = new TrackingHerdrAdapter(
+    new RealHerdrAdapter(),
+    targetLane.paneId,
+    async (started) => {
+      await Bun.write(
+        marker,
+        `${JSON.stringify({ ...started, at: Date.now() })}\n`,
+      );
+    },
+  );
   const runtime = new WorkflowRuntime(
     makeDeps(ledger, c.runId, adapter, c.driveSliceMs),
   );
@@ -448,9 +425,8 @@ async function parentPhase(): Promise<void> {
     );
     // A degraded sibling (crashed/lost/failed_to_start) must NOT count as
     // completion: the managed sibling has to finish clean while the owned lane
-    // is taken over. (The in-slice proof is targetWaitCount===1 in
-    // summarizeInSliceAbort -- a takeover landing before the wait yields 0 and
-    // is rejected there, so the marker-before-block timing cannot false-pass.)
+    // is taken over. The marker is published only after the delegated wait
+    // starts, and targetWaitCount===1 proves no later wait was issued.
     const siblingComplete = managedLaneIds.every((laneId) => {
       const sibling = afterTakeoverDrive.lanes[laneId]!;
       return sibling.runtimeState === "exited" && sibling.exitCode === 0;
@@ -478,35 +454,75 @@ async function parentPhase(): Promise<void> {
       throw new Error(`SIGKILLed controller pid ${controllerPid} is still alive`);
     }
 
-    const resumeAfterLoss = await flow(
-      c.ledgerRoot,
-      c.laneTimeoutMs,
-      "resume",
-      c.runId,
+    const controllerLossAdapter = new TrackingHerdrAdapter(
+      new RealHerdrAdapter(),
+      ownedAfterDrive.paneId,
+      async () => {},
     );
-    if (resumeAfterLoss.exitCode !== 0) {
-      throw new Error(
-        `resume after controller loss failed: exit=${resumeAfterLoss.exitCode} stderr=${resumeAfterLoss.stderr.trim()}`,
+    const controllerLossRuntime = new WorkflowRuntime(
+      makeDeps(
+        new FsLedger(c.ledgerRoot),
+        c.runId,
+        controllerLossAdapter,
+        c.driveSliceMs,
+      ),
+    );
+    let controllerLossStatusState: string | null = null;
+    let controllerLossError: string | null = null;
+    try {
+      const status = await controllerLossRuntime.resumeWorkflow(
+        c.runId,
+        c.laneTimeoutMs,
       );
+      controllerLossStatusState = status.state;
+    } catch (error) {
+      controllerLossError =
+        error instanceof Error ? error.message : String(error);
     }
     const afterLossResume = await new FsLedger(c.ledgerRoot).load(c.runId);
     if (!afterLossResume) throw new Error(`run "${c.runId}" disappeared`);
     const ownedAfterLoss = afterLossResume.lanes[c.ownedLaneId]!;
     const releaseAfterLoss = afterLossResume.lanes[c.releaseLaneId]!;
-    if (
-      ownedAfterLoss.controlMode !== "human_owned" ||
-      ownedAfterLoss.runtimeState !== "running" ||
-      releaseAfterLoss.controlMode !== "human_owned" ||
-      releaseAfterLoss.runtimeState !== "running"
-    ) {
-      throw new Error("resume after controller loss did not preserve ownership");
-    }
-    await assertLaneLive(
-      new RealHerdrAdapter(),
-      ownedAfterLoss.paneId,
-      "fresh resume drove the human-owned lane",
-    );
-    line("fresh flow resume preserved and reconciled owned lanes without drive");
+    const ownedAfterLossInfo = await controllerLossAdapter.processInfo({
+      id: ownedAfterLoss.paneId,
+    });
+    const releaseAfterLossInfo = await controllerLossAdapter.processInfo({
+      id: releaseAfterLoss.paneId,
+    });
+    const controllerLossResume = summarizeControllerLossResume({
+      controllerThrew: controllerLossError !== null,
+      ownedLanes: [
+        {
+          laneId: c.ownedLaneId,
+          waitForOutputCount: controllerLossAdapter.waitCount(
+            ownedAfterLoss.paneId,
+          ),
+          interruptPaneCount: controllerLossAdapter.interruptCount(
+            ownedAfterLoss.paneId,
+          ),
+          controlMode: ownedAfterLoss.controlMode,
+          runtimeState: ownedAfterLoss.runtimeState,
+          processLive:
+            ownedAfterLossInfo.foregroundProcessGroupId !==
+            ownedAfterLossInfo.shellPid,
+        },
+        {
+          laneId: c.releaseLaneId,
+          waitForOutputCount: controllerLossAdapter.waitCount(
+            releaseAfterLoss.paneId,
+          ),
+          interruptPaneCount: controllerLossAdapter.interruptCount(
+            releaseAfterLoss.paneId,
+          ),
+          controlMode: releaseAfterLoss.controlMode,
+          runtimeState: releaseAfterLoss.runtimeState,
+          processLive:
+            releaseAfterLossInfo.foregroundProcessGroupId !==
+            releaseAfterLossInfo.shellPid,
+        },
+      ],
+    });
+    line("fresh tracked resume reconciled owned lanes without drive");
 
     const adapter = new RealHerdrAdapter();
     await waitForLaneGone(
@@ -622,6 +638,7 @@ async function parentPhase(): Promise<void> {
       waitStarted: {
         marker: c.driveWaitMarker,
         observed: true,
+        markerAfterWaitStart: true,
       },
       takeover: {
         exitCode: takeover.exitCode,
@@ -639,11 +656,9 @@ async function parentPhase(): Promise<void> {
         reaped: controllerReaped,
       },
       resumeAfterControllerLoss: {
-        exitCode: resumeAfterLoss.exitCode,
-        ownedRuntimeState: ownedAfterLoss.runtimeState,
-        ownedControlMode: ownedAfterLoss.controlMode,
-        releaseRuntimeState: releaseAfterLoss.runtimeState,
-        releaseControlMode: releaseAfterLoss.controlMode,
+        statusState: controllerLossStatusState,
+        error: controllerLossError,
+        ...controllerLossResume,
       },
       inspectEvidence: inspectCollected,
       release: {
