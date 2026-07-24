@@ -1,7 +1,7 @@
 // Unattended real-stack human-ownership recovery smoke.
 //
 // The first controller is killed only after a takeover lands during a real
-// awaitLane wait slice and the managed sibling finishes. A fresh CLI resume
+// awaitLane wait slice and the managed sibling finishes. A fresh tracked runtime resume
 // preserves both owned lanes, inspect collects a self-terminated lane, and a
 // second tracked controller proves release restores a real managed wait/exit.
 
