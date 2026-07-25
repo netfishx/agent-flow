@@ -17,6 +17,25 @@ export { InMemoryLedger } from "./runtime/ledger.ts";
 export { FsLedger, resolveLedgerRoot } from "./runtime/fs-ledger.ts";
 export type { Ledger, LeaseHandle } from "./runtime/ledger.ts";
 export { projectRunState, reduce } from "./runtime/reducer.ts";
+export { parseCheckpoint } from "./runtime/checkpoint.ts";
+export type { ParsedCheckpoint } from "./runtime/checkpoint.ts";
+export {
+  deliveryIdFor,
+  dueMilestones,
+  marker,
+} from "./issue/milestones.ts";
+export type {
+  BlockedPayload,
+  CompleteLanePayload,
+  CompletePayload,
+  DecisionPayload,
+  DueMilestone,
+  MilestonePayload,
+  StartPayload,
+} from "./issue/milestones.ts";
+export { canonicalJson, canonicalPayloadHash } from "./issue/hash.ts";
+export { renderMilestone } from "./issue/render.ts";
+export type { RenderContext } from "./issue/render.ts";
 export type {
   BlockedAnchor,
   DecisionView,

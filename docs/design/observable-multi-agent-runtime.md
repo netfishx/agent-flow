@@ -237,7 +237,7 @@ GitHub Issues own planned lifecycle:
 
 The runtime should synchronize milestone events instead of spamming heartbeat comments:
 
-- on start: claim the issue and attach `runId` plus pane names;
+- on start: attach `runId` plus lane ids and roles;
 - on blocked: post one structured blocker and move to the appropriate triage state;
 - on completion: attach result, verification evidence, and gaps;
 - on owner decision: record the decision and resulting issue state.
