@@ -124,34 +124,6 @@ export function marker(deliveryId: string): string {
   return `<!-- agent-flow:delivery:${deliveryId} -->`;
 }
 
-const TOKEN_PATTERNS: readonly RegExp[] = [
-  /\b(?:cwd|repoRoot|dispatchedCommand)\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)/gi,
-  /\b(?:GH_TOKEN|GITHUB_TOKEN)\s*=\s*[^\s]+/gi,
-  /\bgithub_pat_[A-Za-z0-9_]{8,}\b/g,
-  /\bgh[pousr]_[A-Za-z0-9_]{8,}\b/g,
-  /\bFLOW_[A-Za-z0-9_-]+\b/g,
-  /\b[A-Za-z0-9_-]+:p\d+\b/g,
-  /<!--\s*agent-flow:delivery:[^>]*-->/gi,
-];
-const POSIX_ABSOLUTE_PATH =
-  /(^|[^A-Za-z0-9_/])\/(?!\/)[^\s"'`)<>\]]+/g;
-const WINDOWS_ABSOLUTE_PATH =
-  /(^|[^A-Za-z0-9_])[A-Za-z]:\\[^\s"'`)<>\]]+/g;
-
-export function redactForPublicSurface(value: string): string {
-  const pathsRedacted = value
-    .replace(POSIX_ABSOLUTE_PATH, "$1[redacted]")
-    .replace(WINDOWS_ABSOLUTE_PATH, "$1[redacted]");
-  return TOKEN_PATTERNS.reduce(
-    (text, pattern) => text.replace(pattern, "[redacted]"),
-    pathsRedacted,
-  );
-}
-
-function publicItems(values: readonly string[]): readonly string[] {
-  return values.map(redactForPublicSurface);
-}
-
 function pointerFor(
   run: RunView,
   laneId: string,
@@ -203,15 +175,12 @@ function startMilestone(run: RunView): DueMilestone | null {
     payload: {
       hashVersion: 1,
       runId: run.runId,
-      workflow: redactForPublicSurface(run.workflow),
+      workflow: run.workflow,
       lanes: run.laneOrder.map((laneId) => {
         const lane = run.lanes[laneId]!;
         return {
           laneId: lane.laneId,
-          role:
-            lane.role === undefined
-              ? null
-              : redactForPublicSurface(lane.role),
+          role: lane.role ?? null,
         };
       }),
       fixedPoint:
@@ -249,11 +218,10 @@ function blockedMilestone(
       hashVersion: 1,
       runId: run.runId,
       laneId,
-      role:
-        lane.role === undefined ? null : redactForPublicSurface(lane.role),
-      blockers: publicItems(anchor.blockers),
-      next: publicItems(anchor.next),
-      gaps: publicItems(anchor.gaps),
+      role: lane.role ?? null,
+      blockers: [...anchor.blockers],
+      next: [...anchor.next],
+      gaps: [...anchor.gaps],
       checkpointPointer: pointerFor(
         run,
         laneId,
@@ -310,16 +278,13 @@ function completeMilestone(run: RunView): DueMilestone | null {
         }
         return {
           laneId,
-          role:
-            lane.role === undefined
-              ? null
-              : redactForPublicSurface(lane.role),
+          role: lane.role ?? null,
           runtimeState: lane.runtimeState,
           exitCode: lane.exitCode,
           signal: lane.signal,
           semanticState: lane.semanticState,
           contractState: lane.contractState,
-          contractErrors: publicItems(lane.contractErrors),
+          contractErrors: [...lane.contractErrors],
           verificationState: lane.verificationState,
           gaps: [],
           resultPointer: pointerFor(
@@ -364,15 +329,16 @@ function decisionMilestone(
       hashVersion: 1,
       runId: run.runId,
       decision: decision.decision,
-      note: redactForPublicSurface(decision.note),
-      resultingIssueState:
-        decision.resultingIssueState === null
-          ? null
-          : redactForPublicSurface(decision.resultingIssueState),
+      note: decision.note,
+      resultingIssueState: decision.resultingIssueState,
     },
   };
 }
 
+/**
+ * Throws if a recorded pointer is missing or outside the run directory.
+ * Reconciler callers in #26/#27 must contain that fail-closed error.
+ */
 export function dueMilestones(run: RunView): readonly DueMilestone[] {
   if (run.issue === null) return [];
 

@@ -12,7 +12,7 @@ import {
 const startPayload: StartPayload = {
   hashVersion: 1,
   runId: "run-25",
-  workflow: "cross-review",
+  workflow: "cross-review /Users/alice/worktree",
   lanes: [
     { laneId: "codex", role: "standards" },
     { laneId: "grok", role: null },
@@ -30,7 +30,7 @@ const blockedPayload: BlockedPayload = {
   runId: "run-25",
   laneId: "codex",
   role: "standards",
-  blockers: ["owner decision required"],
+  blockers: ["cannot read /Users/alice/one.txt"],
   next: ["record the ruling"],
   gaps: ["verification pending"],
   checkpointPointer: "checkpoints/codex.md",
@@ -56,7 +56,7 @@ const completePayload: CompletePayload = {
       signal: null,
       semanticState: "partial",
       contractState: "violated",
-      contractErrors: ["missing VERDICT"],
+      contractErrors: ["missing VERDICT at /Users/alice/result.txt"],
       verificationState: "failed",
       gaps: [],
       resultPointer: "results/codex-result.txt",
@@ -70,7 +70,7 @@ const decisionPayload: DecisionPayload = {
   hashVersion: 1,
   runId: "run-25",
   decision: "changes-requested",
-  note: "Add objective evidence.",
+  note: "Read /Users/alice/decision.txt.",
   resultingIssueState: "ready-for-agent",
 };
 
@@ -84,29 +84,29 @@ const goldenCases: readonly {
     name: "start",
     payload: startPayload,
     canonical:
-      '{"fixedPoint":{"baseCommit":"base","diffHash":"diff","dirtyStatePolicy":"reject","headCommit":"head"},"hashVersion":1,"lanes":[{"laneId":"codex","role":"standards"},{"laneId":"grok","role":null}],"runId":"run-25","workflow":"cross-review"}',
-    digest: "d6e3659adcb16e61bdc05b89fd27c32751ae2d75c162f85cffff83bf8a997e21",
+      '{"fixedPoint":{"baseCommit":"base","diffHash":"diff","dirtyStatePolicy":"reject","headCommit":"head"},"hashVersion":1,"lanes":[{"laneId":"codex","role":"standards"},{"laneId":"grok","role":null}],"runId":"run-25","workflow":"cross-review /Users/alice/worktree"}',
+    digest: "d87439ee2fe43eaaad70b95b85b0dceebb952ac64253dfbb079fba23bce25f03",
   },
   {
     name: "blocked",
     payload: blockedPayload,
     canonical:
-      '{"blockers":["owner decision required"],"checkpointPointer":"checkpoints/codex.md","gaps":["verification pending"],"hashVersion":1,"laneId":"codex","next":["record the ruling"],"role":"standards","runId":"run-25"}',
-    digest: "e1d2c6dff34f8039d2b244c197e32aac6cf83983ebf1669fdebe62bafce70c8d",
+      '{"blockers":["cannot read /Users/alice/one.txt"],"checkpointPointer":"checkpoints/codex.md","gaps":["verification pending"],"hashVersion":1,"laneId":"codex","next":["record the ruling"],"role":"standards","runId":"run-25"}',
+    digest: "f6341ee968bde12586525f6390b502b9c7ecacb72cf97857e3b61c309e2e027d",
   },
   {
     name: "complete",
     payload: completePayload,
     canonical:
-      '{"breakdown":{"crashed":0,"exitedNonZero":1,"exitedZero":0,"failedToStart":0,"lost":0},"finishStatus":"degraded","hashVersion":1,"lanes":[{"checkpointPointer":"checkpoints/codex.md","contractErrors":["missing VERDICT"],"contractState":"violated","evidencePointer":"evidence/codex-evidence.json","exitCode":1,"gaps":[],"laneId":"codex","resultPointer":"results/codex-result.txt","role":"standards","runtimeState":"exited","semanticState":"partial","signal":null,"verificationState":"failed"}],"runId":"run-25"}',
-    digest: "f6ed62480f8e2e0c48c152f3d96f4a8403ed327ed637ef70dd9219728698abf3",
+      '{"breakdown":{"crashed":0,"exitedNonZero":1,"exitedZero":0,"failedToStart":0,"lost":0},"finishStatus":"degraded","hashVersion":1,"lanes":[{"checkpointPointer":"checkpoints/codex.md","contractErrors":["missing VERDICT at /Users/alice/result.txt"],"contractState":"violated","evidencePointer":"evidence/codex-evidence.json","exitCode":1,"gaps":[],"laneId":"codex","resultPointer":"results/codex-result.txt","role":"standards","runtimeState":"exited","semanticState":"partial","signal":null,"verificationState":"failed"}],"runId":"run-25"}',
+    digest: "d89a90c3acc77d1961eb2020e835ded05369ef14fa87382eabd8d9047a8fd9ab",
   },
   {
     name: "decision",
     payload: decisionPayload,
     canonical:
-      '{"decision":"changes-requested","hashVersion":1,"note":"Add objective evidence.","resultingIssueState":"ready-for-agent","runId":"run-25"}',
-    digest: "34f0d654be7a90d9e0d2ecb47ae6e6b2a69c7691fa3db76e596935065432966f",
+      '{"decision":"changes-requested","hashVersion":1,"note":"Read /Users/alice/decision.txt.","resultingIssueState":"ready-for-agent","runId":"run-25"}',
+    digest: "064820f0b4991ee0039dc9a4d0b2fd65f4221ebd26293567122069038381127e",
   },
 ];
 

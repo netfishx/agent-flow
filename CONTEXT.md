@@ -9,12 +9,15 @@ and design records.
   independently controllable.
 - **Ledger** — the append-only event record from which durable run state is
   reconstructed.
-- **Delivery** — one attempt to synchronize a due run milestone to its bound
-  issue, with its outcome projected from ledger events.
+- **Delivery** — the durable record of synchronizing one due run milestone to
+  its bound issue. It may span several attempts, which `intents` counts.
 - **Delivery id** — the deterministic identity of a milestone delivery, derived
   from the run id, anchor sequence, milestone kind, and lane id when applicable.
 - **Payload hash** — the SHA-256 digest of a milestone payload's canonical JSON;
   it detects content drift for an existing delivery id.
+- **Public-surface redaction** — removal of local paths, credentials, pane
+  identifiers, and other private values only while rendering public issue text;
+  payload identity retains the true source values.
 - **Milestone kind** — one of the fixed public lifecycle signals: `start`,
   `blocked`, `complete`, or `decision`.
 - **Anchor sequence** — the ledger sequence of the event that gives a milestone

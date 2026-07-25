@@ -1,12 +1,35 @@
 import type { LabelTransition } from "../runtime/events.ts";
-import {
-  marker,
-  redactForPublicSurface,
-  type DueMilestone,
-} from "./milestones.ts";
+import { marker, type DueMilestone } from "./milestones.ts";
 
 export interface RenderContext {
   readonly labelTransition: LabelTransition;
+}
+
+// This is a public-surface guard: over-redaction is safer than leaking a local
+// path, credential, sentinel, marker, or real Herdr pane identifier.
+const PUBLIC_SURFACE_PATTERNS: readonly RegExp[] = [
+  /\b(?:cwd|repoRoot|dispatchedCommand)\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)/gi,
+  /\b(?:GH_TOKEN|GITHUB_TOKEN)\s*=\s*[^\s]+/gi,
+  /\bgithub_pat_[A-Za-z0-9_]{8,}\b/g,
+  /\bgh[pousr]_[A-Za-z0-9_]{8,}\b/g,
+  /\bFLOW_[A-Za-z0-9_-]+\b/g,
+  /\b[A-Za-z0-9_-]+:p[A-Za-z0-9]+\b/g,
+  /\bfile:\/\/\/[^\s"'`)<>\]]+/gi,
+  /<!--\s*agent-flow:delivery:[^>]*-->/gi,
+];
+const POSIX_ABSOLUTE_PATH =
+  /(^|[^A-Za-z0-9_/])\/(?!\/)[^\s"'`)<>\]]+/g;
+const WINDOWS_ABSOLUTE_PATH =
+  /(^|[^A-Za-z0-9_])[A-Za-z]:\\[^\s"'`)<>\]]+/g;
+
+function redactForPublicSurface(value: string): string {
+  const pathsRedacted = value
+    .replace(POSIX_ABSOLUTE_PATH, "$1[redacted]")
+    .replace(WINDOWS_ABSOLUTE_PATH, "$1[redacted]");
+  return PUBLIC_SURFACE_PATTERNS.reduce(
+    (redacted, pattern) => redacted.replace(pattern, "[redacted]"),
+    pathsRedacted,
+  );
 }
 
 function text(value: string): string {
@@ -71,8 +94,9 @@ function labelOutcome(labelTransition: LabelTransition): string {
     case "skipped":
       return "The triage label was left as a human set it.";
     case "failed":
+      return "The label step was attempted but did not succeed.";
     case "not-applicable":
-      return "The label step did not complete.";
+      return "No label step was called for this milestone.";
   }
 }
 
@@ -134,7 +158,7 @@ function renderComplete(
       "",
       `- **Semantic state:** ${code(lane.semanticState)}`,
       ...(lane.gaps.length === 0
-        ? ["- **Gaps:** none reported"]
+        ? ["- **Gaps:** not collected in this run"]
         : ["- **Gaps:**", ...lane.gaps.map((gap) => `  - ${text(gap)}`)]),
       `- **Checkpoint:** ${
         lane.checkpointPointer === null

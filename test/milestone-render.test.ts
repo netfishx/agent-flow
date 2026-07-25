@@ -156,11 +156,20 @@ describe("renderMilestone", () => {
     },
   );
 
-  test.each(["failed", "not-applicable"] as const)(
-    "does not claim a blocked label outcome when the transition is %s",
-    (labelTransition) => {
+  test.each([
+    [
+      "failed",
+      "The label step was attempted but did not succeed.",
+    ],
+    [
+      "not-applicable",
+      "No label step was called for this milestone.",
+    ],
+  ] as const)(
+    "distinguishes the blocked label transition %s",
+    (labelTransition, expected) => {
       expect(renderMilestone(blocked, { labelTransition })).toContain(
-        "**Triage label:** The label step did not complete.",
+        `**Triage label:** ${expected}`,
       );
     },
   );
@@ -184,7 +193,7 @@ describe("renderMilestone", () => {
 #### Agent checkpoint claim
 
 - **Semantic state:** \`partial\`
-- **Gaps:** none reported
+- **Gaps:** not collected in this run
 - **Checkpoint:** \`checkpoints/codex.md\`
 
 #### Runner evidence
@@ -255,5 +264,23 @@ Recorded from the owner through the trusted local CLI. The runtime recorded this
     ]) {
       expect(body).not.toContain(secret);
     }
+  });
+
+  test.each([
+    "w2:pD",
+    "w2:pZ",
+    "w1:p7K",
+    "w2:p11",
+    "file:///Users/owner/secret/report.md",
+  ])("redacts real public-surface pane and file URL shape %s", (secret) => {
+    const unsafe: DueMilestone = {
+      ...decision,
+      payload: {
+        ...decision.payload,
+        note: `lane evidence leaked from ${secret}`,
+      },
+    };
+
+    expect(renderMilestone(unsafe, notApplicable)).not.toContain(secret);
   });
 });

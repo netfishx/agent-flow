@@ -247,6 +247,46 @@ describe("dueMilestones", () => {
     ]);
   });
 
+  test("payload identity retains true text while publication redaction stays downstream", async () => {
+    const blockedPayloadFor = async (blocker: string) => {
+      const builder = await RunBuilder.create();
+      await builder.register("lane-1", "reviewer");
+      await builder.append("lane_dispatch_intent", {}, { laneId: "lane-1" });
+      await builder.append(
+        "lane_checkpoint",
+        {
+          semanticState: "blocked",
+          checkpointFile: join(
+            runDirectory,
+            "checkpoints",
+            "lane-1.md",
+          ),
+          blockers: [blocker],
+          next: ["inspect /Users/owner/next.txt"],
+          gaps: ["missing /Users/owner/gap.txt"],
+        },
+        { laneId: "lane-1", actor: "agent" },
+      );
+      const milestone = dueMilestones(await builder.view()).find(
+        (candidate) => candidate.kind === "blocked",
+      );
+      if (milestone?.kind !== "blocked") {
+        throw new Error("expected blocked milestone");
+      }
+      return milestone.payload;
+    };
+
+    const alice = await blockedPayloadFor(
+      "cannot read /Users/alice/one.txt",
+    );
+    const bob = await blockedPayloadFor("cannot read /Users/bob/two.txt");
+
+    expect(alice.blockers).toEqual(["cannot read /Users/alice/one.txt"]);
+    expect(alice.next).toEqual(["inspect /Users/owner/next.txt"]);
+    expect(alice.gaps).toEqual(["missing /Users/owner/gap.txt"]);
+    expect(canonicalPayloadHash(alice)).not.toBe(canonicalPayloadHash(bob));
+  });
+
   test("orders start, blocked lanes by laneOrder, complete, then decisions by anchor", async () => {
     const builder = await RunBuilder.create();
     await builder.register("alpha", "standards");
