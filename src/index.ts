@@ -17,12 +17,28 @@ export { InMemoryLedger } from "./runtime/ledger.ts";
 export { FsLedger, resolveLedgerRoot } from "./runtime/fs-ledger.ts";
 export type { Ledger, LeaseHandle } from "./runtime/ledger.ts";
 export { projectRunState, reduce } from "./runtime/reducer.ts";
-export type { LaneView, RunView } from "./runtime/reducer.ts";
+export type {
+  BlockedAnchor,
+  DecisionView,
+  DeliveryView,
+  LaneView,
+  RunView,
+} from "./runtime/reducer.ts";
 export type {
   ContractState,
   ControlMode,
+  DeliveryState,
   FixedPoint,
+  IssueBindingResolvedData,
+  IssueDeliveryConfirmedData,
+  IssueDeliveryFailedData,
+  IssueDeliveryIntendedData,
+  IssueRef,
+  LabelTransition,
+  MilestoneKind,
   NewRunEvent,
+  OwnerDecision,
+  OwnerDecisionRecordedData,
   RunEvent,
   RunEventActor,
   RunEventDataByType,

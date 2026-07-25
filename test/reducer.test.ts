@@ -42,6 +42,7 @@ describe("reduce", () => {
           tabId: "w1:t1",
           controllerPaneId: "w1:p1",
           fixedPoint: null,
+          issue: null,
         },
       }),
     );
@@ -89,6 +90,7 @@ describe("reduce", () => {
           tabId: "w1:t1",
           controllerPaneId: "w1:p1",
           fixedPoint: null,
+          issue: null,
         },
       }),
       ...["exited", "crashed", "lost", "rejected"].map((laneId, index) =>
@@ -242,6 +244,7 @@ describe("reduce", () => {
         tabId: "w1:t1",
         controllerPaneId: "w1:p1",
         fixedPoint: null,
+        issue: null,
       },
     });
     const state = reduce(undefined, started);
@@ -278,6 +281,7 @@ describe("reduce", () => {
           tabId: "w1:t1",
           controllerPaneId: "w1:p1",
           fixedPoint: null,
+          issue: null,
         },
       }),
     );
@@ -437,6 +441,7 @@ describe("reduce", () => {
           tabId: "w1:t1",
           controllerPaneId: "w1:p1",
           fixedPoint: null,
+          issue: null,
         },
       }),
       event(2, "lane_registered", {
@@ -483,6 +488,7 @@ describe("terminal lanes cannot be re-dispatched", () => {
           tabId: "t1",
           controllerPaneId: "p0",
           fixedPoint: null,
+          issue: null,
         },
       }),
     );

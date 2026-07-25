@@ -4,7 +4,7 @@
 
 import type { HerdrAdapter } from "../herdr/adapter.ts";
 import type { Ledger } from "./ledger.ts";
-import type { FixedPoint } from "./events.ts";
+import type { FixedPoint, IssueRef } from "./events.ts";
 import type { RunState as ProjectedRunState } from "./reducer.ts";
 
 export type LaneState =
@@ -102,6 +102,8 @@ export interface StartWorkflowConfig {
   readonly startupSettleMs?: number;
   /** Captured by the caller; the runtime stores it verbatim without validation. */
   readonly fixedPoint?: FixedPoint | null;
+  /** Optional immutable GitHub issue binding, validated locally before startup. */
+  readonly issue?: IssueRef | null;
 }
 
 export interface LaneCommandInput {

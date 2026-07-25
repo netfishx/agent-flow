@@ -6,6 +6,7 @@ import { buildLaneCommand } from "../smoke/lane.ts";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type {
+  IssueRef,
   NewRunEvent,
   RunEvent,
   RunnerEvidence,
@@ -46,6 +47,8 @@ const TERMINAL_RUNTIME: ReadonlySet<RuntimeState> = new Set([
   "failed_to_start",
 ]);
 const CONDITIONAL_COMMIT_ATTEMPTS = 3;
+const GITHUB_OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/;
+const GITHUB_REPOSITORY = /^[A-Za-z0-9._-]+$/;
 
 interface LaneArtifactPaths {
   readonly logFile: string;
@@ -53,6 +56,18 @@ interface LaneArtifactPaths {
   readonly checkpointFile: string;
   readonly resultFile: string;
   readonly evidenceFile: string;
+}
+
+function assertIssueBinding(issue: IssueRef | null | undefined): void {
+  if (issue === null || issue === undefined) return;
+  if (
+    !GITHUB_OWNER.test(issue.owner) ||
+    !GITHUB_REPOSITORY.test(issue.repo) ||
+    !Number.isSafeInteger(issue.number) ||
+    issue.number <= 0
+  ) {
+    throw new Error("invalid issue binding");
+  }
 }
 
 function laneArtifactPaths(
@@ -155,6 +170,7 @@ export class WorkflowRuntime {
   }
 
   async startWorkflow(config: StartWorkflowConfig): Promise<RunHandle> {
+    assertIssueBinding(config.issue);
     const runId = this.deps.idgen();
     assertHandleId("runId", runId);
     if (config.lanes.length === 0) {
@@ -214,17 +230,18 @@ export class WorkflowRuntime {
       await this.commitEvent(
         runId,
         {
-        type: "run_started",
-        actor: "runtime",
-        data: {
-          workflow: config.workflow,
-          workspace: config.workspace,
-          cwd: config.cwd,
-          splitDirection: direction,
-          tabId: tab.id,
-          controllerPaneId: controllerPane.id,
-          fixedPoint: config.fixedPoint ?? null,
-        },
+          type: "run_started",
+          actor: "runtime",
+          data: {
+            workflow: config.workflow,
+            workspace: config.workspace,
+            cwd: config.cwd,
+            splitDirection: direction,
+            tabId: tab.id,
+            controllerPaneId: controllerPane.id,
+            fixedPoint: config.fixedPoint ?? null,
+            issue: config.issue ?? null,
+          },
         },
         startedAt,
       );
