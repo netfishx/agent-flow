@@ -1,3 +1,7 @@
+// Five-capability issue-tracker port and its boundary types. The port resolves
+// issues, finds and creates comments, reads labels, and performs one guarded
+// label transition; it knows nothing about milestones or delivery policy.
+
 import type { IssueRef } from "../runtime/events.ts";
 
 export interface ResolvedIssue {

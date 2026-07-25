@@ -1,3 +1,7 @@
+// Real issue-tracker adapter. It authorizes one immutable GitHub issue target,
+// builds every request through gh-argv, parses stdout through gh-json, and owns
+// process/HTTP failure classification without exposing gh details to callers.
+
 import type { IssueRef } from "../runtime/events.ts";
 import {
   createCommentStdin,
@@ -26,6 +30,14 @@ interface CommandResult {
   readonly exitCode: number;
 }
 
+type GhOperation =
+  | "resolve issue"
+  | "find comment by marker"
+  | "create comment"
+  | "read current labels"
+  | "add triage label"
+  | "remove triage label";
+
 type CommandRunner = (
   argv: readonly string[],
   stdin: string | null,
@@ -38,21 +50,8 @@ export interface RealIssueTrackerOptions extends AuthorizedIssueTargetConfig {
   readonly run?: CommandRunner;
 }
 
-const SAFE_OPERATIONS = new Set([
-  "resolve issue",
-  "find comment by marker",
-  "create comment",
-  "read current labels",
-  "add triage label",
-  "remove triage label",
-]);
-
-function safeOperation(operation: string): string {
-  return SAFE_OPERATIONS.has(operation) ? operation : "operation";
-}
-
 export function classifyGhFailure(
-  operation: string,
+  operation: GhOperation,
   stderr: string,
 ): IssueTrackerError {
   const statusMatch = stderr.match(/HTTP\s+([0-9]{3})/i);
@@ -69,7 +68,7 @@ export function classifyGhFailure(
     (status === 403 && secondaryRateLimit);
   const statusDetail = status === null ? "" : ` (HTTP ${status})`;
   return new IssueTrackerError(
-    `issue tracker ${safeOperation(operation)} failed${statusDetail}`,
+    `issue tracker ${operation} failed${statusDetail}`,
     retryable,
   );
 }
@@ -88,6 +87,18 @@ function isProtectedSpecificationIssue(ref: IssueRef): boolean {
     ref.repo.toLowerCase() === "agent-flow" &&
     ref.number === 6
   );
+}
+
+function assertAllowedTriageTransition(
+  expected: string,
+  next: string,
+): void {
+  if (expected !== "ready-for-agent" || next !== "needs-info") {
+    throw new IssueTrackerError(
+      "issue tracker triage label transition not authorized",
+      false,
+    );
+  }
 }
 
 async function spawnGh(
@@ -126,14 +137,14 @@ export class RealIssueTracker implements IssueTracker {
         false,
       );
     }
-    this.authorizedTarget = { ...options.authorizedTarget };
+    this.authorizedTarget = Object.freeze({ ...options.authorizedTarget });
     const binary = options.binary ?? "gh";
     this.runCommand =
       options.run ??
       ((argv, stdin) => spawnGh(binary, argv, stdin));
   }
 
-  private authorize(ref: IssueRef): void {
+  private authorize(ref: IssueRef): IssueRef {
     issueApiPath(ref);
     if (isProtectedSpecificationIssue(ref)) {
       throw new IssueTrackerError(
@@ -144,10 +155,11 @@ export class RealIssueTracker implements IssueTracker {
     if (!sameTarget(ref, this.authorizedTarget)) {
       throw new IssueTrackerError("issue tracker target not authorized", false);
     }
+    return this.authorizedTarget;
   }
 
   private async run(
-    operation: string,
+    operation: GhOperation,
     argv: readonly string[],
     stdin: string | null,
   ): Promise<string> {
@@ -165,10 +177,10 @@ export class RealIssueTracker implements IssueTracker {
   }
 
   async resolveIssue(ref: IssueRef): Promise<ResolvedIssue> {
-    this.authorize(ref);
+    const target = this.authorize(ref);
     const stdout = await this.run(
       "resolve issue",
-      ghArgvBuilders.resolveIssue(ref),
+      ghArgvBuilders.resolveIssue(target),
       null,
     );
     return parseResolvedIssue(stdout);
@@ -178,31 +190,31 @@ export class RealIssueTracker implements IssueTracker {
     ref: IssueRef,
     marker: string,
   ): Promise<CommentRef | null> {
-    this.authorize(ref);
+    const target = this.authorize(ref);
     assertMarkerArgument(marker);
     const stdout = await this.run(
       "find comment by marker",
-      ghArgvBuilders.listComments(ref),
+      ghArgvBuilders.listComments(target),
       null,
     );
     return parseCommentByMarker(stdout, marker);
   }
 
   async createComment(ref: IssueRef, body: string): Promise<CommentRef> {
-    this.authorize(ref);
+    const target = this.authorize(ref);
     const stdout = await this.run(
       "create comment",
-      ghArgvBuilders.createComment(ref),
+      ghArgvBuilders.createComment(target),
       createCommentStdin(body),
     );
     return parseCreatedComment(stdout);
   }
 
   async readCurrentLabels(ref: IssueRef): Promise<readonly string[]> {
-    this.authorize(ref);
+    const target = this.authorize(ref);
     const stdout = await this.run(
       "read current labels",
-      ghArgvBuilders.readCurrentLabels(ref),
+      ghArgvBuilders.readCurrentLabels(target),
       null,
     );
     return parseCurrentLabels(stdout);
@@ -213,19 +225,19 @@ export class RealIssueTracker implements IssueTracker {
     expected: string,
     next: string,
   ): Promise<TriageLabelOutcome> {
-    this.authorize(ref);
-    const labels = await this.readCurrentLabels(ref);
+    assertAllowedTriageTransition(expected, next);
+    const target = this.authorize(ref);
+    const labels = await this.readCurrentLabels(target);
     if (!labels.includes(expected)) return "skipped";
-    if (expected === next) return "applied";
 
     await this.run(
       "add triage label",
-      ghArgvBuilders.addLabel(ref, next),
+      ghArgvBuilders.addLabel(target, next),
       null,
     );
     await this.run(
       "remove triage label",
-      ghArgvBuilders.removeLabel(ref, expected),
+      ghArgvBuilders.removeLabel(target, expected),
       null,
     );
     return "applied";

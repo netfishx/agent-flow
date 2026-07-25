@@ -98,10 +98,15 @@ describe("classifyGhFailure", () => {
     }
   });
 
-  test("does not leak stderr or an unrecognized operation into the reason", () => {
+  test("does not leak stderr into the reason", () => {
     const secret = "ghp_SENTINEL";
-    const error = classifyGhFailure(secret, `${secret} (HTTP 404)`);
-    expect(error.reason).toBe("issue tracker operation failed (HTTP 404)");
+    const error = classifyGhFailure(
+      "resolve issue",
+      `${secret} (HTTP 404)`,
+    );
+    expect(error.reason).toBe(
+      "issue tracker resolve issue failed (HTTP 404)",
+    );
     expect(error.reason).not.toContain(secret);
   });
 });
@@ -147,7 +152,7 @@ describe("RealIssueTracker target boundary", () => {
       {
         argv: [
           "api",
-          "repos/NetFishX/Agent-Flow/issues/26",
+          "repos/netfishx/agent-flow/issues/26",
           "--method",
           "GET",
         ],
@@ -199,7 +204,7 @@ describe("RealIssueTracker target boundary", () => {
         tracker.compareAndSetTriageLabel(
           other,
           "ready-for-agent",
-          "ready-for-human",
+          "needs-info",
         ),
     ]) {
       await expect(operation()).rejects.toMatchObject({
@@ -247,7 +252,7 @@ describe("RealIssueTracker target boundary", () => {
         tracker.compareAndSetTriageLabel(
           forbidden,
           "ready-for-agent",
-          "ready-for-human",
+          "needs-info",
         ),
     ]) {
       await expect(operation()).rejects.toMatchObject({
@@ -281,6 +286,76 @@ describe("RealIssueTracker target boundary", () => {
         argv.some((arg) => arg.includes("repos/netfishx/../issues/24")),
       ),
     ).toBe(false);
+  });
+
+  test("keeps compare-and-set writes on the authorized target after the caller mutates its ref", async () => {
+    const ref: { owner: string; repo: string; number: number } = {
+      ...authorizedTarget,
+    };
+    const calls: RecordedCommand[] = [];
+    let callIndex = 0;
+    const tracker = new RealIssueTracker({
+      authorizedTarget,
+      run: async (argv, stdin) => {
+        calls.push({ argv: [...argv], stdin });
+        if (callIndex++ === 0) {
+          ref.number = 999;
+          return {
+            stdout: '{"labels":[{"name":"ready-for-agent"}]}',
+            stderr: "",
+            exitCode: 0,
+          };
+        }
+        return { stdout: "[]", stderr: "", exitCode: 0 };
+      },
+    });
+
+    await expect(
+      tracker.compareAndSetTriageLabel(
+        ref,
+        "ready-for-agent",
+        "needs-info",
+      ),
+    ).resolves.toBe("applied");
+    expect(calls.map(({ argv }) => argv[1])).toEqual([
+      "repos/netfishx/agent-flow/issues/26",
+      "repos/netfishx/agent-flow/issues/26/labels",
+      "repos/netfishx/agent-flow/issues/26/labels/ready-for-agent",
+    ]);
+  });
+
+  test("keeps create-comment on the authorized target across caller aliasing", async () => {
+    let numberReads = 0;
+    const ref = {
+      owner: "netfishx",
+      repo: "agent-flow",
+      get number() {
+        numberReads++;
+        return numberReads <= 5 ? 26 : 999;
+      },
+    };
+    const calls: RecordedCommand[] = [];
+    const tracker = new RealIssueTracker({
+      authorizedTarget,
+      run: async (argv, stdin) => {
+        calls.push({ argv: [...argv], stdin });
+        ref.repo = "retargeted";
+        return {
+          stdout: JSON.stringify({
+            id: 99,
+            html_url:
+              "https://github.com/netfishx/agent-flow/issues/26#issuecomment-99",
+          }),
+          stderr: "",
+          exitCode: 0,
+        };
+      },
+    });
+
+    await tracker.createComment(ref, "body");
+    expect(calls[0]?.argv[1]).toBe(
+      "repos/netfishx/agent-flow/issues/26/comments",
+    );
   });
 });
 
@@ -563,7 +638,7 @@ describe("RealIssueTracker comments and label transition", () => {
       tracker.compareAndSetTriageLabel(
         authorizedTarget,
         "ready-for-agent",
-        "ready-for-human",
+        "needs-info",
       ),
     ).resolves.toBe("applied");
     expect(runner.calls.map(({ argv }) => argv)).toEqual([
@@ -579,7 +654,7 @@ describe("RealIssueTracker comments and label transition", () => {
         "--method",
         "POST",
         "--raw-field",
-        "labels[]=ready-for-human",
+        "labels[]=needs-info",
       ],
       [
         "api",
@@ -613,6 +688,32 @@ describe("RealIssueTracker comments and label transition", () => {
     expect(runner.calls).toHaveLength(1);
     expect(runner.calls[0]?.argv).toContain("GET");
   });
+
+  test.each([
+    ["arbitrary", "ready-for-agent", "ready-for-human"],
+    ["wontfix", "ready-for-agent", "wontfix"],
+  ])(
+    "rejects the forbidden %s label transition before any command",
+    async (_name, expected, next) => {
+      const runner = recordingRunner([]);
+      const tracker = new RealIssueTracker({
+        authorizedTarget,
+        run: runner.run,
+      });
+
+      await expect(
+        tracker.compareAndSetTriageLabel(
+          authorizedTarget,
+          expected,
+          next,
+        ),
+      ).rejects.toMatchObject({
+        name: "IssueTrackerError",
+        retryable: false,
+      });
+      expect(runner.calls).toHaveLength(0);
+    },
+  );
 });
 
 describe("GitHub capability hygiene", () => {
@@ -717,7 +818,7 @@ describe("GitHub capability hygiene", () => {
       await tracker.compareAndSetTriageLabel(
         authorizedTarget,
         "ready-for-agent",
-        "ready-for-human",
+        "needs-info",
       );
 
       expect(runner.calls).toHaveLength(7);

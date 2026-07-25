@@ -35,24 +35,40 @@ interface ParsedComment {
   readonly body: string;
 }
 
-function parseComment(value: unknown): ParsedComment {
+type CommentRefOperation = "find comment by marker" | "create comment";
+
+function parseCommentRef(
+  value: unknown,
+  operation: CommentRefOperation,
+): CommentRef {
   const commentId = isRecord(value) ? value.id : undefined;
   const commentUrl = isRecord(value) ? value.html_url : undefined;
-  const body = isRecord(value) ? value.body : undefined;
   if (
+    typeof commentId !== "number" ||
     !Number.isSafeInteger(commentId) ||
-    (commentId as number) <= 0 ||
+    commentId <= 0 ||
     typeof commentUrl !== "string" ||
-    commentUrl.length === 0 ||
-    typeof body !== "string"
+    commentUrl.length === 0
   ) {
+    throw new IssueTrackerError(
+      `issue tracker ${operation} response parse failure`,
+      false,
+    );
+  }
+  return { commentId, commentUrl };
+}
+
+function parseComment(value: unknown): ParsedComment {
+  const ref = parseCommentRef(value, "find comment by marker");
+  const body = isRecord(value) ? value.body : undefined;
+  if (typeof body !== "string") {
     throw new IssueTrackerError(
       "issue tracker find comment by marker response parse failure",
       false,
     );
   }
   return {
-    ref: { commentId: commentId as number, commentUrl },
+    ref,
     body,
   };
 }
@@ -113,20 +129,7 @@ export function parseCommentByMarker(
 
 export function parseCreatedComment(raw: string): CommentRef {
   const root = parseJson("create comment", raw);
-  const commentId = isRecord(root) ? root.id : undefined;
-  const commentUrl = isRecord(root) ? root.html_url : undefined;
-  if (
-    !Number.isSafeInteger(commentId) ||
-    (commentId as number) <= 0 ||
-    typeof commentUrl !== "string" ||
-    commentUrl.length === 0
-  ) {
-    throw new IssueTrackerError(
-      "issue tracker create comment response parse failure",
-      false,
-    );
-  }
-  return { commentId: commentId as number, commentUrl };
+  return parseCommentRef(root, "create comment");
 }
 
 export function parseCurrentLabels(raw: string): readonly string[] {

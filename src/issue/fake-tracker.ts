@@ -1,3 +1,7 @@
+// Deterministic issue-tracker test adapter. It records every port call, exposes
+// programmable results and one failure, and mirrors marker and label-transition
+// semantics without spawning a process or touching GitHub.
+
 import type { IssueRef } from "../runtime/events.ts";
 import type {
   CommentRef,
@@ -40,6 +44,18 @@ export interface FakeIssueTrackerOptions {
   readonly labels?: readonly string[];
   /** Program exactly one port capability to fail. */
   readonly failure?: FakeIssueTrackerFailure;
+}
+
+function assertAllowedTriageTransition(
+  expected: string,
+  next: string,
+): void {
+  if (expected !== "ready-for-agent" || next !== "needs-info") {
+    throw new IssueTrackerError(
+      "fake issue tracker triage label transition not authorized",
+      false,
+    );
+  }
 }
 
 export class FakeIssueTracker implements IssueTracker {
@@ -109,8 +125,8 @@ export class FakeIssueTracker implements IssueTracker {
     next: string,
   ): Promise<TriageLabelOutcome> {
     this.record("compareAndSetTriageLabel", [ref, expected, next]);
+    assertAllowedTriageTransition(expected, next);
     if (!this.currentLabels.includes(expected)) return "skipped";
-    if (expected === next) return "applied";
 
     if (!this.currentLabels.includes(next)) {
       this.currentLabels.push(next);

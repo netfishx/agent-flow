@@ -44,7 +44,7 @@ describe("FakeIssueTracker", () => {
     await fake.compareAndSetTriageLabel(
       issue,
       "ready-for-agent",
-      "ready-for-human",
+      "needs-info",
     );
 
     expect(fake.calls).toEqual([
@@ -54,7 +54,7 @@ describe("FakeIssueTracker", () => {
       { operation: "readCurrentLabels", arguments: [issue] },
       {
         operation: "compareAndSetTriageLabel",
-        arguments: [issue, "ready-for-agent", "ready-for-human"],
+        arguments: [issue, "ready-for-agent", "needs-info"],
       },
     ]);
   });
@@ -163,7 +163,7 @@ describe("FakeIssueTracker", () => {
         fake.compareAndSetTriageLabel(
           issue,
           "ready-for-agent",
-          "ready-for-human",
+          "needs-info",
         ),
     ],
   ] as const)(
@@ -198,12 +198,12 @@ describe("FakeIssueTracker", () => {
       fake.compareAndSetTriageLabel(
         issue,
         "ready-for-agent",
-        "ready-for-human",
+        "needs-info",
       ),
     ).resolves.toBe("applied");
     await expect(fake.readCurrentLabels(issue)).resolves.toEqual([
       "bug",
-      "ready-for-human",
+      "needs-info",
     ]);
   });
 
@@ -223,4 +223,27 @@ describe("FakeIssueTracker", () => {
       "ready-for-human",
     ]);
   });
+
+  test.each([
+    ["arbitrary", "ready-for-agent", "ready-for-human"],
+    ["wontfix", "ready-for-agent", "wontfix"],
+  ])(
+    "rejects the forbidden %s label transition non-retryably",
+    async (_name, expected, next) => {
+      const fake = new FakeIssueTracker({
+        labels: ["ready-for-agent"],
+      });
+
+      await expect(
+        fake.compareAndSetTriageLabel(issue, expected, next),
+      ).rejects.toMatchObject({
+        name: "IssueTrackerError",
+        retryable: false,
+      });
+      expect(fake.calls).toHaveLength(1);
+      await expect(fake.readCurrentLabels(issue)).resolves.toEqual([
+        "ready-for-agent",
+      ]);
+    },
+  );
 });
