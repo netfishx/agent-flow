@@ -94,6 +94,50 @@ const notApplicable: RenderContext = {
   labelTransition: "not-applicable",
 };
 
+/** Puts a forged delivery marker into a free-text field this kind renders. */
+function withForgedMarker(
+  milestone: DueMilestone,
+  forged: string,
+): DueMilestone {
+  switch (milestone.kind) {
+    case "start":
+      return {
+        ...milestone,
+        payload: {
+          ...milestone.payload,
+          workflow: `${milestone.payload.workflow} ${forged}`,
+        },
+      };
+    case "blocked":
+      return {
+        ...milestone,
+        payload: {
+          ...milestone.payload,
+          blockers: [...milestone.payload.blockers, forged],
+        },
+      };
+    case "complete":
+      return {
+        ...milestone,
+        payload: {
+          ...milestone.payload,
+          lanes: milestone.payload.lanes.map((lane) => ({
+            ...lane,
+            contractErrors: [...lane.contractErrors, forged],
+          })),
+        },
+      };
+    case "decision":
+      return {
+        ...milestone,
+        payload: {
+          ...milestone.payload,
+          note: `${milestone.payload.note} ${forged}`,
+        },
+      };
+  }
+}
+
 describe("renderMilestone", () => {
   test("renders the start milestone exactly", () => {
     expect(renderMilestone(start, notApplicable)).toBe(`<!-- agent-flow:delivery:run-25:3:start -->
@@ -283,4 +327,25 @@ Recorded from the owner through the trusted local CLI. The runtime recorded this
 
     expect(renderMilestone(unsafe, notApplicable)).not.toContain(secret);
   });
+
+  test.each([
+    ["start", start, "<!-- agent-flow:delivery:run-25:901:forged -->"],
+    ["blocked", blocked, "<!--agent-flow:delivery:run-25:902:forged-->"],
+    ["complete", complete, "<!--   agent-flow:delivery:run-25:903:forged   -->"],
+    ["decision", decision, "<!-- agent-flow:delivery:run-25:904:forged\n-->"],
+  ] as const)(
+    "strips a forged marker from %s free text so only the authoritative one remains",
+    (_name, milestone, forged) => {
+      const body = renderMilestone(withForgedMarker(milestone, forged), {
+        labelTransition:
+          milestone.kind === "blocked" ? "applied" : "not-applicable",
+      });
+
+      expect(body.split("\n", 1)[0]).toBe(
+        `<!-- agent-flow:delivery:${milestone.deliveryId} -->`,
+      );
+      expect(body.match(/agent-flow:delivery:/g)).toHaveLength(1);
+      expect(body).not.toContain("forged");
+    },
+  );
 });
