@@ -5,6 +5,7 @@ import type {
   RunEventType,
 } from "../src/runtime/events.ts";
 import { reduce } from "../src/runtime/reducer.ts";
+import type { IssueRef } from "../src/index.ts";
 
 function event<T extends RunEventType>(
   sequence: number,
@@ -29,11 +30,7 @@ function event<T extends RunEventType>(
   } as RunEvent;
 }
 
-function started(issue: {
-  readonly owner: string;
-  readonly repo: string;
-  readonly number: number;
-} | null): RunEvent {
+function started(issue: IssueRef | null): RunEvent {
   return event(1, "run_started", {
     data: {
       workflow: "cross-review",
@@ -69,7 +66,33 @@ function pendingDelivery() {
   );
 }
 
+function failedDelivery() {
+  return reduce(
+    pendingDelivery(),
+    event(3, "issue_delivery_failed", {
+      data: {
+        deliveryId: "complete:lane-1",
+        reason: "permission denied",
+        retryable: false,
+      },
+    }),
+  );
+}
+
 describe("issue delivery reducer", () => {
+  test("rejects run_started when its required issue field is missing", () => {
+    const valid = started(null) as Extract<
+      RunEvent,
+      { readonly type: "run_started" }
+    >;
+    const { issue: omitted, ...data } = valid.data;
+    void omitted;
+
+    expect(() =>
+      reduce(undefined, { ...valid, data } as unknown as RunEvent),
+    ).toThrow(/run_started.*missing required "issue"/);
+  });
+
   test("projects the immutable issue binding with an unresolved node id", () => {
     expect(
       reduce(
@@ -250,16 +273,7 @@ describe("issue delivery reducer", () => {
 
   test("rejects every illegal delivery transition", () => {
     const pending = pendingDelivery();
-    const failed = reduce(
-      pending,
-      event(3, "issue_delivery_failed", {
-        data: {
-          deliveryId: "complete:lane-1",
-          reason: "permission denied",
-          retryable: false,
-        },
-      }),
-    );
+    const failed = failedDelivery();
     const delivered = reduce(
       pending,
       event(3, "issue_delivery_confirmed", {
@@ -412,6 +426,63 @@ describe("issue delivery reducer", () => {
         }),
       ),
     ).toThrow(/unbound run/);
+  });
+
+  test("rejects a re-intent when kind differs from the first intent", () => {
+    expect(() =>
+      reduce(
+        failedDelivery(),
+        event(4, "issue_delivery_intended", {
+          data: {
+            deliveryId: "complete:lane-1",
+            kind: "blocked",
+            laneId: "lane-1",
+            payloadHash: "sha256:complete",
+          },
+        }),
+      ),
+    ).toThrow(/kind differs/);
+  });
+
+  test("rejects a re-intent when laneId differs from the first intent", () => {
+    expect(() =>
+      reduce(
+        failedDelivery(),
+        event(4, "issue_delivery_intended", {
+          data: {
+            deliveryId: "complete:lane-1",
+            kind: "complete",
+            laneId: "lane-2",
+            payloadHash: "sha256:complete",
+          },
+        }),
+      ),
+    ).toThrow(/laneId differs/);
+  });
+
+  test("intentionally records owner decisions on unbound runs unlike delivery events", () => {
+    const state = reduce(
+      reduce(undefined, started(null)),
+      event(2, "owner_decision_recorded", {
+        actor: "human",
+        data: {
+          decision: "changes-requested",
+          note: "The owner decision remains true without issue delivery.",
+          resultingIssueState: null,
+        },
+      }),
+    );
+
+    expect(state.issue).toBeNull();
+    expect(state.decisions).toEqual([
+      {
+        sequence: 2,
+        at: 200,
+        decision: "changes-requested",
+        note: "The owner decision remains true without issue delivery.",
+        resultingIssueState: null,
+      },
+    ]);
   });
 
   test("records decision and lifecycle anchors without rewriting the first blocked checkpoint", () => {

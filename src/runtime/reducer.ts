@@ -274,7 +274,10 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
 
   if (event.type === "run_started") {
     if (state) throw new Error(`run "${event.runId}" is already started`);
-    const issue = event.data.issue ?? null;
+    if (!("issue" in event.data)) {
+      throw new Error('run_started event is missing required "issue" field');
+    }
+    const issue = event.data.issue;
     return {
       schemaVersion: 1,
       runId: event.runId,
@@ -511,9 +514,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         },
       });
     case "issue_binding_resolved":
-      if (state.issue === null) {
-        throw new Error("issue_binding_resolved cannot apply to an unbound run");
-      }
+      assertIssueBound(state, event.type);
       if (
         state.issueNodeId !== null &&
         state.issueNodeId !== event.data.issueNodeId
@@ -549,6 +550,16 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       if (delivery.payloadHash !== event.data.payloadHash) {
         throw new Error(
           `issue_delivery_intended payloadHash differs for delivery "${delivery.deliveryId}"`,
+        );
+      }
+      if (delivery.kind !== event.data.kind) {
+        throw new Error(
+          `issue_delivery_intended kind differs for delivery "${delivery.deliveryId}"`,
+        );
+      }
+      if (delivery.laneId !== event.data.laneId) {
+        throw new Error(
+          `issue_delivery_intended laneId differs for delivery "${delivery.deliveryId}"`,
         );
       }
       if (delivery.state !== "failed") {

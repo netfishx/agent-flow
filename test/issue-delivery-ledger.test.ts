@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RunEvent } from "../src/runtime/events.ts";
@@ -245,6 +245,45 @@ function expectReconstructed(
 }
 
 describe("issue delivery ledger replay", () => {
+  test("load fails closed when run_started omits its required issue field", async () => {
+    const root = await ledgerRoot();
+    const started = events[0]! as Extract<
+      RunEvent,
+      { readonly type: "run_started" }
+    >;
+    const { issue: omitted, ...data } = started.data;
+    void omitted;
+    const runDir = join(root, "runs", started.runId);
+    await mkdir(runDir, { recursive: true });
+    await writeFile(
+      join(runDir, "events.jsonl"),
+      `${JSON.stringify({ ...started, data })}\n`,
+      "utf8",
+    );
+
+    await expect(new FsLedger(root).load(started.runId)).rejects.toThrow(
+      /corrupt event stream.*run_started.*missing required "issue"/,
+    );
+  });
+
+  test("a null issue remains a valid unbound replay", async () => {
+    const ledger = new InMemoryLedger();
+    const started = events[0]! as Extract<
+      RunEvent,
+      { readonly type: "run_started" }
+    >;
+    const unbound: RunEvent = {
+      ...started,
+      eventId: "run-unbound#1",
+      runId: "run-unbound",
+      data: { ...started.data, issue: null },
+    };
+
+    await ledger.commit(unbound);
+
+    expect((await ledger.load("run-unbound"))!.issue).toBeNull();
+  });
+
   test("an in-memory load reconstructs every issue delivery fact", async () => {
     const ledger = new InMemoryLedger();
     await commitAll(ledger);
