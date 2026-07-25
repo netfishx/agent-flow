@@ -191,7 +191,7 @@ describe("issue delivery reducer", () => {
       settledAt: 300,
       commentId: null,
       commentUrl: null,
-      labelTransition: null,
+      labelTransition: "not-applicable",
       lastFailure: { reason: "remote unavailable", retryable: true },
     });
     state = reduce(
@@ -210,7 +210,7 @@ describe("issue delivery reducer", () => {
       intents: 2,
       intendedAt: 400,
       settledAt: null,
-      labelTransition: null,
+      labelTransition: "not-applicable",
       lastFailure: { reason: "remote unavailable", retryable: true },
     });
     state = reduce(
@@ -266,9 +266,53 @@ describe("issue delivery reducer", () => {
       settledAt: null,
       commentId: null,
       commentUrl: null,
-      labelTransition: null,
+      labelTransition: "not-applicable",
       lastFailure: null,
     });
+  });
+
+  test("carries an explicit label outcome through every delivery state", () => {
+    // The published contract types labelTransition as non-nullable, with
+    // "not-applicable" standing for "no label outcome recorded yet". No state
+    // in the lifecycle may leave it null.
+    const key = "complete:lane-1";
+    const intent = {
+      deliveryId: key,
+      kind: "complete",
+      laneId: "lane-1",
+      payloadHash: "sha256:complete",
+    } as const;
+
+    const pending = pendingDelivery();
+    expect(pending.deliveries[key]!.labelTransition).toBe("not-applicable");
+
+    const failed = reduce(
+      pending,
+      event(3, "issue_delivery_failed", {
+        data: { deliveryId: key, reason: "rate limited", retryable: true },
+      }),
+    );
+    expect(failed.deliveries[key]!.labelTransition).toBe("not-applicable");
+
+    const reIntended = reduce(
+      failed,
+      event(4, "issue_delivery_intended", { data: intent }),
+    );
+    expect(reIntended.deliveries[key]!.labelTransition).toBe("not-applicable");
+
+    const confirmed = reduce(
+      reIntended,
+      event(5, "issue_delivery_confirmed", {
+        data: {
+          deliveryId: key,
+          commentId: 7,
+          commentUrl:
+            "https://github.com/netfishx/agent-flow/issues/24#issuecomment-7",
+          labelTransition: "skipped",
+        },
+      }),
+    );
+    expect(confirmed.deliveries[key]!.labelTransition).toBe("skipped");
   });
 
   test("rejects every illegal delivery transition", () => {

@@ -26,7 +26,8 @@ export interface DeliveryView {
   readonly settledAt: number | null;
   readonly commentId: number | null;
   readonly commentUrl: string | null;
-  readonly labelTransition: LabelTransition | null;
+  /** "not-applicable" until a confirmation records the label outcome. */
+  readonly labelTransition: LabelTransition;
   readonly lastFailure: {
     readonly reason: string;
     readonly retryable: boolean;
@@ -536,7 +537,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
           settledAt: null,
           commentId: null,
           commentUrl: null,
-          labelTransition: null,
+          labelTransition: "not-applicable",
           lastFailure: null,
         };
         return withRun(state, event, {
@@ -576,7 +577,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
             intents: delivery.intents + 1,
             intendedAt: event.at,
             settledAt: null,
-            labelTransition: null,
+            labelTransition: "not-applicable",
           },
         },
       });
@@ -618,7 +619,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
             ...delivery,
             state: "failed",
             settledAt: event.at,
-            labelTransition: null,
+            labelTransition: "not-applicable",
             lastFailure: {
               reason: event.data.reason,
               retryable: event.data.retryable,

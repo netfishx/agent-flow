@@ -223,6 +223,9 @@ function expectReconstructed(
   expect(view.deliveries["blocked:lane-1"]).toMatchObject({
     state: "pending",
     intendedAt: 800,
+    // Replay must reconstruct the unsettled label outcome as the explicit
+    // "not-applicable" the published contract specifies, never as null.
+    labelTransition: "not-applicable",
   });
   expect(view.decisions).toEqual([
     {
