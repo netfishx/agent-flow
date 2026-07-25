@@ -68,6 +68,7 @@ async function seedFinishedRun(
           dirtyStatePolicy: "reject",
           capturedAt: 99,
         },
+        issue: null,
       },
     },
     {
@@ -282,6 +283,7 @@ function ambiguousRunStarted(): RunEvent {
       tabId: "w1:t1",
       controllerPaneId: "w1:p1",
       fixedPoint: null,
+      issue: null,
     },
   };
 }

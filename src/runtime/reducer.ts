@@ -1,7 +1,12 @@
 import type {
   ContractState,
   ControlMode,
+  DeliveryState,
   FixedPoint,
+  IssueRef,
+  LabelTransition,
+  MilestoneKind,
+  OwnerDecision,
   RunEvent,
   RunFinishStatus,
   RunOutcomeBreakdown,
@@ -9,6 +14,41 @@ import type {
   SemanticState,
   VerificationState,
 } from "./events.ts";
+
+export interface DeliveryView {
+  readonly deliveryId: string;
+  readonly kind: MilestoneKind;
+  readonly laneId: string | null;
+  readonly payloadHash: string;
+  readonly state: DeliveryState;
+  readonly intents: number;
+  readonly intendedAt: number;
+  readonly settledAt: number | null;
+  readonly commentId: number | null;
+  readonly commentUrl: string | null;
+  /** "not-applicable" until a confirmation records the label outcome. */
+  readonly labelTransition: LabelTransition;
+  readonly lastFailure: {
+    readonly reason: string;
+    readonly retryable: boolean;
+  } | null;
+}
+
+export interface DecisionView {
+  readonly sequence: number;
+  readonly at: number;
+  readonly decision: OwnerDecision;
+  readonly note: string;
+  readonly resultingIssueState: string | null;
+}
+
+export interface BlockedAnchor {
+  readonly sequence: number;
+  readonly checkpointFile: string;
+  readonly blockers: readonly string[];
+  readonly next: readonly string[];
+  readonly gaps: readonly string[];
+}
 
 export interface LaneView {
   readonly laneId: string;
@@ -44,6 +84,7 @@ export interface LaneView {
   readonly evidenceFile: string | null;
   readonly lostCause: string | null;
   readonly startRejection: string | null;
+  readonly blockedAnchor: BlockedAnchor | null;
 }
 
 export interface RunView {
@@ -56,6 +97,8 @@ export interface RunView {
   readonly tabId: string;
   readonly controllerPaneId: string;
   readonly fixedPoint: FixedPoint | null;
+  readonly issue: IssueRef | null;
+  readonly issueNodeId: string | null;
   readonly startedAt: number;
   readonly updatedAt: number;
   readonly checkpointAnnouncedAt: number | null;
@@ -69,6 +112,11 @@ export interface RunView {
   } | null;
   readonly lanes: Readonly<Record<string, LaneView>>;
   readonly laneOrder: readonly string[];
+  readonly deliveries: Readonly<Record<string, DeliveryView>>;
+  readonly deliveryOrder: readonly string[];
+  readonly decisions: readonly DecisionView[];
+  readonly startAnchorSequence: number | null;
+  readonly finishedSequence: number | null;
   readonly lastAppliedSequence: number;
 }
 
@@ -155,6 +203,20 @@ function withRun(state: RunView, event: RunEvent, patch: Partial<RunView>): RunV
   };
 }
 
+function assertIssueBound(state: RunView, eventType: RunEvent["type"]): void {
+  if (state.issue === null) {
+    throw new Error(`${eventType} cannot apply to an unbound run`);
+  }
+}
+
+function deliveryFor(state: RunView, deliveryId: string): DeliveryView {
+  const delivery = state.deliveries[deliveryId];
+  if (!delivery) {
+    throw new Error(`unknown deliveryId "${deliveryId}"`);
+  }
+  return delivery;
+}
+
 export function projectRunOutcomeBreakdown(
   state: RunView,
 ): RunOutcomeBreakdown {
@@ -213,6 +275,10 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
 
   if (event.type === "run_started") {
     if (state) throw new Error(`run "${event.runId}" is already started`);
+    if (!("issue" in event.data)) {
+      throw new Error('run_started event is missing required "issue" field');
+    }
+    const issue = event.data.issue;
     return {
       schemaVersion: 1,
       runId: event.runId,
@@ -223,6 +289,8 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       tabId: event.data.tabId,
       controllerPaneId: event.data.controllerPaneId,
       fixedPoint: event.data.fixedPoint,
+      issue: issue === null ? null : { ...issue },
+      issueNodeId: null,
       startedAt: event.at,
       updatedAt: event.at,
       checkpointAnnouncedAt: null,
@@ -233,6 +301,11 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       controller: null,
       lanes: {},
       laneOrder: [],
+      deliveries: {},
+      deliveryOrder: [],
+      decisions: [],
+      startAnchorSequence: null,
+      finishedSequence: null,
       lastAppliedSequence: event.sequence,
     };
   }
@@ -276,14 +349,15 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         evidenceFile: null,
         lostCause: null,
         startRejection: null,
+        blockedAnchor: null,
       };
       return withRun(state, event, {
         lanes: { ...state.lanes, [event.laneId]: lane },
         laneOrder: [...state.laneOrder, event.laneId],
       });
     }
-    case "lane_dispatch_intent":
-      return withLane(state, event, (lane) => {
+    case "lane_dispatch_intent": {
+      const next = withLane(state, event, (lane) => {
         assertNonTerminal(lane, event.type);
         if (lane.dispatchIntentAt !== null) {
           throw new Error("duplicate lane_dispatch_intent");
@@ -294,6 +368,11 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
           dispatchIntentAt: event.at,
         };
       });
+      return {
+        ...next,
+        startAnchorSequence: state.startAnchorSequence ?? event.sequence,
+      };
+    }
     case "lane_dispatched":
       return withLane(state, event, (lane) => {
         assertNonTerminal(lane, event.type);
@@ -321,12 +400,25 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         };
       });
     case "lane_checkpoint":
-      return withLane(state, event, (lane) => ({
-        ...lane,
-        semanticState: event.data.semanticState,
-        checkpointFile: event.data.checkpointFile,
-        checkpointAt: event.at,
-      }));
+      return withLane(state, event, (lane) => {
+        const blockedAnchor =
+          lane.blockedAnchor === null && event.data.semanticState === "blocked"
+            ? {
+                sequence: event.sequence,
+                checkpointFile: event.data.checkpointFile,
+                blockers: [...(event.data.blockers ?? [])],
+                next: [...(event.data.next ?? [])],
+                gaps: [...(event.data.gaps ?? [])],
+              }
+            : lane.blockedAnchor;
+        return {
+          ...lane,
+          semanticState: event.data.semanticState,
+          checkpointFile: event.data.checkpointFile,
+          checkpointAt: event.at,
+          blockedAnchor,
+        };
+      });
     case "lane_exited":
       return withLane(state, event, (lane) => {
         assertNonTerminal(lane, event.type);
@@ -422,6 +514,131 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
           pid: event.data.pid,
         },
       });
+    case "issue_binding_resolved":
+      assertIssueBound(state, event.type);
+      if (
+        state.issueNodeId !== null &&
+        state.issueNodeId !== event.data.issueNodeId
+      ) {
+        throw new Error(
+          "issue_binding_resolved cannot replace a different issue node id",
+        );
+      }
+      return withRun(state, event, { issueNodeId: event.data.issueNodeId });
+    case "issue_delivery_intended": {
+      assertIssueBound(state, event.type);
+      const delivery = state.deliveries[event.data.deliveryId];
+      if (!delivery) {
+        const intended: DeliveryView = {
+          ...event.data,
+          state: "pending",
+          intents: 1,
+          intendedAt: event.at,
+          settledAt: null,
+          commentId: null,
+          commentUrl: null,
+          labelTransition: "not-applicable",
+          lastFailure: null,
+        };
+        return withRun(state, event, {
+          deliveries: {
+            ...state.deliveries,
+            [event.data.deliveryId]: intended,
+          },
+          deliveryOrder: [...state.deliveryOrder, event.data.deliveryId],
+        });
+      }
+      if (delivery.payloadHash !== event.data.payloadHash) {
+        throw new Error(
+          `issue_delivery_intended payloadHash differs for delivery "${delivery.deliveryId}"`,
+        );
+      }
+      if (delivery.kind !== event.data.kind) {
+        throw new Error(
+          `issue_delivery_intended kind differs for delivery "${delivery.deliveryId}"`,
+        );
+      }
+      if (delivery.laneId !== event.data.laneId) {
+        throw new Error(
+          `issue_delivery_intended laneId differs for delivery "${delivery.deliveryId}"`,
+        );
+      }
+      if (delivery.state !== "failed") {
+        throw new Error(
+          `issue_delivery_intended requires absent or failed delivery, received "${delivery.state}"`,
+        );
+      }
+      return withRun(state, event, {
+        deliveries: {
+          ...state.deliveries,
+          [delivery.deliveryId]: {
+            ...delivery,
+            state: "pending",
+            intents: delivery.intents + 1,
+            intendedAt: event.at,
+            settledAt: null,
+            labelTransition: "not-applicable",
+          },
+        },
+      });
+    }
+    case "issue_delivery_confirmed": {
+      assertIssueBound(state, event.type);
+      const delivery = deliveryFor(state, event.data.deliveryId);
+      if (delivery.state !== "pending") {
+        throw new Error(
+          `issue_delivery_confirmed requires pending delivery, received "${delivery.state}"`,
+        );
+      }
+      return withRun(state, event, {
+        deliveries: {
+          ...state.deliveries,
+          [delivery.deliveryId]: {
+            ...delivery,
+            state: "delivered",
+            settledAt: event.at,
+            commentId: event.data.commentId,
+            commentUrl: event.data.commentUrl,
+            labelTransition: event.data.labelTransition,
+          },
+        },
+      });
+    }
+    case "issue_delivery_failed": {
+      assertIssueBound(state, event.type);
+      const delivery = deliveryFor(state, event.data.deliveryId);
+      if (delivery.state !== "pending") {
+        throw new Error(
+          `issue_delivery_failed requires pending delivery, received "${delivery.state}"`,
+        );
+      }
+      return withRun(state, event, {
+        deliveries: {
+          ...state.deliveries,
+          [delivery.deliveryId]: {
+            ...delivery,
+            state: "failed",
+            settledAt: event.at,
+            labelTransition: "not-applicable",
+            lastFailure: {
+              reason: event.data.reason,
+              retryable: event.data.retryable,
+            },
+          },
+        },
+      });
+    }
+    case "owner_decision_recorded":
+      return withRun(state, event, {
+        decisions: [
+          ...state.decisions,
+          {
+            sequence: event.sequence,
+            at: event.at,
+            ...event.data,
+          },
+        ],
+      });
     case "run_finished": {
       if (state.finishStatus !== null) {
         throw new Error("duplicate run_finished");
@@ -448,6 +665,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         finishedAt: event.at,
         finishStatus: event.data.status,
         breakdown: { ...event.data.breakdown },
+        finishedSequence: event.sequence,
       });
     }
     default:

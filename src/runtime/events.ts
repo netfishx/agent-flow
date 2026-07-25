@@ -16,6 +16,11 @@ export type RunEventType =
   | "lane_takeover"
   | "lane_release"
   | "controller_attached"
+  | "issue_binding_resolved"
+  | "issue_delivery_intended"
+  | "issue_delivery_confirmed"
+  | "issue_delivery_failed"
+  | "owner_decision_recorded"
   | "run_finished";
 
 export type RunEventActor =
@@ -44,6 +49,21 @@ export type ContractState = "unknown" | "satisfied" | "violated";
 export type VerificationState = "unverified" | "verified" | "failed";
 export type ControlMode = "managed" | "human_owned";
 export type RunFinishStatus = "clean" | "degraded";
+
+export interface IssueRef {
+  readonly owner: string;
+  readonly repo: string;
+  readonly number: number;
+}
+
+export type MilestoneKind = "start" | "blocked" | "complete" | "decision";
+export type DeliveryState = "pending" | "delivered" | "failed";
+export type LabelTransition =
+  | "not-applicable"
+  | "applied"
+  | "skipped"
+  | "failed";
+export type OwnerDecision = "accepted" | "rejected" | "changes-requested";
 
 export interface FixedPoint {
   readonly repoRoot: string;
@@ -89,6 +109,7 @@ export interface RunStartedData {
   readonly tabId: string;
   readonly controllerPaneId: string;
   readonly fixedPoint: FixedPoint | null;
+  readonly issue: IssueRef | null;
 }
 
 export interface LaneRegisteredData {
@@ -109,6 +130,9 @@ export interface LaneDispatchedData {
 export interface LaneCheckpointData {
   readonly semanticState: SemanticState;
   readonly checkpointFile: string;
+  readonly blockers?: readonly string[];
+  readonly next?: readonly string[];
+  readonly gaps?: readonly string[];
 }
 
 export interface LaneExitedData {
@@ -160,6 +184,36 @@ export interface RunFinishedData {
   readonly breakdown: RunOutcomeBreakdown;
 }
 
+export interface IssueBindingResolvedData {
+  readonly issueNodeId: string;
+}
+
+export interface IssueDeliveryIntendedData {
+  readonly deliveryId: string;
+  readonly kind: MilestoneKind;
+  readonly laneId: string | null;
+  readonly payloadHash: string;
+}
+
+export interface IssueDeliveryConfirmedData {
+  readonly deliveryId: string;
+  readonly commentId: number;
+  readonly commentUrl: string;
+  readonly labelTransition: LabelTransition;
+}
+
+export interface IssueDeliveryFailedData {
+  readonly deliveryId: string;
+  readonly reason: string;
+  readonly retryable: boolean;
+}
+
+export interface OwnerDecisionRecordedData {
+  readonly decision: OwnerDecision;
+  readonly note: string;
+  readonly resultingIssueState: string | null;
+}
+
 export interface RunEventDataByType {
   readonly run_started: RunStartedData;
   readonly lane_registered: LaneRegisteredData;
@@ -178,6 +232,11 @@ export interface RunEventDataByType {
   readonly lane_takeover: EmptyEventData;
   readonly lane_release: EmptyEventData;
   readonly controller_attached: ControllerAttachedData;
+  readonly issue_binding_resolved: IssueBindingResolvedData;
+  readonly issue_delivery_intended: IssueDeliveryIntendedData;
+  readonly issue_delivery_confirmed: IssueDeliveryConfirmedData;
+  readonly issue_delivery_failed: IssueDeliveryFailedData;
+  readonly owner_decision_recorded: OwnerDecisionRecordedData;
   readonly run_finished: RunFinishedData;
 }
 
@@ -222,6 +281,11 @@ export type RunEvent =
   | EventFor<"lane_takeover", "human", string>
   | EventFor<"lane_release", "human", string>
   | EventFor<"controller_attached", "runtime">
+  | EventFor<"issue_binding_resolved", "runtime">
+  | EventFor<"issue_delivery_intended", "runtime">
+  | EventFor<"issue_delivery_confirmed", "runtime">
+  | EventFor<"issue_delivery_failed", "runtime">
+  | EventFor<"owner_decision_recorded", "human">
   | EventFor<"run_finished", "runtime">;
 
 export type NewRunEvent = RunEvent extends infer E
