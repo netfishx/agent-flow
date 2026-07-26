@@ -97,6 +97,21 @@ class LoseFirstConfirmationLedger extends InMemoryLedger {
   }
 }
 
+class ArmableConfirmationLossLedger extends InMemoryLedger {
+  private armed = false;
+
+  loseNextConfirmation(): void {
+    this.armed = true;
+  }
+
+  protected override beforeCommit(event: RunEvent): void {
+    if (this.armed && event.type === "issue_delivery_confirmed") {
+      this.armed = false;
+      throw new Error("injected confirmation commit loss");
+    }
+  }
+}
+
 class DecisionAfterAwaitRuntime extends WorkflowRuntime {
   private appended = false;
 
@@ -223,8 +238,6 @@ describe("WorkflowRuntime issue synchronization", () => {
     const handle = await runtime.startWorkflow(config(root));
     await runtime.confirmLaneStarted(handle.runId, "review");
     await runtime.awaitLane(handle.runId, "review", 1_000);
-    await runtime.resumeWorkflow(handle.runId);
-    await runtime.resumeWorkflow(handle.runId);
 
     const run = await ledger.load(handle.runId);
     const createdBodies = tracker.calls
@@ -281,6 +294,85 @@ describe("WorkflowRuntime issue synchronization", () => {
     expect(
       (await ledger.load(handle.runId))?.deliveries[
         "run-inspect-due:3:start"
+      ],
+    ).toMatchObject({
+      state: "failed",
+      lastFailure: { retryable: true },
+    });
+  });
+
+  test("inspection cannot synchronize when its runtime still holds the lease", async () => {
+    const tracker = new FakeIssueTracker();
+    const { root, adapter, ledger, runtime } = await setup({
+      tracker,
+      runId: "run-inspect-held-lease",
+    });
+    const handle = await runtime.startWorkflow(config(root));
+    tracker.calls.splice(0);
+    adapter.finishLane("review");
+
+    await runtime.inspectWorkflow(handle.runId);
+
+    const run = await ledger.load(handle.runId);
+    expect(run?.finishStatus).toBe("clean");
+    expect(run?.deliveryOrder).toEqual([
+      "run-inspect-held-lease:3:start",
+    ]);
+    expect(tracker.calls).toEqual([]);
+  });
+
+  test("inspection cannot synchronize terminal facts while holding the lease", async () => {
+    const tracker = new FakeIssueTracker();
+    const { root, ledger, runtime } = await setup({
+      tracker,
+      runId: "run-inspect-terminal-held-lease",
+    });
+    const handle = await runtime.startWorkflow(config(root));
+    tracker.calls.splice(0);
+    await appendEvent(
+      ledger,
+      handle.runId,
+      "lane_exited",
+      { exitCode: 0 },
+      { laneId: "review" },
+    );
+
+    await runtime.inspectWorkflow(handle.runId);
+
+    const run = await ledger.load(handle.runId);
+    expect(run?.finishStatus).toBe("clean");
+    expect(run?.deliveryOrder).toEqual([
+      "run-inspect-terminal-held-lease:3:start",
+    ]);
+    expect(tracker.calls).toEqual([]);
+  });
+
+  test("a lease-free drive cannot synchronize a retryable delivery", async () => {
+    const failing = new FakeIssueTracker({
+      failure: { operation: "resolveIssue", retryable: true },
+    });
+    const { root, adapter, ledger, runtime } = await setup({
+      tracker: failing,
+      runId: "run-lease-free-drive",
+    });
+    const handle = await runtime.startWorkflow(config(root));
+    const healthy = new FakeIssueTracker();
+    const observer = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: createClock(6_000).now,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: healthy,
+    });
+
+    await observer.awaitLane(handle.runId, "review", 1);
+
+    expect(healthy.calls).toEqual([]);
+    expect(
+      (await ledger.load(handle.runId))?.deliveries[
+        "run-lease-free-drive:3:start"
       ],
     ).toMatchObject({
       state: "failed",
@@ -463,6 +555,73 @@ describe("WorkflowRuntime issue synchronization", () => {
       kind: "decision",
       state: "delivered",
       labelTransition: "not-applicable",
+    });
+    expect(
+      tracker.calls
+        .filter((call) => call.operation === "createComment")
+        .map((call) => call.arguments[1] as string)
+        .filter((body) => body.includes("## Owner decision")),
+    ).toHaveLength(1);
+  });
+
+  test("repeated resumes backfill a lost decision confirmation without reposting", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "agent-flow-issue-sync-repeated-resume-"),
+    );
+    roots.push(root);
+    const clock = createClock(17_500);
+    const adapter = new CountingAdapter({
+      clock,
+      lanes: [{ laneId: "review", exitCode: 0 }],
+    });
+    const ledger = new ArmableConfirmationLossLedger();
+    const tracker = new RememberingTracker();
+    const runtime = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run-repeated-resume",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: tracker,
+    });
+    const handle = await runtime.startWorkflow(config(root));
+    await runtime.takeoverLane(handle.runId, "review");
+    await appendEvent(
+      ledger,
+      handle.runId,
+      "owner_decision_recorded",
+      {
+        decision: "changes-requested",
+        note: "keep the human-owned lane running",
+        resultingIssueState: "needs-info",
+      },
+      { actor: "human" },
+    );
+    ledger.loseNextConfirmation();
+
+    await runtime.resumeWorkflow(handle.runId, 1);
+
+    const afterFirst = await ledger.load(handle.runId);
+    const decision = afterFirst?.decisions[0];
+    if (decision === undefined) {
+      throw new Error("expected owner decision");
+    }
+    const deliveryId =
+      `${handle.runId}:${decision.sequence}:decision`;
+    expect(afterFirst?.finishStatus).toBeNull();
+    expect(afterFirst?.deliveries[deliveryId]).toMatchObject({
+      state: "failed",
+      lastFailure: { retryable: true },
+    });
+
+    await runtime.resumeWorkflow(handle.runId, 1);
+
+    const afterSecond = await ledger.load(handle.runId);
+    expect(afterSecond?.finishStatus).toBeNull();
+    expect(afterSecond?.deliveries[deliveryId]).toMatchObject({
+      state: "delivered",
+      intents: 2,
     });
     expect(
       tracker.calls

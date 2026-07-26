@@ -462,6 +462,57 @@ describe("reconcileIssueSync", () => {
     ).toBe(false);
   });
 
+  test("closes a retryable failed delivery when its payload hash conflicts", async () => {
+    const builder = await RunBuilder.create();
+    await builder.registerAndDispatch();
+    const [start] = dueMilestones(await builder.view());
+    if (start === undefined) throw new Error("expected start milestone");
+    const currentHash = canonicalPayloadHash(start.payload);
+    const recordedHash = "b".repeat(64);
+    await builder.append("issue_delivery_intended", {
+      deliveryId: start.deliveryId,
+      kind: start.kind,
+      laneId: start.laneId,
+      payloadHash: recordedHash,
+    });
+    await builder.append("issue_delivery_failed", {
+      deliveryId: start.deliveryId,
+      reason: "temporary outage",
+      retryable: true,
+    });
+    const tracker = new FakeIssueTracker();
+
+    const summary = await reconcileIssueSync({
+      loadRun: () => builder.view(),
+      appendEvent: (event) => builder.appendIssueEvent(event),
+      tracker,
+    });
+
+    const delivery = (await builder.view()).deliveries[start.deliveryId];
+    expect(summary.deliveries).toEqual([
+      {
+        deliveryId: start.deliveryId,
+        kind: "start",
+        outcome: "failed",
+        reason: `payload hash conflict for delivery "${start.deliveryId}": recorded ${recordedHash}, computed ${currentHash}`,
+        retryable: false,
+      },
+    ]);
+    expect(delivery).toMatchObject({
+      state: "failed",
+      intents: 2,
+      lastFailure: {
+        retryable: false,
+      },
+    });
+    expect(tracker.calls).toEqual([]);
+    expect(
+      dueMilestones(await builder.view()).some(
+        (milestone) => milestone.deliveryId === start.deliveryId,
+      ),
+    ).toBe(false);
+  });
+
   test("contains an unusable complete artifact pointer before any delivery attempt", async () => {
     const builder = await RunBuilder.create();
     await builder.registerAndDispatch();

@@ -176,10 +176,8 @@ export class WorkflowRuntime {
 
   async startWorkflow(config: StartWorkflowConfig): Promise<RunHandle> {
     assertIssueBinding(config.issue);
-    if (config.issue !== null && config.issue !== undefined) {
-      if (this.deps.issueTracker === undefined) {
-        throw new Error("bound issue requires an issue tracker");
-      }
+    if (config.issue && this.deps.issueTracker === undefined) {
+      throw new Error("bound issue requires an issue tracker");
     }
     const runId = this.deps.idgen();
     assertHandleId("runId", runId);
@@ -709,7 +707,7 @@ export class WorkflowRuntime {
             `lane "${laneId}" printed its sentinel but its process is still running`,
           );
         }
-        await this.finalizeLane(runId, laneId, true);
+        await this.finalizeLane(runId, laneId, true, true);
         lane = this.getLane(this.getRun(runId), laneId);
         if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
           await this.recordTerminalFacts(runId, laneId, lane.exitCode);
@@ -822,9 +820,7 @@ export class WorkflowRuntime {
     await reconcileIssueSync({
       loadRun: async () => {
         const loaded = await this.deps.ledger.load(runId);
-        if (loaded === null) {
-          throw new Error(`unknown runId "${runId}"`);
-        }
+        if (!loaded) throw new Error(`run not found: "${runId}"`);
         this.registerReducedView(loaded);
         return loaded;
       },
@@ -963,7 +959,12 @@ export class WorkflowRuntime {
       return;
     }
     if (info.foregroundProcessGroupId === info.shellPid) {
-      await this.finalizeLane(runId, laneId, false);
+      await this.finalizeLane(
+        runId,
+        laneId,
+        false,
+        synchronizeIssue,
+      );
     } else {
       await this.commitEventConditionally(runId, (current) => {
         if (!current) throw new Error(`unknown runId "${runId}"`);
@@ -983,6 +984,7 @@ export class WorkflowRuntime {
     runId: string,
     laneId: string,
     waitMatched: boolean,
+    synchronizeIssue: boolean,
   ): Promise<void> {
     const lane = this.getLane(this.getRun(runId), laneId);
     if (TERMINAL_RUNTIME.has(lane.runtimeState)) return;
@@ -1012,7 +1014,12 @@ export class WorkflowRuntime {
         },
       );
       await this.finishIfTerminal(runId);
-      await this.recordTerminalFacts(runId, laneId, exitCode);
+      await this.recordTerminalFacts(
+        runId,
+        laneId,
+        exitCode,
+        synchronizeIssue,
+      );
       const finalizedLane = this.getLane(this.getRun(runId), laneId);
       if (
         finalizedLane.runtimeState === "lost" &&
@@ -1042,7 +1049,12 @@ export class WorkflowRuntime {
       };
     });
     await this.finishIfTerminal(runId);
-    await this.recordTerminalFacts(runId, laneId, exitCode);
+    await this.recordTerminalFacts(
+      runId,
+      laneId,
+      exitCode,
+      synchronizeIssue,
+    );
   }
 
   private async recordTerminalFacts(
@@ -1165,7 +1177,7 @@ export class WorkflowRuntime {
         },
       };
     });
-    await this.releaseControllerLeaseIfFactsComplete(
+    await this.synchronizeIssueAndReleaseControllerLeaseAfterTerminalFacts(
       runId,
       synchronizeIssue,
     );
@@ -1196,7 +1208,7 @@ export class WorkflowRuntime {
     });
   }
 
-  private async releaseControllerLeaseIfFactsComplete(
+  private async synchronizeIssueAndReleaseControllerLeaseAfterTerminalFacts(
     runId: string,
     synchronizeIssue: boolean,
   ): Promise<void> {
