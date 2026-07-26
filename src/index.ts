@@ -36,6 +36,16 @@ export type {
 export { canonicalJson, canonicalPayloadHash } from "./issue/hash.ts";
 export { renderMilestone } from "./issue/render.ts";
 export type { RenderContext } from "./issue/render.ts";
+export { IssueTrackerError } from "./issue/tracker.ts";
+export type {
+  AuthorizedIssueTargetConfig,
+  CommentRef,
+  IssueTracker,
+  ResolvedIssue,
+  TriageLabelOutcome,
+} from "./issue/tracker.ts";
+export { RealIssueTracker } from "./issue/real-tracker.ts";
+export type { RealIssueTrackerOptions } from "./issue/real-tracker.ts";
 export type {
   BlockedAnchor,
   DecisionView,

@@ -17,3 +17,12 @@ export type {
 export { classifyWaitOutput } from "./herdr/real-adapter.ts";
 export { InMemoryLedger } from "./runtime/ledger.ts";
 export { FsLedger } from "./runtime/fs-ledger.ts";
+export { FakeIssueTracker } from "./issue/fake-tracker.ts";
+export type {
+  FakeIssueTrackerCall,
+  FakeIssueTrackerFailure,
+  FakeIssueTrackerOperation,
+  FakeIssueTrackerOptions,
+  FakeMarkerHit,
+} from "./issue/fake-tracker.ts";
+export { classifyGhFailure } from "./issue/real-tracker.ts";
