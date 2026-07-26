@@ -2,6 +2,10 @@
 // and then folded into memory through the same reducer used by ledger replay.
 
 import type { PaneRef } from "../herdr/types.ts";
+import {
+  reconcileIssueSync,
+  type IssueSyncEvent,
+} from "../issue/reconcile.ts";
 import { buildLaneCommand } from "../smoke/lane.ts";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -159,6 +163,7 @@ export class WorkflowRuntime {
   private readonly pendingTransitions = new Map<string, Promise<void>>();
   private readonly commitTails = new Map<string, Promise<void>>();
   private readonly leases = new Map<string, LeaseHandle>();
+  private readonly deferredLeaseReleases = new Set<string>();
   private readonly driveSliceMs: number;
 
   constructor(protected readonly deps: RuntimeDeps) {
@@ -171,6 +176,11 @@ export class WorkflowRuntime {
 
   async startWorkflow(config: StartWorkflowConfig): Promise<RunHandle> {
     assertIssueBinding(config.issue);
+    if (config.issue !== null && config.issue !== undefined) {
+      if (this.deps.issueTracker === undefined) {
+        throw new Error("bound issue requires an issue tracker");
+      }
+    }
     const runId = this.deps.idgen();
     assertHandleId("runId", runId);
     if (config.lanes.length === 0) {
@@ -365,6 +375,7 @@ export class WorkflowRuntime {
       started.push(item.spec.laneId);
     }
 
+    await this.reconcileBoundIssue(runId);
     return { runId, laneIds: topology.map((item) => item.spec.laneId) };
   }
 
@@ -377,7 +388,7 @@ export class WorkflowRuntime {
     let run = this.getRun(runId);
     for (const laneId of run.laneOrder) {
       try {
-        await this.refreshLane(runId, laneId);
+        await this.refreshLane(runId, laneId, false);
       } catch (error) {
         if (!(error instanceof LaneTerminalAnomaly)) throw error;
       }
@@ -442,10 +453,12 @@ export class WorkflowRuntime {
     if (loaded.finishStatus !== null) return this.workflowStatus(loaded);
 
     await this.acquireControllerLease(runId);
+    this.deferredLeaseReleases.add(runId);
     try {
       const authoritative = await this.deps.ledger.load(runId);
       if (!authoritative) throw new Error(`run not found: "${runId}"`);
       if (authoritative.finishStatus !== null) {
+        this.deferredLeaseReleases.delete(runId);
         await this.releaseControllerLease(runId);
         return this.workflowStatus(authoritative);
       }
@@ -525,6 +538,7 @@ export class WorkflowRuntime {
         }
       }
       const completed = this.getRun(runId);
+      await this.reconcileBoundIssue(runId);
       if (completed.finishStatus === null) {
         const nonTerminal = completed.laneOrder
           .map((laneId) => this.getLane(completed, laneId))
@@ -541,10 +555,12 @@ export class WorkflowRuntime {
         }
         // Every remaining non-terminal lane is human_owned: reconciled, never auto-driven.
         // The controller detaches; the human-owned lane keeps running in its pane.
-        await this.releaseControllerLease(runId);
       }
+      this.deferredLeaseReleases.delete(runId);
+      await this.releaseControllerLease(runId);
       return this.workflowStatus(this.getRun(runId));
     } catch (error) {
+      this.deferredLeaseReleases.delete(runId);
       try {
         await this.releaseControllerLease(runId);
       } catch (releaseError) {
@@ -755,9 +771,11 @@ export class WorkflowRuntime {
   }
 
   protected async onDriveSliceBoundary(
-    _runId: string,
+    runId: string,
     _laneId: string,
-  ): Promise<void> {}
+  ): Promise<void> {
+    await this.reconcileBoundIssue(runId);
+  }
 
   protected registerReducedView(view: RunView): void {
     this.runs.set(view.runId, view);
@@ -795,6 +813,28 @@ export class WorkflowRuntime {
     return this.commitEventConditionally(runId, () => input, at).then((next) => {
       if (!next) throw new Error("unconditional event commit was skipped");
       return next;
+    });
+  }
+
+  private async reconcileBoundIssue(runId: string): Promise<void> {
+    const tracker = this.deps.issueTracker;
+    if (tracker === undefined || !this.leases.has(runId)) return;
+    await reconcileIssueSync({
+      loadRun: async () => {
+        const loaded = await this.deps.ledger.load(runId);
+        if (loaded === null) {
+          throw new Error(`unknown runId "${runId}"`);
+        }
+        this.registerReducedView(loaded);
+        return loaded;
+      },
+      appendEvent: async (event: IssueSyncEvent) => {
+        await this.commitEvent(runId, {
+          ...event,
+          actor: "runtime",
+        } as NewRunEvent);
+      },
+      tracker,
     });
   }
 
@@ -884,13 +924,22 @@ export class WorkflowRuntime {
     return false;
   }
 
-  private async refreshLane(runId: string, laneId: string): Promise<void> {
+  private async refreshLane(
+    runId: string,
+    laneId: string,
+    synchronizeIssue = true,
+  ): Promise<void> {
     let lane = this.getLane(this.getRun(runId), laneId);
     if (TERMINAL_RUNTIME.has(lane.runtimeState)) {
       if (
         (lane.contractEvaluatedAt === null || lane.verificationRecordedAt === null)
       ) {
-        await this.recordTerminalFacts(runId, laneId, lane.exitCode);
+        await this.recordTerminalFacts(
+          runId,
+          laneId,
+          lane.exitCode,
+          synchronizeIssue,
+        );
       }
       return;
     }
@@ -904,7 +953,12 @@ export class WorkflowRuntime {
       if (
         (lane.contractEvaluatedAt === null || lane.verificationRecordedAt === null)
       ) {
-        await this.recordTerminalFacts(runId, laneId, lane.exitCode);
+        await this.recordTerminalFacts(
+          runId,
+          laneId,
+          lane.exitCode,
+          synchronizeIssue,
+        );
       }
       return;
     }
@@ -995,6 +1049,7 @@ export class WorkflowRuntime {
     runId: string,
     laneId: string,
     parsedExitCode: number | null,
+    synchronizeIssue = true,
   ): Promise<void> {
     const run = this.getRun(runId);
     const lane = this.getLane(run, laneId);
@@ -1110,7 +1165,10 @@ export class WorkflowRuntime {
         },
       };
     });
-    await this.releaseControllerLeaseIfFactsComplete(runId);
+    await this.releaseControllerLeaseIfFactsComplete(
+      runId,
+      synchronizeIssue,
+    );
   }
 
   protected async writeRunnerEvidenceFile(
@@ -1140,6 +1198,7 @@ export class WorkflowRuntime {
 
   private async releaseControllerLeaseIfFactsComplete(
     runId: string,
+    synchronizeIssue: boolean,
   ): Promise<void> {
     const run = this.getRun(runId);
     if (run.finishStatus === null) return;
@@ -1150,7 +1209,11 @@ export class WorkflowRuntime {
         lane.verificationRecordedAt !== null
       );
     });
-    if (factsComplete) await this.releaseControllerLease(runId);
+    if (factsComplete) {
+      if (this.deferredLeaseReleases.has(runId)) return;
+      if (synchronizeIssue) await this.reconcileBoundIssue(runId);
+      await this.releaseControllerLease(runId);
+    }
   }
 
   private async readDurable(path: string): Promise<string> {

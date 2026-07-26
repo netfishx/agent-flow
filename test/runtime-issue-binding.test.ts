@@ -11,6 +11,7 @@ import type {
 } from "../src/herdr/types.ts";
 import { InMemoryLedger } from "../src/runtime/ledger.ts";
 import { WorkflowRuntime } from "../src/runtime/runtime.ts";
+import { FakeIssueTracker } from "../src/testing.ts";
 import type { IssueRef } from "../src/index.ts";
 
 class CountingFakeHerdrAdapter extends FakeHerdrAdapter {
@@ -28,7 +29,7 @@ class CountingFakeHerdrAdapter extends FakeHerdrAdapter {
   }
 }
 
-function setup() {
+function setup(issueTracker?: FakeIssueTracker) {
   const clock = createClock(1_000);
   const adapter = new CountingFakeHerdrAdapter({
     clock,
@@ -42,6 +43,7 @@ function setup() {
     idgen: () => "run-issue-binding",
     readResultFile: adapter.readResultFile,
     sleep: async () => {},
+    ...(issueTracker === undefined ? {} : { issueTracker }),
   });
   return { adapter, ledger, runtime };
 }
@@ -96,7 +98,7 @@ describe("runtime issue binding", () => {
   }
 
   test("persists a valid binding verbatim and defaults an omitted binding to null", async () => {
-    const bound = setup();
+    const bound = setup(new FakeIssueTracker());
     const issue = { owner: "netfishx", repo: "agent-flow.ts", number: 24 } as const;
     const boundHandle = await bound.runtime.startWorkflow(config(issue));
 

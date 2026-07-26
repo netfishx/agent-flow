@@ -3,6 +3,7 @@
 // address work through opaque `runId` / `laneId` strings only.
 
 import type { HerdrAdapter } from "../herdr/adapter.ts";
+import type { IssueTracker } from "../issue/tracker.ts";
 import type { Ledger } from "./ledger.ts";
 import type { FixedPoint, IssueRef } from "./events.ts";
 import type { RunState as ProjectedRunState } from "./reducer.ts";
@@ -125,6 +126,8 @@ export interface RunHandle {
 /** Everything the runtime needs from the outside — all injectable for tests. */
 export interface RuntimeDeps {
   readonly adapter: HerdrAdapter;
+  /** Optional GitHub issue sink; required only for issue-bound runs. */
+  readonly issueTracker?: IssueTracker;
   /** Required event ledger; InMemoryLedger is the explicit ephemeral choice. */
   readonly ledger: Ledger;
   /** Monotonic-ish millisecond clock, stamped at phase boundaries. */
