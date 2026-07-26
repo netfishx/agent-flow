@@ -28,3 +28,13 @@ and design records.
   not applicable, applied, skipped, or failed.
 - **Marker** — the invisible HTML comment containing a delivery id at the start
   of a synchronized issue comment, used for exact remote deduplication.
+- **Reconciliation pass** — one lease-held sweep over a run's due milestones.
+  Passes for a single run never overlap, so two of them cannot both miss a
+  marker and both create a comment.
+- **Backfill** — confirming a delivery from a marker the issue already carries,
+  because the remote write landed but its confirmation did not.
+- **Delivery outcome** — what one reconciliation pass did with one delivery:
+  posted, backfilled, or failed.
+- **Planning failure** — a reconciliation pass that could not compute the due
+  list at all. It is contained rather than thrown, and it produces no delivery
+  record, so no delivery state carries it.
