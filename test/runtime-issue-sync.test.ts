@@ -25,10 +25,12 @@ import {
 } from "../src/issue/tracker.ts";
 import type {
   IssueRef,
+  LaneResult,
   RunEvent,
   RunEventActor,
   RunEventDataByType,
   RunEventType,
+  RuntimeDeps,
 } from "../src/index.ts";
 
 const roots: string[] = [];
@@ -92,6 +94,30 @@ class LoseFirstConfirmationLedger extends InMemoryLedger {
       this.lost = true;
       throw new Error("injected confirmation commit loss");
     }
+  }
+}
+
+class DecisionAfterAwaitRuntime extends WorkflowRuntime {
+  private appended = false;
+
+  constructor(
+    deps: RuntimeDeps,
+    private readonly appendDecision: (runId: string) => Promise<void>,
+  ) {
+    super(deps);
+  }
+
+  override async awaitLane(
+    runId: string,
+    laneId: string,
+    timeoutMs: number,
+  ): Promise<LaneResult> {
+    const result = await super.awaitLane(runId, laneId, timeoutMs);
+    if (!this.appended) {
+      this.appended = true;
+      await this.appendDecision(runId);
+    }
+    return result;
   }
 }
 
@@ -262,6 +288,78 @@ describe("WorkflowRuntime issue synchronization", () => {
     });
   });
 
+  test("a drive slice delivers a decision while its lane remains non-terminal", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "agent-flow-issue-sync-drive-slice-"),
+    );
+    roots.push(root);
+    const clock = createClock(7_500);
+    const adapter = new CountingAdapter({
+      clock,
+      lanes: [
+        {
+          laneId: "review",
+          exitCode: 0,
+          emitSentinel: false,
+          waitMatches: false,
+        },
+      ],
+    });
+    const ledger = new InMemoryLedger();
+    const tracker = new FakeIssueTracker();
+    const runtime = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run-drive-slice-only",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: tracker,
+    });
+    const handle = await runtime.startWorkflow(config(root));
+    await runtime.confirmLaneStarted(handle.runId, "review");
+    await appendEvent(
+      ledger,
+      handle.runId,
+      "owner_decision_recorded",
+      {
+        decision: "changes-requested",
+        note: "recorded between dispatch and terminal facts",
+        resultingIssueState: "needs-info",
+      },
+      { actor: "human" },
+    );
+
+    const lane = await runtime.awaitLane(
+      handle.runId,
+      "review",
+      1,
+    );
+
+    const run = await ledger.load(handle.runId);
+    const decision = run?.decisions[0];
+    if (decision === undefined) {
+      throw new Error("expected owner decision");
+    }
+    const deliveryId =
+      `${handle.runId}:${decision.sequence}:decision`;
+    expect(lane).toMatchObject({
+      state: "running",
+      timedOut: true,
+    });
+    expect(run?.finishStatus).toBeNull();
+    expect(run?.deliveries[deliveryId]).toMatchObject({
+      kind: "decision",
+      state: "delivered",
+    });
+    expect(
+      tracker.calls
+        .filter((call) => call.operation === "createComment")
+        .map((call) => call.arguments[1] as string)
+        .filter((body) => body.includes("## Owner decision")),
+    ).toHaveLength(1);
+  });
+
   test("a lost confirmation commit is backfilled on resume without reposting start", async () => {
     const root = await mkdtemp(
       join(tmpdir(), "agent-flow-issue-sync-confirm-"),
@@ -310,6 +408,68 @@ describe("WorkflowRuntime issue synchronization", () => {
       intents: 2,
     });
     expect(run?.finishStatus).toBe("clean");
+  });
+
+  test("resume tail delivers a decision recorded after the last driven lane returns", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "agent-flow-issue-sync-resume-tail-"),
+    );
+    roots.push(root);
+    const clock = createClock(15_000);
+    const adapter = new CountingAdapter({
+      clock,
+      lanes: [{ laneId: "review", exitCode: 0 }],
+    });
+    const ledger = new InMemoryLedger();
+    const tracker = new FakeIssueTracker();
+    const deps: RuntimeDeps = {
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run-resume-tail-only",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: tracker,
+    };
+    const handle = await new WorkflowRuntime(deps).startWorkflow(
+      config(root),
+    );
+    const resumed = new DecisionAfterAwaitRuntime(
+      { ...deps, idgen: () => "unused" },
+      (runId) =>
+        appendEvent(
+          ledger,
+          runId,
+          "owner_decision_recorded",
+          {
+            decision: "changes-requested",
+            note: "recorded after lane drive",
+            resultingIssueState: "needs-info",
+          },
+          { actor: "human" },
+        ),
+    );
+
+    await resumed.resumeWorkflow(handle.runId, 1_000);
+
+    const run = await ledger.load(handle.runId);
+    const decision = run?.decisions[0];
+    if (decision === undefined) {
+      throw new Error("expected owner decision");
+    }
+    const deliveryId =
+      `${handle.runId}:${decision.sequence}:decision`;
+    expect(run?.deliveries[deliveryId]).toMatchObject({
+      kind: "decision",
+      state: "delivered",
+      labelTransition: "not-applicable",
+    });
+    expect(
+      tracker.calls
+        .filter((call) => call.operation === "createComment")
+        .map((call) => call.arguments[1] as string)
+        .filter((body) => body.includes("## Owner decision")),
+    ).toHaveLength(1);
   });
 
   test.each([

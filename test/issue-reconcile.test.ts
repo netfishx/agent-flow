@@ -325,11 +325,53 @@ describe("reconcileIssueSync", () => {
       intents: 1,
       commentId: 88,
       commentUrl: "https://example.invalid/comment/88",
+      labelTransition: "not-applicable",
     });
     expect(
       tracker.calls.map((call) => call.operation),
     ).toEqual(["resolveIssue", "findCommentByMarker", "readCurrentLabels"]);
   });
+
+  test.each([
+    [["needs-info"], "applied"],
+    [["ready-for-human"], "skipped"],
+  ] as const)(
+    "backfills a blocked delivery with label transition %s",
+    async (labels, expectedTransition) => {
+      const builder = await RunBuilder.create();
+      await builder.registerAndDispatch();
+      await builder.settleStart();
+      await builder.blockLane();
+      const [blocked] = dueMilestones(await builder.view());
+      if (blocked === undefined || blocked.kind !== "blocked") {
+        throw new Error("expected blocked milestone");
+      }
+      const tracker = new FakeIssueTracker({
+        markerHit: {
+          body: `${marker(blocked.deliveryId)}\n\nexisting delivery`,
+          comment: {
+            commentId: 89,
+            commentUrl: "https://example.invalid/comment/89",
+          },
+        },
+        labels,
+      });
+
+      await reconcileIssueSync({
+        loadRun: () => builder.view(),
+        appendEvent: (event) => builder.appendIssueEvent(event),
+        tracker,
+      });
+
+      expect(
+        (await builder.view()).deliveries[blocked.deliveryId],
+      ).toMatchObject({
+        state: "delivered",
+        commentId: 89,
+        labelTransition: expectedTransition,
+      });
+    },
+  );
 
   test.each([true, false])(
     "records resolve failure with retryable=%s and never throws",
