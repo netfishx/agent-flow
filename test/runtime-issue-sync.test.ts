@@ -2,7 +2,7 @@
 // boundaries through the real runtime with fake Herdr and tracker adapters.
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -109,6 +109,15 @@ class ArmableConfirmationLossLedger extends InMemoryLedger {
       this.armed = false;
       throw new Error("injected confirmation commit loss");
     }
+  }
+}
+
+class RecordingLedger extends InMemoryLedger {
+  readonly events: RunEvent[] = [];
+
+  override async commit(event: RunEvent): Promise<void> {
+    await super.commit(event);
+    this.events.push(structuredClone(event));
   }
 }
 
@@ -410,7 +419,7 @@ describe("WorkflowRuntime issue synchronization", () => {
     expect(tracker.calls).toEqual([]);
   });
 
-  test("a lease-free drive cannot synchronize a retryable delivery", async () => {
+  test("a lease-free drive cannot collect a checkpoint or synchronize a delivery", async () => {
     const failing = new FakeIssueTracker({
       failure: { operation: "resolveIssue", retryable: true },
     });
@@ -419,6 +428,17 @@ describe("WorkflowRuntime issue synchronization", () => {
       runId: "run-lease-free-drive",
     });
     const handle = await runtime.startWorkflow(config(root));
+    await writeFile(
+      join(
+        root,
+        "work",
+        handle.runId,
+        "checkpoints",
+        "review.md",
+      ),
+      "STATUS: blocked\nBLOCKERS:\n- lease required\n",
+      "utf8",
+    );
     const healthy = new FakeIssueTracker();
     const observer = new WorkflowRuntime({
       adapter,
@@ -433,6 +453,12 @@ describe("WorkflowRuntime issue synchronization", () => {
     await observer.awaitLane(handle.runId, "review", 1);
 
     expect(healthy.calls).toEqual([]);
+    expect(
+      (await ledger.load(handle.runId))?.lanes.review,
+    ).toMatchObject({
+      semanticState: "unknown",
+      blockedAnchor: null,
+    });
     expect(
       (await ledger.load(handle.runId))?.deliveries[
         "run-lease-free-drive:3:start"
@@ -513,6 +539,336 @@ describe("WorkflowRuntime issue synchronization", () => {
         .map((call) => call.arguments[1] as string)
         .filter((body) => body.includes("## Owner decision")),
     ).toHaveLength(1);
+  });
+
+  test("a drive slice reports one blocked comment while its lane remains running", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "agent-flow-issue-sync-blocked-live-"),
+    );
+    roots.push(root);
+    const clock = createClock(8_000);
+    const adapter = new CountingAdapter({
+      clock,
+      lanes: [
+        {
+          laneId: "review",
+          exitCode: 0,
+          emitSentinel: false,
+          waitMatches: false,
+        },
+      ],
+    });
+    const ledger = new InMemoryLedger();
+    const tracker = new FakeIssueTracker({
+      labels: ["ready-for-agent"],
+    });
+    const runtime = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run-blocked-live",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: tracker,
+    });
+    const handle = await runtime.startWorkflow(config(root));
+    await runtime.confirmLaneStarted(handle.runId, "review");
+    const checkpointFile = join(
+      root,
+      "work",
+      handle.runId,
+      "checkpoints",
+      "review.md",
+    );
+    await mkdir(join(root, "work", handle.runId, "checkpoints"), {
+      recursive: true,
+    });
+    await writeFile(
+      checkpointFile,
+      `STATUS: blocked
+BLOCKERS:
+- owner ruling required
+NEXT:
+- wait in the visible pane
+GAPS:
+- verification is pending
+`,
+      "utf8",
+    );
+
+    const lane = await runtime.awaitLane(handle.runId, "review", 1);
+
+    const run = await ledger.load(handle.runId);
+    const blockedBodies = tracker.calls
+      .filter((call) => call.operation === "createComment")
+      .map((call) => call.arguments[1] as string)
+      .filter((body) => body.includes("is blocked"));
+    expect(lane).toMatchObject({ state: "running", timedOut: true });
+    expect(run?.finishStatus).toBeNull();
+    expect(run?.lanes.review).toMatchObject({
+      runtimeState: "running",
+      semanticState: "blocked",
+      checkpointFile,
+    });
+    expect(blockedBodies).toHaveLength(1);
+    expect(blockedBodies[0]).toContain("**Role:** reviewer");
+    expect(blockedBodies[0]).toContain("owner ruling required");
+    expect(blockedBodies[0]).toContain("wait in the visible pane");
+    expect(blockedBodies[0]).toContain("verification is pending");
+    expect(blockedBodies[0]).toContain(
+      "**Checkpoint:** `checkpoints/review.md`",
+    );
+    expect(blockedBodies[0]).toContain(
+      "The triage label was moved to `needs-info`.",
+    );
+    const blockedDelivery = run?.deliveryOrder
+      .map((deliveryId) => run.deliveries[deliveryId])
+      .find((delivery) => delivery?.kind === "blocked");
+    expect(blockedDelivery).toMatchObject({
+      state: "delivered",
+      labelTransition: "applied",
+    });
+    expect(
+      tracker.calls.filter(
+        (call) => call.operation === "compareAndSetTriageLabel",
+      ),
+    ).toHaveLength(1);
+  });
+
+  test("terminal collection upgrades blocked to complete exactly once", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "agent-flow-issue-sync-blocked-complete-"),
+    );
+    roots.push(root);
+    const clock = createClock(9_000);
+    const adapter = new CountingAdapter({
+      clock,
+      lanes: [
+        {
+          laneId: "review",
+          exitCode: 0,
+          waitMatches: false,
+        },
+      ],
+    });
+    const ledger = new RecordingLedger();
+    const tracker = new FakeIssueTracker({
+      labels: ["ready-for-agent"],
+    });
+    const runtime = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run-blocked-complete",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: tracker,
+    });
+    const handle = await runtime.startWorkflow(config(root));
+    await runtime.confirmLaneStarted(handle.runId, "review");
+    const checkpointFile = join(
+      root,
+      "work",
+      handle.runId,
+      "checkpoints",
+      "review.md",
+    );
+    await writeFile(
+      checkpointFile,
+      "STATUS: blocked\nBLOCKERS:\n- owner ruling required\n",
+      "utf8",
+    );
+    await runtime.awaitLane(handle.runId, "review", 1);
+    await writeFile(
+      checkpointFile,
+      "STATUS: complete\nBLOCKERS:\n- none\nGAPS:\n- routed onward\n",
+      "utf8",
+    );
+    adapter.finishLane("review");
+
+    await runtime.awaitLane(handle.runId, "review", 1);
+    const checkpointCountAfterUpgrade = ledger.events.filter(
+      (event) =>
+        event.type === "lane_checkpoint" &&
+        event.laneId === "review",
+    ).length;
+    await runtime.awaitLane(handle.runId, "review", 1);
+
+    const run = await ledger.load(handle.runId);
+    expect(run?.lanes.review).toMatchObject({
+      runtimeState: "exited",
+      semanticState: "complete",
+      blockedAnchor: {
+        blockers: ["owner ruling required"],
+      },
+    });
+    expect(checkpointCountAfterUpgrade).toBe(2);
+    expect(
+      ledger.events.filter(
+        (event) =>
+          event.type === "lane_checkpoint" &&
+          event.laneId === "review",
+      ),
+    ).toHaveLength(2);
+    expect(
+      ledger.events
+        .filter(
+          (event) =>
+            event.type === "lane_checkpoint" &&
+            event.laneId === "review",
+        )
+        .map((event) => event.actor),
+    ).toEqual(["agent", "agent"]);
+  });
+
+  test("a sibling boundary collects a human-owned lane without driving it", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "agent-flow-issue-sync-human-sibling-"),
+    );
+    roots.push(root);
+    const clock = createClock(9_500);
+    const adapter = new CountingAdapter({
+      clock,
+      lanes: [
+        {
+          laneId: "human",
+          exitCode: 0,
+          emitSentinel: false,
+          waitMatches: false,
+        },
+        {
+          laneId: "sibling",
+          exitCode: 0,
+          emitSentinel: false,
+          waitMatches: false,
+        },
+      ],
+    });
+    const ledger = new InMemoryLedger();
+    const tracker = new FakeIssueTracker({
+      labels: ["ready-for-agent"],
+    });
+    const runtime = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run-human-sibling",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: tracker,
+    });
+    const handle = await runtime.startWorkflow({
+      ...config(root),
+      lanes: [
+        { laneId: "human", role: "owner-operated", steps: 1 },
+        { laneId: "sibling", role: "managed", steps: 1 },
+      ],
+    });
+    await runtime.confirmLaneStarted(handle.runId, "human");
+    await runtime.confirmLaneStarted(handle.runId, "sibling");
+    await runtime.takeoverLane(handle.runId, "human");
+    const checkpointFile = join(
+      root,
+      "work",
+      handle.runId,
+      "checkpoints",
+      "human.md",
+    );
+    await mkdir(join(root, "work", handle.runId, "checkpoints"), {
+      recursive: true,
+    });
+    await writeFile(
+      checkpointFile,
+      "STATUS: blocked\nBLOCKERS:\n- owner input required\n",
+      "utf8",
+    );
+
+    await runtime.awaitLane(handle.runId, "sibling", 1);
+
+    const run = await ledger.load(handle.runId);
+    const humanPane = adapter.paneIdForLane("human");
+    expect(run?.lanes.human).toMatchObject({
+      runtimeState: "running",
+      controlMode: "human_owned",
+      semanticState: "blocked",
+    });
+    expect(adapter.waitedPaneIds).not.toContain(humanPane);
+    expect(adapter.interruptedPaneIds).not.toContain(humanPane);
+    expect(adapter.focusedPaneId).not.toBe(humanPane);
+    expect(
+      tracker.calls
+        .filter((call) => call.operation === "createComment")
+        .map((call) => call.arguments[1] as string)
+        .filter((body) => body.includes("Lane `human` is blocked")),
+    ).toHaveLength(1);
+  });
+
+  test("an all-human-owned run collects only at the next resume tail", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "agent-flow-issue-sync-human-resume-"),
+    );
+    roots.push(root);
+    const clock = createClock(9_750);
+    const adapter = new CountingAdapter({
+      clock,
+      lanes: [
+        {
+          laneId: "review",
+          exitCode: 0,
+          emitSentinel: false,
+          waitMatches: false,
+        },
+      ],
+    });
+    const ledger = new InMemoryLedger();
+    const tracker = new FakeIssueTracker({
+      labels: ["ready-for-agent"],
+    });
+    const deps: RuntimeDeps = {
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run-human-resume",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: tracker,
+    };
+    const runtime = new WorkflowRuntime(deps);
+    const handle = await runtime.startWorkflow(config(root));
+    await runtime.confirmLaneStarted(handle.runId, "review");
+    await runtime.takeoverLane(handle.runId, "review");
+    const checkpointFile = join(
+      root,
+      "work",
+      handle.runId,
+      "checkpoints",
+      "review.md",
+    );
+    await mkdir(join(root, "work", handle.runId, "checkpoints"), {
+      recursive: true,
+    });
+    await writeFile(
+      checkpointFile,
+      "STATUS: blocked\nBLOCKERS:\n- resume-tail owner input\n",
+      "utf8",
+    );
+    const blockedComments = () =>
+      tracker.calls
+        .filter((call) => call.operation === "createComment")
+        .map((call) => call.arguments[1] as string)
+        .filter((body) => body.includes("is blocked"));
+    expect(blockedComments()).toHaveLength(0);
+
+    await new WorkflowRuntime({
+      ...deps,
+      idgen: () => "unused",
+    }).resumeWorkflow(handle.runId, 1);
+
+    expect(blockedComments()).toHaveLength(1);
+    expect(adapter.waitedPaneIds).toEqual([]);
+    expect(adapter.interruptedPaneIds).toEqual([]);
+    expect(adapter.focusedPaneId).toBeNull();
+    expect((await ledger.load(handle.runId))?.finishStatus).toBeNull();
   });
 
   test("a lost confirmation commit is backfilled on resume without reposting start", async () => {

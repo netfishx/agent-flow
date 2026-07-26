@@ -52,6 +52,15 @@ VERIFICATION_CLAIMS:
     });
   });
 
+  test("requires the documented uppercase STATUS header without changing none normalization", () => {
+    expect(
+      parseCheckpoint("Status: Complete\nBLOCKERS:\n- None\n"),
+    ).toMatchObject({
+      status: null,
+      blockers: [],
+    });
+  });
+
   test.each([
     "",
     "STATUS: working\nBLOCKERS:\n- waiting\n",

@@ -11,12 +11,26 @@ import type {
   IssueDeliveryFailedData,
   IssueDeliveryIntendedData,
   MilestoneKind,
+  RuntimeState,
 } from "../runtime/events.ts";
+import type { ParsedCheckpoint } from "../runtime/checkpoint.ts";
+import {
+  checkpointSemanticSignature,
+  laneCheckpointFile,
+  parseCheckpoint,
+} from "../runtime/checkpoint.ts";
 import type { RunView } from "../runtime/reducer.ts";
 import { canonicalPayloadHash } from "./hash.ts";
 import { dueMilestones, marker } from "./milestones.ts";
 import { renderMilestone } from "./render.ts";
 import { IssueTrackerError, type IssueTracker } from "./tracker.ts";
+
+const TERMINAL_RUNTIME: ReadonlySet<RuntimeState> = new Set([
+  "exited",
+  "crashed",
+  "lost",
+  "failed_to_start",
+]);
 
 export type IssueSyncEvent =
   | {
@@ -38,8 +52,62 @@ export type IssueSyncEvent =
 
 export interface ReconcileIssueSyncDeps {
   readonly loadRun: () => Promise<RunView>;
-  readonly appendEvent: (event: IssueSyncEvent) => Promise<void>;
+  readonly appendEvent: (event: ReconcileEvent) => Promise<void>;
+  readonly readLaneCheckpoint?: (
+    laneId: string,
+  ) => Promise<string | null>;
   readonly tracker: IssueTracker;
+}
+
+export interface LaneCheckpointCollectionEvent {
+  readonly type: "lane_checkpoint";
+  readonly laneId: string;
+  readonly data: {
+    readonly semanticState: "blocked";
+    readonly checkpointFile: string;
+    readonly blockers: readonly string[];
+    readonly next: readonly string[];
+    readonly gaps: readonly string[];
+  };
+}
+
+export type ReconcileEvent =
+  | IssueSyncEvent
+  | LaneCheckpointCollectionEvent;
+
+export function collectBlockedCheckpoint(
+  run: RunView,
+  laneId: string,
+  checkpoint: ParsedCheckpoint,
+): LaneCheckpointCollectionEvent | null {
+  if (checkpoint.status !== "blocked") return null;
+  const lane = run.lanes[laneId];
+  if (lane === undefined) {
+    throw new Error(`unknown laneId "${laneId}" in run "${run.runId}"`);
+  }
+  if (TERMINAL_RUNTIME.has(lane.runtimeState)) return null;
+  if (
+    lane.checkpointSemanticSignature ===
+    checkpointSemanticSignature({
+      status: checkpoint.status,
+      blockers: checkpoint.blockers,
+      next: checkpoint.next,
+      gaps: checkpoint.gaps,
+    })
+  ) {
+    return null;
+  }
+  return {
+    type: "lane_checkpoint",
+    laneId,
+    data: {
+      semanticState: "blocked",
+      checkpointFile: laneCheckpointFile(run.cwd, run.runId, laneId),
+      blockers: checkpoint.blockers,
+      next: checkpoint.next,
+      gaps: checkpoint.gaps,
+    },
+  };
 }
 
 export type ReconcileDeliverySummary =
@@ -88,7 +156,28 @@ export async function reconcileIssueSync(
 ): Promise<ReconcileIssueSyncSummary> {
   let milestones;
   try {
-    const run = await deps.loadRun();
+    let run = await deps.loadRun();
+    if (deps.readLaneCheckpoint !== undefined) {
+      for (const laneId of run.laneOrder) {
+        try {
+          const text = await deps.readLaneCheckpoint(laneId);
+          if (text === null) continue;
+          const event = collectBlockedCheckpoint(
+            run,
+            laneId,
+            parseCheckpoint(text),
+          );
+          if (event !== null) {
+            await deps.appendEvent(event);
+            run = await deps.loadRun();
+          }
+        } catch {
+          // A checkpoint is an optional Agent report. Collection failures are
+          // not issue-delivery failures and do not abort the pass.
+        }
+      }
+      run = await deps.loadRun();
+    }
     milestones = dueMilestones(run);
   } catch (error) {
     return {

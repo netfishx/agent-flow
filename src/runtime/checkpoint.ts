@@ -1,3 +1,6 @@
+import { join } from "node:path";
+import type { SemanticState } from "./events.ts";
+
 export interface ParsedCheckpoint {
   readonly status: "complete" | "partial" | "blocked" | null;
   readonly blockers: readonly string[];
@@ -5,6 +8,28 @@ export interface ParsedCheckpoint {
   readonly gaps: readonly string[];
   readonly artifacts: readonly string[];
   readonly verificationClaims: readonly string[];
+}
+
+export function checkpointSemanticSignature(input: {
+  readonly status: SemanticState;
+  readonly blockers?: readonly string[];
+  readonly next?: readonly string[];
+  readonly gaps?: readonly string[];
+}): string {
+  return JSON.stringify([
+    input.status,
+    input.blockers ?? [],
+    input.next ?? [],
+    input.gaps ?? [],
+  ]);
+}
+
+export function laneCheckpointFile(
+  cwd: string,
+  runId: string,
+  laneId: string,
+): string {
+  return join(cwd, runId, "checkpoints", `${laneId}.md`);
 }
 
 type CheckpointSection =
@@ -28,7 +53,7 @@ function normalizedItems(items: readonly string[]): readonly string[] {
 
 export function parseCheckpoint(text: string): ParsedCheckpoint {
   const statusMatch = text.match(
-    /^STATUS:\s*(complete|partial|blocked)\s*$/im,
+    /^STATUS:\s*(complete|partial|blocked)\s*$/m,
   );
   const collected: Record<CheckpointSection, string[]> = {
     BLOCKERS: [],
