@@ -10,13 +10,13 @@ import type {
   IssueDeliveryConfirmedData,
   IssueDeliveryFailedData,
   IssueDeliveryIntendedData,
+  LaneCheckpointData,
   MilestoneKind,
   RuntimeState,
 } from "../runtime/events.ts";
 import type { ParsedCheckpoint } from "../runtime/checkpoint.ts";
 import {
   checkpointSemanticSignature,
-  laneCheckpointFile,
   parseCheckpoint,
 } from "../runtime/checkpoint.ts";
 import type { RunView } from "../runtime/reducer.ts";
@@ -55,19 +55,20 @@ export interface ReconcileIssueSyncDeps {
   readonly appendEvent: (event: ReconcileEvent) => Promise<void>;
   readonly readLaneCheckpoint?: (
     laneId: string,
-  ) => Promise<string | null>;
+  ) => Promise<LaneCheckpointRead | null>;
   readonly tracker: IssueTracker;
+}
+
+export interface LaneCheckpointRead {
+  readonly text: string;
+  readonly checkpointFile: string;
 }
 
 export interface LaneCheckpointCollectionEvent {
   readonly type: "lane_checkpoint";
   readonly laneId: string;
-  readonly data: {
+  readonly data: Omit<LaneCheckpointData, "semanticState"> & {
     readonly semanticState: "blocked";
-    readonly checkpointFile: string;
-    readonly blockers: readonly string[];
-    readonly next: readonly string[];
-    readonly gaps: readonly string[];
   };
 }
 
@@ -79,6 +80,7 @@ export function collectBlockedCheckpoint(
   run: RunView,
   laneId: string,
   checkpoint: ParsedCheckpoint,
+  checkpointFile: string,
 ): LaneCheckpointCollectionEvent | null {
   if (checkpoint.status !== "blocked") return null;
   const lane = run.lanes[laneId];
@@ -102,7 +104,7 @@ export function collectBlockedCheckpoint(
     laneId,
     data: {
       semanticState: "blocked",
-      checkpointFile: laneCheckpointFile(run.cwd, run.runId, laneId),
+      checkpointFile,
       blockers: checkpoint.blockers,
       next: checkpoint.next,
       gaps: checkpoint.gaps,
@@ -157,26 +159,39 @@ export async function reconcileIssueSync(
   let milestones;
   try {
     let run = await deps.loadRun();
-    if (deps.readLaneCheckpoint !== undefined) {
+    if (run.issue !== null && deps.readLaneCheckpoint !== undefined) {
       for (const laneId of run.laneOrder) {
-        try {
-          const text = await deps.readLaneCheckpoint(laneId);
-          if (text === null) continue;
-          const event = collectBlockedCheckpoint(
-            run,
-            laneId,
-            parseCheckpoint(text),
+        const lane = run.lanes[laneId];
+        if (lane === undefined) {
+          throw new Error(
+            `unknown laneId "${laneId}" in run "${run.runId}"`,
           );
-          if (event !== null) {
-            await deps.appendEvent(event);
-            run = await deps.loadRun();
-          }
+        }
+        if (TERMINAL_RUNTIME.has(lane.runtimeState)) continue;
+        let checkpoint: ParsedCheckpoint;
+        let checkpointFile: string;
+        try {
+          const read = await deps.readLaneCheckpoint(laneId);
+          if (read === null) continue;
+          checkpoint = parseCheckpoint(read.text);
+          checkpointFile = read.checkpointFile;
         } catch {
-          // A checkpoint is an optional Agent report. Collection failures are
-          // not issue-delivery failures and do not abort the pass.
+          // An absent, unreadable, or unparseable Agent report is not an
+          // issue-delivery failure and does not abort the pass.
+          continue;
+        }
+        run = await deps.loadRun();
+        const event = collectBlockedCheckpoint(
+          run,
+          laneId,
+          checkpoint,
+          checkpointFile,
+        );
+        if (event !== null) {
+          await deps.appendEvent(event);
+          run = await deps.loadRun();
         }
       }
-      run = await deps.loadRun();
     }
     milestones = dueMilestones(run);
   } catch (error) {

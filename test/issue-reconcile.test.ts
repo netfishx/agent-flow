@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, expectTypeOf, test } from "bun:test";
 import {
   FakeIssueTracker,
   InMemoryLedger,
@@ -17,9 +17,12 @@ import {
   type RunEventType,
   type RunView,
 } from "../src/index.ts";
+import type { LaneCheckpointData } from "../src/runtime/events.ts";
 import {
   collectBlockedCheckpoint,
   reconcileIssueSync,
+  type LaneCheckpointCollectionEvent,
+  type LaneCheckpointRead,
   type ReconcileEvent,
 } from "../src/issue/reconcile.ts";
 
@@ -98,6 +101,15 @@ const issue: IssueRef = {
   repo: "agent-flow",
   number: 27,
 };
+const collectedCheckpointFile =
+  "/tmp/agent-flow-reconcile/run-reconcile/checkpoints/review.md";
+
+function checkpointRead(text: string): {
+  readonly text: string;
+  readonly checkpointFile: string;
+} {
+  return { text, checkpointFile: collectedCheckpointFile };
+}
 
 class RunBuilder {
   readonly ledger = new InMemoryLedger();
@@ -221,6 +233,14 @@ class RunBuilder {
 }
 
 describe("reconcileIssueSync", () => {
+  test("narrows the shared lane checkpoint event data for blocked collection", () => {
+    expectTypeOf<LaneCheckpointCollectionEvent["data"]>().toEqualTypeOf<
+      Omit<LaneCheckpointData, "semanticState"> & {
+        readonly semanticState: "blocked";
+      }
+    >();
+  });
+
   test("selects a blocked checkpoint fact for a non-terminal lane", async () => {
     const builder = await RunBuilder.create();
     await builder.registerAndDispatch();
@@ -237,6 +257,7 @@ NEXT:
 GAPS:
 - not verified
 `),
+        collectedCheckpointFile,
       ),
     ).toEqual({
       type: "lane_checkpoint",
@@ -250,6 +271,22 @@ GAPS:
         gaps: ["not verified"],
       },
     });
+  });
+
+  test("preserves the runtime-owned checkpoint path in the collected fact", async () => {
+    const builder = await RunBuilder.create();
+    await builder.registerAndDispatch();
+
+    const event = collectBlockedCheckpoint(
+      await builder.view(),
+      "review",
+      parseCheckpoint("STATUS: blocked\nBLOCKERS:\n- owner ruling\n"),
+      "/runtime-owned/artifacts/review-checkpoint.txt",
+    );
+
+    expect(event?.data.checkpointFile).toBe(
+      "/runtime-owned/artifacts/review-checkpoint.txt",
+    );
   });
 
   test("skips an unchanged blocked checkpoint re-read", async () => {
@@ -269,6 +306,7 @@ NEXT:
 GAPS:
 - not verified
 `),
+        collectedCheckpointFile,
       ),
     ).toBeNull();
   });
@@ -289,12 +327,18 @@ GAPS:
       await builder.view(),
       "review",
       changed,
+      collectedCheckpointFile,
     );
     expect(event).not.toBeNull();
     await builder.appendIssueEvent(event!);
 
     expect(
-      collectBlockedCheckpoint(await builder.view(), "review", changed),
+      collectBlockedCheckpoint(
+        await builder.view(),
+        "review",
+        changed,
+        collectedCheckpointFile,
+      ),
     ).toBeNull();
   });
 
@@ -312,6 +356,7 @@ GAPS:
         await builder.view(),
         "review",
         parseCheckpoint("STATUS: blocked\nBLOCKERS:\n- too late\n"),
+        collectedCheckpointFile,
       ),
     ).toBeNull();
   });
@@ -327,6 +372,7 @@ GAPS:
           await builder.view(),
           "review",
           parseCheckpoint(`STATUS: ${status}\nBLOCKERS:\n- none\n`),
+          collectedCheckpointFile,
         ),
       ).toBeNull();
     },
@@ -345,14 +391,14 @@ GAPS:
       appendEvent: (event) => builder.appendIssueEvent(event),
       readLaneCheckpoint: async (laneId) =>
         laneId === "review"
-          ? `STATUS: blocked
+          ? checkpointRead(`STATUS: blocked
 BLOCKERS:
 - owner decision required
 NEXT:
 - wait for owner
 GAPS:
 - not verified
-`
+`)
           : null,
       tracker,
     });
@@ -382,23 +428,156 @@ GAPS:
     ).toHaveLength(1);
   });
 
+  test("does not collect blocked when the lane exits while its checkpoint is being read", async () => {
+    const builder = await RunBuilder.create();
+    await builder.registerAndDispatch();
+    await builder.settleStart();
+    const beforeRead = await builder.view();
+    const tracker = new FakeIssueTracker({
+      labels: ["ready-for-agent"],
+    });
+
+    const summary = await reconcileIssueSync({
+      loadRun: () => builder.view(),
+      appendEvent: (event) => builder.appendIssueEvent(event),
+      readLaneCheckpoint: async () => {
+        await builder.append(
+          "lane_exited",
+          { exitCode: 0 },
+          { laneId: "review" },
+        );
+        return checkpointRead(
+          "STATUS: blocked\nBLOCKERS:\n- owner decision required\n",
+        );
+      },
+      tracker,
+    });
+
+    const after = await builder.view();
+    expect(after.lastAppliedSequence).toBe(
+      beforeRead.lastAppliedSequence + 1,
+    );
+    expect(after.lanes.review).toMatchObject({
+      runtimeState: "exited",
+      semanticState: "unknown",
+      blockedAnchor: null,
+    });
+    expect(summary).toEqual({
+      deliveries: [],
+      planningFailure: null,
+    });
+    expect(
+      tracker.calls.filter(
+        (call) =>
+          call.operation === "createComment" ||
+          call.operation === "compareAndSetTriageLabel",
+      ),
+    ).toEqual([]);
+  });
+
+  test("does not read or collect checkpoints for an unbound run", async () => {
+    const builder = await RunBuilder.create(false);
+    await builder.registerAndDispatch();
+    const readLaneIds: string[] = [];
+    const appendedEvents: ReconcileEvent[] = [];
+    const tracker = new FakeIssueTracker();
+
+    const summary = await reconcileIssueSync({
+      loadRun: () => builder.view(),
+      appendEvent: async (event) => {
+        appendedEvents.push(event);
+        await builder.appendIssueEvent(event);
+      },
+      readLaneCheckpoint: async (laneId) => {
+        readLaneIds.push(laneId);
+        return checkpointRead(
+          "STATUS: blocked\nBLOCKERS:\n- owner decision required\n",
+        );
+      },
+      tracker,
+    });
+
+    expect(readLaneIds).toEqual([]);
+    expect(appendedEvents).toEqual([]);
+    expect(summary).toEqual({
+      deliveries: [],
+      planningFailure: null,
+    });
+    expect(tracker.calls).toEqual([]);
+  });
+
+  test("does not read checkpoints for lanes already terminal at pass start", async () => {
+    const builder = await RunBuilder.create();
+    await builder.registerAndDispatch();
+    await builder.settleStart();
+    await builder.append(
+      "lane_exited",
+      { exitCode: 0 },
+      { laneId: "review" },
+    );
+    const readLaneIds: string[] = [];
+    const tracker = new FakeIssueTracker();
+
+    const summary = await reconcileIssueSync({
+      loadRun: () => builder.view(),
+      appendEvent: (event) => builder.appendIssueEvent(event),
+      readLaneCheckpoint: async (laneId) => {
+        readLaneIds.push(laneId);
+        return checkpointRead(
+          "STATUS: blocked\nBLOCKERS:\n- already too late\n",
+        );
+      },
+      tracker,
+    });
+
+    expect(readLaneIds).toEqual([]);
+    expect(summary).toEqual({
+      deliveries: [],
+      planningFailure: null,
+    });
+    expect(tracker.calls).toEqual([]);
+  });
+
+  test("does not reload the run after a collection loop with no changes", async () => {
+    const builder = await RunBuilder.create();
+    await builder.registerAndDispatch();
+    await builder.settleStart();
+    let loads = 0;
+
+    const summary = await reconcileIssueSync({
+      loadRun: async () => {
+        loads++;
+        return builder.view();
+      },
+      appendEvent: (event) => builder.appendIssueEvent(event),
+      readLaneCheckpoint: async () => null,
+      tracker: new FakeIssueTracker(),
+    });
+
+    expect(loads).toBe(1);
+    expect(summary).toEqual({
+      deliveries: [],
+      planningFailure: null,
+    });
+  });
+
   test.each([
-    ["absent", async (): Promise<string | null> => null],
+    ["absent", async (): Promise<LaneCheckpointRead | null> => null],
     [
       "unreadable",
-      async (): Promise<string | null> => {
+      async (): Promise<LaneCheckpointRead | null> => {
         throw new Error("checkpoint permission denied");
       },
     ],
     [
       "unparseable",
-      async (): Promise<string | null> =>
-        "Status: blocked\nBLOCKERS:\n- ignored\n",
+      async (): Promise<LaneCheckpointRead | null> =>
+        checkpointRead("Status: blocked\nBLOCKERS:\n- ignored\n"),
     ],
     [
       "working heartbeat",
-      async (): Promise<string | null> =>
-        "STATUS: working\nBLOCKERS:\n- none\n",
+      async (): Promise<LaneCheckpointRead | null> =>
+        checkpointRead("STATUS: working\nBLOCKERS:\n- none\n"),
     ],
   ] as const)(
     "%s checkpoint collection creates no fact, delivery, or delivery failure",
@@ -428,6 +607,41 @@ GAPS:
     },
   );
 
+  test("reports a blocked checkpoint ledger failure as a planning failure", async () => {
+    const builder = await RunBuilder.create();
+    await builder.registerAndDispatch();
+    await builder.settleStart();
+    const before = await builder.view();
+    const tracker = new FakeIssueTracker();
+
+    const summary = await reconcileIssueSync({
+      loadRun: () => builder.view(),
+      appendEvent: async (event) => {
+        if (event.type === "lane_checkpoint") {
+          throw new Error("ledger rejected blocked checkpoint");
+        }
+        await builder.appendIssueEvent(event);
+      },
+      readLaneCheckpoint: async () =>
+        checkpointRead(
+          "STATUS: blocked\nBLOCKERS:\n- owner decision required\n",
+        ),
+      tracker,
+    });
+
+    const after = await builder.view();
+    expect(summary).toEqual({
+      deliveries: [],
+      planningFailure: {
+        reason: "ledger rejected blocked checkpoint",
+      },
+    });
+    expect(after.lastAppliedSequence).toBe(before.lastAppliedSequence);
+    expect(after.deliveryOrder).toEqual(before.deliveryOrder);
+    expect(after.lanes.review?.blockedAnchor).toBeNull();
+    expect(tracker.calls).toEqual([]);
+  });
+
   test("blocked to working to blocked posts once and records only changed blocked lines", async () => {
     const builder = await RunBuilder.create();
     await builder.registerAndDispatch();
@@ -441,7 +655,7 @@ GAPS:
       loadRun: () => builder.view(),
       appendEvent: (event: ReconcileEvent) =>
         builder.appendIssueEvent(event),
-      readLaneCheckpoint: async () => checkpoint,
+      readLaneCheckpoint: async () => checkpointRead(checkpoint),
       tracker,
     };
 

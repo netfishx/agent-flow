@@ -874,7 +874,10 @@ export class WorkflowRuntime {
           laneId,
         );
         try {
-          return await readFile(checkpointFile, "utf8");
+          return {
+            text: await readFile(checkpointFile, "utf8"),
+            checkpointFile,
+          };
         } catch {
           return null;
         }
