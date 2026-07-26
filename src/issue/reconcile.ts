@@ -70,6 +70,15 @@ function failureFor(error: unknown): {
   };
 }
 
+/**
+ * One reconciliation pass over a run's due milestones.
+ *
+ * Passes for one run must not overlap. Between a recorded intent and its
+ * created comment the marker is legitimately absent, so a second pass entering
+ * that window would miss it and post a second comment. The controller lease
+ * excludes other processes; serializing a controller's own passes is the
+ * caller's job.
+ */
 export async function reconcileIssueSync(
   deps: ReconcileIssueSyncDeps,
 ): Promise<ReconcileIssueSyncSummary> {

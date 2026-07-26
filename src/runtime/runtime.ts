@@ -164,6 +164,7 @@ export class WorkflowRuntime {
   private readonly commitTails = new Map<string, Promise<void>>();
   private readonly leases = new Map<string, LeaseHandle>();
   private readonly deferredLeaseReleases = new Set<string>();
+  private readonly reconcileTails = new Map<string, Promise<void>>();
   private readonly driveSliceMs: number;
 
   constructor(protected readonly deps: RuntimeDeps) {
@@ -814,8 +815,32 @@ export class WorkflowRuntime {
     });
   }
 
-  private async reconcileBoundIssue(runId: string): Promise<void> {
+  // The controller lease makes one process the single writer, but a controller
+  // drives several lanes at once, so its own boundaries can overlap. Two
+  // overlapping passes would both query the marker before either created its
+  // comment, and both would post. Passes are therefore queued per run: one run
+  // never overtakes itself, and runs never wait on each other.
+  private reconcileBoundIssue(runId: string): Promise<void> {
+    if (this.deps.issueTracker === undefined) return Promise.resolve();
+    const prior = this.reconcileTails.get(runId) ?? Promise.resolve();
+    const pass = prior.then(() => this.reconcileBoundIssuePass(runId));
+    const tail = pass.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.reconcileTails.set(runId, tail);
+    void tail.then(() => {
+      if (this.reconcileTails.get(runId) === tail) {
+        this.reconcileTails.delete(runId);
+      }
+    });
+    return pass;
+  }
+
+  private async reconcileBoundIssuePass(runId: string): Promise<void> {
     const tracker = this.deps.issueTracker;
+    // Re-read at execution time: a queued pass must not deliver under a lease
+    // that was released while it waited.
     if (tracker === undefined || !this.leases.has(runId)) return;
     await reconcileIssueSync({
       loadRun: async () => {

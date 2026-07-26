@@ -112,6 +112,69 @@ class ArmableConfirmationLossLedger extends InMemoryLedger {
   }
 }
 
+/**
+ * Parks the first marker query until the test releases it, so a second
+ * reconciliation can be driven into the exact window where the first has
+ * already recorded its intent but has not yet created its comment.
+ */
+class GatedMarkerTracker extends FakeIssueTracker {
+  private armed = false;
+  private parked = false;
+  private readonly entry = Promise.withResolvers<void>();
+  private readonly gate = Promise.withResolvers<void>();
+
+  /** Resolves once a marker query is parked inside the remote window. */
+  get parkedInMarkerQuery(): Promise<void> {
+    return this.entry.promise;
+  }
+
+  arm(): void {
+    this.armed = true;
+  }
+
+  release(): void {
+    this.gate.resolve();
+  }
+
+  override async findCommentByMarker(
+    ref: IssueRef,
+    markerValue: string,
+  ): Promise<CommentRef | null> {
+    const found = await super.findCommentByMarker(ref, markerValue);
+    if (this.armed && !this.parked) {
+      this.parked = true;
+      this.entry.resolve();
+      await this.gate.promise;
+    }
+    return found;
+  }
+}
+
+/** Lets a test observe that a lane has entered its drive-slice boundary. */
+class BoundaryReportingRuntime extends WorkflowRuntime {
+  constructor(
+    deps: RuntimeDeps,
+    private readonly onBoundary: (laneId: string) => void,
+  ) {
+    super(deps);
+  }
+
+  protected override async onDriveSliceBoundary(
+    runId: string,
+    laneId: string,
+  ): Promise<void> {
+    this.onBoundary(laneId);
+    await super.onDriveSliceBoundary(runId, laneId);
+  }
+}
+
+/** Runs every already-scheduled microtask and timer callback to completion. */
+async function settleEventLoop(): Promise<void> {
+  for (let turn = 0; turn < 5; turn++) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+
 class DecisionAfterAwaitRuntime extends WorkflowRuntime {
   private appended = false;
 
@@ -787,5 +850,153 @@ describe("WorkflowRuntime issue synchronization", () => {
     expect(
       tracker.calls.filter((call) => call.operation === "createComment"),
     ).toHaveLength(1);
+  });
+
+  test("concurrent lane boundaries create one delivery's comment once", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "agent-flow-issue-sync-concurrent-"),
+    );
+    roots.push(root);
+    const clock = createClock(25_000);
+    const adapter = new CountingAdapter({
+      clock,
+      lanes: [
+        {
+          laneId: "alpha",
+          exitCode: 0,
+          emitSentinel: false,
+          waitMatches: false,
+        },
+        {
+          laneId: "beta",
+          exitCode: 0,
+          emitSentinel: false,
+          waitMatches: false,
+        },
+      ],
+    });
+    const ledger = new InMemoryLedger();
+    const tracker = new GatedMarkerTracker();
+    const boundaries = new Map<string, PromiseWithResolvers<void>>([
+      ["alpha", Promise.withResolvers<void>()],
+      ["beta", Promise.withResolvers<void>()],
+    ]);
+    const runtime = new BoundaryReportingRuntime(
+      {
+        adapter,
+        ledger,
+        clock: clock.now,
+        idgen: () => "run-concurrent-boundaries",
+        readResultFile: adapter.readResultFile,
+        sleep: async () => {},
+        issueTracker: tracker,
+      },
+      (laneId) => boundaries.get(laneId)?.resolve(),
+    );
+    const handle = await runtime.startWorkflow({
+      ...config(root),
+      lanes: [
+        { laneId: "alpha", steps: 1 },
+        { laneId: "beta", steps: 1 },
+      ],
+    });
+    await runtime.confirmLaneStarted(handle.runId, "alpha");
+    await runtime.confirmLaneStarted(handle.runId, "beta");
+    // An owner decision recorded mid-run is due at the next boundary of every
+    // lane this controller is driving.
+    await appendEvent(
+      ledger,
+      handle.runId,
+      "owner_decision_recorded",
+      {
+        decision: "changes-requested",
+        note: "recorded while both lanes are being driven",
+        resultingIssueState: "needs-info",
+      },
+      { actor: "human" },
+    );
+    tracker.arm();
+    tracker.calls.splice(0);
+
+    const alpha = runtime.awaitLane(handle.runId, "alpha", 1);
+    await tracker.parkedInMarkerQuery;
+    const callsWhileParked = tracker.calls.length;
+    const beta = runtime.awaitLane(handle.runId, "beta", 1);
+    await boundaries.get("beta")!.promise;
+    await settleEventLoop();
+
+    // Beta reached the same boundary while alpha's pass sits between its
+    // recorded intent and its comment. Alpha's marker query has not answered
+    // yet, so any remote call beta made here would be one made while the
+    // marker is guaranteed to be missing.
+    expect(tracker.calls).toHaveLength(callsWhileParked);
+
+    tracker.release();
+    await Promise.all([alpha, beta]);
+
+    const run = await ledger.load(handle.runId);
+    const decision = run?.decisions[0];
+    if (decision === undefined) throw new Error("expected owner decision");
+    const deliveryId = `${handle.runId}:${decision.sequence}:decision`;
+    const posts = tracker.calls.filter(
+      (call) => call.operation === "createComment",
+    );
+    expect(
+      posts.map((call) => String(call.arguments[1]).split("\n")[0]),
+    ).toEqual([marker(deliveryId)]);
+    expect(run?.deliveries[deliveryId]).toMatchObject({
+      state: "delivered",
+      intents: 1,
+    });
+  });
+
+  test("a parked reconciliation does not block another run", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "agent-flow-issue-sync-per-run-"),
+    );
+    roots.push(root);
+    const clock = createClock(30_000);
+    const adapter = new CountingAdapter({
+      clock,
+      lanes: [
+        { laneId: "alpha", exitCode: 0 },
+        { laneId: "beta", exitCode: 0 },
+      ],
+    });
+    const ledger = new InMemoryLedger();
+    const tracker = new GatedMarkerTracker();
+    const runIds = ["run-parked", "run-free"];
+    const runtime = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => runIds.shift() ?? "exhausted",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: tracker,
+    });
+    tracker.arm();
+
+    const parked = runtime.startWorkflow({
+      ...config(root),
+      lanes: [{ laneId: "alpha", steps: 1 }],
+    });
+    await tracker.parkedInMarkerQuery;
+
+    // A second run must reach its own issue while the first run's pass holds
+    // an open remote call. Serialization is per run, not global.
+    const free = await runtime.startWorkflow({
+      ...config(root),
+      lanes: [{ laneId: "beta", steps: 1 }],
+    });
+    expect(
+      (await ledger.load(free.runId))?.deliveries["run-free:3:start"],
+    ).toMatchObject({ state: "delivered" });
+
+    tracker.release();
+    const blocked = await parked;
+    expect(
+      (await ledger.load(blocked.runId))?.deliveries["run-parked:3:start"],
+    ).toMatchObject({ state: "delivered" });
   });
 });
