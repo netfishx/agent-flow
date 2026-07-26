@@ -36,13 +36,10 @@ export type {
 export { canonicalJson, canonicalPayloadHash } from "./issue/hash.ts";
 export { renderMilestone } from "./issue/render.ts";
 export type { RenderContext } from "./issue/render.ts";
-export { reconcileIssueSync } from "./issue/reconcile.ts";
-export type {
-  IssueSyncEvent,
-  ReconcileDeliverySummary,
-  ReconcileIssueSyncDeps,
-  ReconcileIssueSyncSummary,
-} from "./issue/reconcile.ts";
+// The effectively-once reconciler is intentionally NOT exported here. A raw
+// pass must be serialized per run by whoever calls it, and `WorkflowRuntime` is
+// the entry point that guarantees that. Exposing the bare pass would publish an
+// interface whose contract this package cannot enforce.
 export { IssueTrackerError } from "./issue/tracker.ts";
 export type {
   AuthorizedIssueTargetConfig,

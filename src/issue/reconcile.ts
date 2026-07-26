@@ -1,5 +1,9 @@
 // Effectively-once issue-delivery orchestration. This seam translates due
 // milestones into delivery facts and tracker calls without owning event metadata.
+//
+// Internal to the package: `WorkflowRuntime` and its tests are the only callers,
+// because a raw pass carries a serialization contract only the runtime honours.
+// It is deliberately absent from `src/index.ts`.
 
 import type {
   IssueBindingResolvedData,
