@@ -121,6 +121,31 @@ class RecordingLedger extends InMemoryLedger {
   }
 }
 
+class ExitBeforeBlockedCheckpointLedger extends InMemoryLedger {
+  readonly events: RunEvent[] = [];
+  private injected = false;
+
+  override async commit(event: RunEvent): Promise<void> {
+    if (
+      !this.injected &&
+      event.type === "lane_checkpoint" &&
+      event.data.semanticState === "blocked"
+    ) {
+      this.injected = true;
+      const exitEvent = {
+        ...event,
+        type: "lane_exited",
+        actor: "runtime",
+        data: { exitCode: 0 },
+      } as const satisfies RunEvent;
+      await super.commit(exitEvent);
+      this.events.push(structuredClone(exitEvent));
+    }
+    await super.commit(event);
+    this.events.push(structuredClone(event));
+  }
+}
+
 /**
  * Parks the first marker query until the test releases it, so a second
  * reconciliation can be driven into the exact window where the first has
@@ -174,6 +199,15 @@ class BoundaryReportingRuntime extends WorkflowRuntime {
   ): Promise<void> {
     this.onBoundary(laneId);
     await super.onDriveSliceBoundary(runId, laneId);
+  }
+}
+
+class BoundaryReconcileRuntime extends WorkflowRuntime {
+  async reconcileAtBoundary(
+    runId: string,
+    laneId: string,
+  ): Promise<void> {
+    await this.onDriveSliceBoundary(runId, laneId);
   }
 }
 
@@ -633,6 +667,81 @@ GAPS:
         (call) => call.operation === "compareAndSetTriageLabel",
       ),
     ).toHaveLength(1);
+  });
+
+  test("does not collect blocked when a lane exits after checkpoint selection but before commit", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "agent-flow-issue-sync-blocked-commit-race-"),
+    );
+    roots.push(root);
+    const clock = createClock(8_500);
+    const adapter = new CountingAdapter({
+      clock,
+      lanes: [
+        {
+          laneId: "review",
+          exitCode: 0,
+          emitSentinel: false,
+          waitMatches: false,
+        },
+      ],
+    });
+    const ledger = new ExitBeforeBlockedCheckpointLedger();
+    const tracker = new FakeIssueTracker({
+      labels: ["ready-for-agent"],
+    });
+    const runtime = new BoundaryReconcileRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run-blocked-commit-race",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: tracker,
+    });
+    const handle = await runtime.startWorkflow(config(root));
+    await runtime.confirmLaneStarted(handle.runId, "review");
+    const checkpointFile = join(
+      root,
+      "work",
+      handle.runId,
+      "checkpoints",
+      "review.md",
+    );
+    await mkdir(join(root, "work", handle.runId, "checkpoints"), {
+      recursive: true,
+    });
+    await writeFile(
+      checkpointFile,
+      "STATUS: blocked\nBLOCKERS:\n- owner ruling required\n",
+      "utf8",
+    );
+    tracker.calls.splice(0);
+
+    await runtime.reconcileAtBoundary(handle.runId, "review");
+
+    const run = await ledger.load(handle.runId);
+    expect({
+      runtimeState: run?.lanes.review?.runtimeState,
+      semanticState: run?.lanes.review?.semanticState,
+      blockedAnchor: run?.lanes.review?.blockedAnchor,
+      checkpointFacts: ledger.events.filter(
+        (event) => event.type === "lane_checkpoint",
+      ).length,
+      createdComments: tracker.calls.filter(
+        (call) => call.operation === "createComment",
+      ).length,
+      labelCompares: tracker.calls.filter(
+        (call) => call.operation === "compareAndSetTriageLabel",
+      ).length,
+    }).toEqual({
+      runtimeState: "exited",
+      semanticState: "unknown",
+      blockedAnchor: null,
+      checkpointFacts: 0,
+      createdComments: 0,
+      labelCompares: 0,
+    });
   });
 
   test("terminal collection upgrades blocked to complete exactly once", async () => {

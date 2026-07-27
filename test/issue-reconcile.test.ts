@@ -22,6 +22,7 @@ import {
   collectBlockedCheckpoint,
   reconcileIssueSync,
   type LaneCheckpointCollectionEvent,
+  type LaneCheckpointCollectionInput,
   type LaneCheckpointRead,
   type ReconcileEvent,
 } from "../src/issue/reconcile.ts";
@@ -232,6 +233,22 @@ class RunBuilder {
   }
 }
 
+function commitLaneCheckpoint(
+  builder: RunBuilder,
+): (input: LaneCheckpointCollectionInput) => Promise<boolean> {
+  return async ({ laneId, checkpoint, checkpointFile }) => {
+    const event = collectBlockedCheckpoint(
+      await builder.view(),
+      laneId,
+      checkpoint,
+      checkpointFile,
+    );
+    if (event === null) return false;
+    await builder.appendIssueEvent(event);
+    return true;
+  };
+}
+
 describe("reconcileIssueSync", () => {
   test("narrows the shared lane checkpoint event data for blocked collection", () => {
     expectTypeOf<LaneCheckpointCollectionEvent["data"]>().toEqualTypeOf<
@@ -389,6 +406,7 @@ GAPS:
     const summary = await reconcileIssueSync({
       loadRun: () => builder.view(),
       appendEvent: (event) => builder.appendIssueEvent(event),
+      commitLaneCheckpoint: commitLaneCheckpoint(builder),
       readLaneCheckpoint: async (laneId) =>
         laneId === "review"
           ? checkpointRead(`STATUS: blocked
@@ -440,6 +458,7 @@ GAPS:
     const summary = await reconcileIssueSync({
       loadRun: () => builder.view(),
       appendEvent: (event) => builder.appendIssueEvent(event),
+      commitLaneCheckpoint: commitLaneCheckpoint(builder),
       readLaneCheckpoint: async () => {
         await builder.append(
           "lane_exited",
@@ -488,6 +507,7 @@ GAPS:
         appendedEvents.push(event);
         await builder.appendIssueEvent(event);
       },
+      commitLaneCheckpoint: commitLaneCheckpoint(builder),
       readLaneCheckpoint: async (laneId) => {
         readLaneIds.push(laneId);
         return checkpointRead(
@@ -521,6 +541,7 @@ GAPS:
     const summary = await reconcileIssueSync({
       loadRun: () => builder.view(),
       appendEvent: (event) => builder.appendIssueEvent(event),
+      commitLaneCheckpoint: commitLaneCheckpoint(builder),
       readLaneCheckpoint: async (laneId) => {
         readLaneIds.push(laneId);
         return checkpointRead(
@@ -550,6 +571,7 @@ GAPS:
         return builder.view();
       },
       appendEvent: (event) => builder.appendIssueEvent(event),
+      commitLaneCheckpoint: commitLaneCheckpoint(builder),
       readLaneCheckpoint: async () => null,
       tracker: new FakeIssueTracker(),
     });
@@ -591,6 +613,7 @@ GAPS:
       const summary = await reconcileIssueSync({
         loadRun: () => builder.view(),
         appendEvent: (event) => builder.appendIssueEvent(event),
+        commitLaneCheckpoint: commitLaneCheckpoint(builder),
         readLaneCheckpoint,
         tracker,
       });
@@ -616,11 +639,9 @@ GAPS:
 
     const summary = await reconcileIssueSync({
       loadRun: () => builder.view(),
-      appendEvent: async (event) => {
-        if (event.type === "lane_checkpoint") {
-          throw new Error("ledger rejected blocked checkpoint");
-        }
-        await builder.appendIssueEvent(event);
+      appendEvent: (event) => builder.appendIssueEvent(event),
+      commitLaneCheckpoint: async () => {
+        throw new Error("ledger rejected blocked checkpoint");
       },
       readLaneCheckpoint: async () =>
         checkpointRead(
@@ -655,6 +676,7 @@ GAPS:
       loadRun: () => builder.view(),
       appendEvent: (event: ReconcileEvent) =>
         builder.appendIssueEvent(event),
+      commitLaneCheckpoint: commitLaneCheckpoint(builder),
       readLaneCheckpoint: async () => checkpointRead(checkpoint),
       tracker,
     };

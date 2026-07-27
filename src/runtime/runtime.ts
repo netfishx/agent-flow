@@ -3,8 +3,9 @@
 
 import type { PaneRef } from "../herdr/types.ts";
 import {
+  collectBlockedCheckpoint,
   reconcileIssueSync,
-  type ReconcileEvent,
+  type IssueSyncEvent,
 } from "../issue/reconcile.ts";
 import { buildLaneCommand } from "../smoke/lane.ts";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -853,18 +854,35 @@ export class WorkflowRuntime {
         this.registerReducedView(loaded);
         return loaded;
       },
-      appendEvent: async (event: ReconcileEvent) => {
-        if (event.type === "lane_checkpoint") {
-          await this.commitEvent(runId, {
-            ...event,
-            actor: "agent",
-          });
-          return;
-        }
+      appendEvent: async (event: IssueSyncEvent) => {
         await this.commitEvent(runId, {
           ...event,
           actor: "runtime",
         } as NewRunEvent);
+      },
+      commitLaneCheckpoint: async ({
+        laneId,
+        checkpoint,
+        checkpointFile,
+      }) => {
+        const committed = await this.commitEventConditionally(
+          runId,
+          (current) => {
+            if (!current) {
+              throw new Error(`unknown runId "${runId}"`);
+            }
+            const event = collectBlockedCheckpoint(
+              current,
+              laneId,
+              checkpoint,
+              checkpointFile,
+            );
+            return event === null
+              ? null
+              : { ...event, actor: "agent" };
+          },
+        );
+        return committed !== null;
       },
       readLaneCheckpoint: async (laneId: string) => {
         const run = this.getRun(runId);
