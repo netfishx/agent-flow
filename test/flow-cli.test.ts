@@ -14,6 +14,7 @@ import {
   createClock,
   FakeHerdrAdapter,
 } from "../src/herdr/fake-adapter.ts";
+import { FakeIssueTracker } from "../src/testing.ts";
 import { FsLedger } from "../src/runtime/fs-ledger.ts";
 import type {
   RunEvent,
@@ -820,12 +821,267 @@ describe("flow CLI external behavior", () => {
     expect(inspect.stdout).toContain("finishStatus=clean");
   });
 
-  test("usage errors are non-zero", async () => {
+  test("decide records every supplied value without rewriting free text", async () => {
+    const root = await tempRoot();
+    await seedFinishedRun(root);
+    const stdout = sink();
+    const stderr = sink();
+
+    const exitCode = await runFlowCli(
+      [
+        "decide",
+        "run-cli",
+        "--note",
+        " preserve this note verbatim ",
+        "--issue-state",
+        " ready-for-human ",
+        "--decision",
+        "accepted",
+      ],
+      stdout.output,
+      stderr.output,
+      {
+        environment: { ...process.env, FLOW_LEDGER_ROOT: root },
+        runtimeFactory: (ledger) =>
+          new WorkflowRuntime({
+            adapter: new FakeHerdrAdapter({
+              clock: createClock(1_000),
+              lanes: [],
+            }),
+            ledger,
+            clock: () => 2_000,
+            idgen: () => "unused",
+            readResultFile: async () => "",
+            sleep: async () => {},
+          }),
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(stderr.text()).toBe("");
+    expect(stdout.text()).toContain("runId=run-cli");
+    expect((await new FsLedger(root).load("run-cli"))?.decisions).toEqual([
+      {
+        sequence: 11,
+        at: 2_000,
+        actor: "human",
+        decision: "accepted",
+        note: " preserve this note verbatim ",
+        resultingIssueState: " ready-for-human ",
+      },
+    ]);
+
+    const emptyNoteStdout = sink();
+    const emptyNoteStderr = sink();
+    const emptyNoteExitCode = await runFlowCli(
+      [
+        "decide",
+        "run-cli",
+        "--decision",
+        "rejected",
+        "--note",
+        "",
+      ],
+      emptyNoteStdout.output,
+      emptyNoteStderr.output,
+      {
+        environment: { ...process.env, FLOW_LEDGER_ROOT: root },
+        runtimeFactory: (ledger) =>
+          new WorkflowRuntime({
+            adapter: new FakeHerdrAdapter({
+              clock: createClock(1_000),
+              lanes: [],
+            }),
+            ledger,
+            clock: () => 2_000,
+            idgen: () => "unused",
+            readResultFile: async () => "",
+            sleep: async () => {},
+          }),
+      },
+    );
+
+    expect(emptyNoteExitCode).toBe(0);
+    expect(emptyNoteStderr.text()).toBe("");
+    expect(
+      (await new FsLedger(root).load("run-cli"))?.decisions.at(-1),
+    ).toMatchObject({
+      actor: "human",
+      decision: "rejected",
+      note: "",
+      resultingIssueState: null,
+    });
+  });
+
+  test("decide delivers exactly one new decision marker per invocation", async () => {
+    const root = await tempRoot();
+    const clock = createClock(3_000);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "review", exitCode: 0 }],
+    });
+    const tracker = new FakeIssueTracker();
+    const source = new WorkflowRuntime({
+      adapter,
+      ledger: new FsLedger(root),
+      clock: clock.now,
+      idgen: () => "run-cli-decide",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: tracker,
+    });
+    const handle = await source.startWorkflow({
+      workflow: "cross-review",
+      workspace: "agent-flow",
+      cwd: join(root, "work"),
+      lanes: [{ laneId: "review", role: "reviewer", steps: 1 }],
+      issue: { owner: "netfishx", repo: "agent-flow", number: 29 },
+    });
+    await source.confirmLaneStarted(handle.runId, "review");
+    await source.awaitLane(handle.runId, "review", 1_000);
+    tracker.calls.splice(0);
+    const invoke = async (decision: "accepted" | "rejected") => {
+      const stdout = sink();
+      const stderr = sink();
+      const exitCode = await runFlowCli(
+        [
+          "decide",
+          handle.runId,
+          "--decision",
+          decision,
+          "--note",
+          `${decision} through CLI`,
+        ],
+        stdout.output,
+        stderr.output,
+        {
+          environment: { ...process.env, FLOW_LEDGER_ROOT: root },
+          runtimeFactory: (ledger) =>
+            new WorkflowRuntime({
+              adapter,
+              ledger,
+              clock: clock.now,
+              idgen: () => "unused",
+              readResultFile: adapter.readResultFile,
+              sleep: async () => {},
+              issueTracker: tracker,
+            }),
+        },
+      );
+      expect(exitCode).toBe(0);
+      expect(stderr.text()).toBe("");
+      expect(stdout.text()).toContain("state=complete");
+    };
+
+    await invoke("accepted");
+    expect(
+      tracker.calls
+        .filter((call) => call.operation === "createComment")
+        .map((call) => call.arguments[1] as string)
+        .filter((body) => body.split("\n")[0]!.includes(":decision -->")),
+    ).toHaveLength(1);
+    await invoke("rejected");
+    const decisionBodies = tracker.calls
+      .filter((call) => call.operation === "createComment")
+      .map((call) => call.arguments[1] as string)
+      .filter((body) => body.split("\n")[0]!.includes(":decision -->"));
+    expect(decisionBodies).toHaveLength(2);
+    expect(new Set(decisionBodies.map((body) => body.split("\n")[0])).size)
+      .toBe(2);
+  });
+
+  test.each([
+    ["unknown verb", ["unknown"]],
+    ["missing run id", ["decide", "--decision", "accepted", "--note", "x"]],
+    [
+      "extra positional",
+      ["decide", "run-cli", "extra", "--decision", "accepted", "--note", "x"],
+    ],
+    ["missing decision", ["decide", "run-cli", "--note", "x"]],
+    ["missing note", ["decide", "run-cli", "--decision", "accepted"]],
+    [
+      "flag without value",
+      ["decide", "run-cli", "--decision", "accepted", "--note"],
+    ],
+    [
+      "repeated flag",
+      [
+        "decide",
+        "run-cli",
+        "--decision",
+        "accepted",
+        "--decision",
+        "rejected",
+        "--note",
+        "x",
+      ],
+    ],
+    [
+      "unknown flag",
+      [
+        "decide",
+        "run-cli",
+        "--decision",
+        "accepted",
+        "--note",
+        "x",
+        "--author",
+        "owner",
+      ],
+    ],
+    [
+      "invalid decision",
+      ["decide", "run-cli", "--decision", "maybe", "--note", "x"],
+    ],
+  ] as const)("decide rejects %s with the usage error", async (_name, args) => {
+    const stdout = sink();
+    const stderr = sink();
+
+    const exitCode = await runFlowCli(args, stdout.output, stderr.output);
+
+    expect(exitCode).toBe(2);
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).toStartWith("usage: flow status");
+    expect(stderr.text()).toContain("flow decide <runId>");
+  });
+
+  test("existing verbs keep their usage errors", async () => {
     const root = await tempRoot();
     expect((await flow(root, "inspect")).exitCode).not.toBe(0);
-    expect((await flow(root, "unknown")).exitCode).not.toBe(0);
     expect((await flow(root, "takeover", "run-cli")).exitCode).toBe(2);
     expect((await flow(root, "release")).exitCode).toBe(2);
+  });
+
+  test("the runtime source has no GitHub comment-author identity path", async () => {
+    const sources: string[] = [];
+    const glob = new Bun.Glob("src/**/*.ts");
+    for await (const path of glob.scan({
+      cwd: join(import.meta.dir, ".."),
+      onlyFiles: true,
+    })) {
+      sources.push(await readFile(join(import.meta.dir, "..", path), "utf8"));
+    }
+    const trackerPort = await readFile(
+      join(import.meta.dir, "..", "src", "issue", "tracker.ts"),
+      "utf8",
+    );
+    const interfaceBody = trackerPort.match(
+      /export interface IssueTracker \{([\s\S]*?)\n\}/,
+    )?.[1];
+    const portMethods = [
+      ...(interfaceBody ?? "").matchAll(/^\s{2}([A-Za-z]\w*)\(/gm),
+    ].map((match) => match[1]);
+
+    expect(portMethods).toEqual([
+      "resolveIssue",
+      "findCommentByMarker",
+      "createComment",
+      "readCurrentLabels",
+      "compareAndSetTriageLabel",
+    ]);
+    expect(sources.join("\n")).not.toMatch(
+      /\b(?:comment\.(?:author|user)|commentAuthor|commentUser|user\.login|authorAssociation|authorLogin)\b/i,
+    );
   });
 
   test("an unusable ledger root fails loudly without an in-memory fallback", async () => {
