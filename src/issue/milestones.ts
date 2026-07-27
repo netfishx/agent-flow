@@ -319,6 +319,7 @@ function decisionMilestone(
   index: number,
 ): DueMilestone | null {
   const decision = run.decisions[index]!;
+  if (decision.actor !== "human") return null;
   const deliveryId = deliveryIdFor(run.runId, decision.sequence, "decision");
   if (!due(run, deliveryId)) return null;
   return {

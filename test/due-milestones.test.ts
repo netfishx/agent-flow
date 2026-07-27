@@ -394,6 +394,31 @@ describe("dueMilestones", () => {
     ]);
   });
 
+  test("a non-human decision view cannot produce a decision milestone", async () => {
+    const builder = await RunBuilder.create();
+    await builder.append(
+      "owner_decision_recorded",
+      {
+        decision: "accepted",
+        note: "fabricated outside the reducer",
+        resultingIssueState: null,
+      },
+      { actor: "human" },
+    );
+    const run = await builder.view();
+    const fabricated: RunView = {
+      ...run,
+      decisions: run.decisions.map((decision) => ({
+        ...decision,
+        actor: "agent",
+      })),
+    };
+
+    expect(
+      dueMilestones(fabricated).filter(({ kind }) => kind === "decision"),
+    ).toEqual([]);
+  });
+
   test("complete waits for all terminal facts and then remains hash-stable", async () => {
     const builder = await RunBuilder.create();
     await builder.register("lane-1", "reviewer");

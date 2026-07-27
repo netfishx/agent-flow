@@ -602,6 +602,29 @@ describe("FsLedger public capabilities", () => {
     );
   });
 
+  test("load rejects a hand-written owner decision from a non-human actor", async () => {
+    const root = await tempRoot();
+    await seedEventFile(root, [
+      `${JSON.stringify(started())}\n`,
+      `${JSON.stringify({
+        ...started(),
+        eventId: "run-fs#2",
+        sequence: 2,
+        type: "owner_decision_recorded",
+        actor: "agent",
+        data: {
+          decision: "accepted",
+          note: "fabricated outside the local CLI trust domain",
+          resultingIssueState: null,
+        },
+      })}\n`,
+    ]);
+
+    await expect(new FsLedger(root).load("run-fs")).rejects.toThrow(
+      /corrupt event stream.*owner_decision_recorded requires human actor/,
+    );
+  });
+
   test("fails closed on mid-file corruption and event id conflicts", async () => {
     const root = await tempRoot();
     await seedEventFile(root, [
