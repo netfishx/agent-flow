@@ -9,7 +9,10 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { runFlowCli } from "../src/cli/flow.ts";
+import {
+  resolveIssueTarget,
+  runFlowCli,
+} from "../src/cli/flow.ts";
 import {
   createClock,
   FakeHerdrAdapter,
@@ -17,7 +20,11 @@ import {
 import { FakeIssueTracker } from "../src/testing.ts";
 import { FsLedger } from "../src/runtime/fs-ledger.ts";
 import type {
+  IssueRef,
   RunEvent,
+  RunEventActor,
+  RunEventDataByType,
+  RunEventType,
   RunnerEvidence,
 } from "../src/runtime/events.ts";
 import type { LeaseHandle, Ledger } from "../src/runtime/ledger.ts";
@@ -189,6 +196,74 @@ async function seedFinishedRun(
   }
 }
 
+async function appendCliEvent<T extends RunEventType>(
+  ledger: Ledger,
+  runId: string,
+  type: T,
+  data: RunEventDataByType[T],
+  options: {
+    readonly laneId?: string;
+    readonly actor?: RunEventActor;
+    readonly at?: number;
+  } = {},
+): Promise<void> {
+  const run = await ledger.load(runId);
+  const sequence = (run?.lastAppliedSequence ?? 0) + 1;
+  await ledger.commit({
+    schemaVersion: 1,
+    eventId: `${runId}#${sequence}`,
+    runId,
+    sequence,
+    type,
+    at: options.at ?? sequence * 10,
+    actor: options.actor ?? "runtime",
+    controllerEpoch: run?.controllerEpoch ?? 0,
+    data,
+    ...(options.laneId === undefined
+      ? {}
+      : { laneId: options.laneId }),
+  } as RunEvent);
+}
+
+const synchronizationIssue: IssueRef = {
+  owner: "netfishx",
+  repo: "agent-flow",
+  number: 30,
+};
+
+async function seedSynchronizationRun(
+  ledger: Ledger,
+  runId: string,
+  cwd: string,
+  issue: IssueRef | null,
+): Promise<void> {
+  await appendCliEvent(ledger, runId, "run_started", {
+    workflow: "cross-review",
+    workspace: "w1",
+    cwd,
+    splitDirection: "down",
+    tabId: `${runId}:tab`,
+    controllerPaneId: `${runId}:controller`,
+    fixedPoint: null,
+    issue,
+  });
+  await appendCliEvent(
+    ledger,
+    runId,
+    "lane_registered",
+    {
+      laneId: "lane-1",
+      paneId: `${runId}:lane-1`,
+      logFile: join(cwd, runId, "logs", "lane-1.log"),
+      stderrFile: join(cwd, runId, "logs", "lane-1.stderr.log"),
+      sentinelToken: `FLOW_${runId}_LANE_lane-1_EXIT`,
+      steps: 1,
+      stepDelaySeconds: 0,
+    },
+    { laneId: "lane-1" },
+  );
+}
+
 async function flow(root: string, ...args: string[]) {
   const child = Bun.spawn(["bun", "run", "flow", ...args], {
     cwd: join(import.meta.dir, ".."),
@@ -290,6 +365,190 @@ function ambiguousRunStarted(): RunEvent {
 }
 
 describe("flow CLI external behavior", () => {
+  test.each([
+    [
+      "configured",
+      { FLOW_ISSUE_TARGET: "netfishx/agent-flow#30" },
+      { owner: "netfishx", repo: "agent-flow", number: 30 },
+    ],
+    ["unconfigured", {}, null],
+  ] as const)(
+    "resolves the issue target when %s",
+    (_name, environment, expected) => {
+      expect(resolveIssueTarget(environment)).toEqual(expected);
+    },
+  );
+
+  test.each([
+    "",
+    "netfishx/agent-flow",
+    "netfishx/agent-flow#0",
+    "netfishx/agent-flow#30/extra",
+    "netfishx//agent-flow#30",
+    "netfishx/agent-flow#9007199254740992",
+  ])("rejects malformed FLOW_ISSUE_TARGET %p", (configured) => {
+    expect(() =>
+      resolveIssueTarget({ FLOW_ISSUE_TARGET: configured }),
+    ).toThrow("FLOW_ISSUE_TARGET must be owner/repo#number");
+  });
+
+  test("default CLI validates delivery targets while read-only commands ignore them", async () => {
+    const root = await tempRoot();
+    await seedFinishedRun(root);
+    const clock = createClock(250);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "review", exitCode: 0 }],
+    });
+    const source = new WorkflowRuntime({
+      adapter,
+      ledger: new FsLedger(root),
+      clock: clock.now,
+      idgen: () => "run-cli-real-tracker-wiring",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: new FakeIssueTracker(),
+    });
+    const handle = await source.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd: join(root, "work"),
+      lanes: [{ laneId: "review", steps: 1 }],
+      issue: synchronizationIssue,
+    });
+    await source.confirmLaneStarted(handle.runId, "review");
+    await source.awaitLane(handle.runId, "review", 1_000);
+    const configuredStdout = sink();
+    const configuredStderr = sink();
+
+    const configuredExit = await runFlowCli(
+      ["resume", handle.runId],
+      configuredStdout.output,
+      configuredStderr.output,
+      {
+        environment: {
+          FLOW_LEDGER_ROOT: root,
+          FLOW_ISSUE_TARGET: "netfishx/agent-flow#30",
+        },
+      },
+    );
+    const malformedStdout = sink();
+    const malformedStderr = sink();
+    const malformedExit = await runFlowCli(
+      ["resume", handle.runId],
+      malformedStdout.output,
+      malformedStderr.output,
+      {
+        environment: {
+          FLOW_LEDGER_ROOT: root,
+          FLOW_ISSUE_TARGET: "netfishx/agent-flow",
+        },
+      },
+    );
+    const inspectStdout = sink();
+    const inspectStderr = sink();
+    const inspectExit = await runFlowCli(
+      ["inspect", "run-cli"],
+      inspectStdout.output,
+      inspectStderr.output,
+      {
+        environment: {
+          FLOW_LEDGER_ROOT: root,
+          FLOW_ISSUE_TARGET: "not a target",
+        },
+      },
+    );
+    const statusStdout = sink();
+    const statusStderr = sink();
+    const statusExit = await runFlowCli(
+      ["status"],
+      statusStdout.output,
+      statusStderr.output,
+      {
+        environment: {
+          FLOW_LEDGER_ROOT: root,
+          FLOW_ISSUE_TARGET: "not a target",
+        },
+      },
+    );
+
+    expect(configuredExit).toBe(0);
+    expect(configuredStderr.text()).toBe("");
+    expect(configuredStdout.text()).toContain(
+      `runId=${handle.runId}`,
+    );
+    expect(malformedExit).toBe(1);
+    expect(malformedStdout.text()).toBe("");
+    expect(malformedStderr.text()).toContain(
+      "FLOW_ISSUE_TARGET must be owner/repo#number",
+    );
+    expect(inspectExit).toBe(0);
+    expect(inspectStderr.text()).toBe("");
+    expect(inspectStdout.text()).toContain("runId=run-cli");
+    expect(statusExit).toBe(0);
+    expect(statusStderr.text()).toBe("");
+    expect(statusStdout.text()).toContain("run-cli");
+  });
+
+  test("mismatched delivery target refuses without changing the ledger", async () => {
+    const root = await tempRoot();
+    const clock = createClock(400);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "review", exitCode: 0 }],
+    });
+    const ledger = new FsLedger(root);
+    const source = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run-cli-target-mismatch",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: new FakeIssueTracker({
+        failure: { operation: "resolveIssue", retryable: true },
+      }),
+    });
+    const handle = await source.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd: join(root, "work"),
+      lanes: [{ laneId: "review", steps: 1 }],
+      issue: synchronizationIssue,
+    });
+    await source.confirmLaneStarted(handle.runId, "review");
+    await source.awaitLane(handle.runId, "review", 1_000);
+    const before = await ledger.load(handle.runId);
+    expect(
+      before?.deliveryOrder.map(
+        (deliveryId) =>
+          before.deliveries[deliveryId]?.lastFailure?.retryable,
+      ),
+    ).toEqual([true, true]);
+    const stdout = sink();
+    const stderr = sink();
+
+    const exitCode = await runFlowCli(
+      ["resume", handle.runId],
+      stdout.output,
+      stderr.output,
+      {
+        environment: {
+          FLOW_LEDGER_ROOT: root,
+          FLOW_ISSUE_TARGET: "netfishx/agent-flow#31",
+        },
+      },
+    );
+    const after = await ledger.load(handle.runId);
+
+    expect(exitCode).toBe(1);
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).toContain(
+      "FLOW_ISSUE_TARGET does not match the run binding",
+    );
+    expect(after).toEqual(before);
+  });
+
   test("status lists a run from the durable ledger", async () => {
     const root = await tempRoot();
     await seedFinishedRun(root);
@@ -303,6 +562,87 @@ describe("flow CLI external behavior", () => {
     expect(result.stdout).toContain("finishStatus=clean");
     expect(result.stdout).toContain("lanes=1");
     expect(result.stdout).toContain("updatedAt=180");
+  });
+
+  test("status reports all four synchronization states", async () => {
+    const root = await tempRoot();
+    const ledger = new FsLedger(root);
+    const cwd = join(root, "work");
+    await seedSynchronizationRun(
+      ledger,
+      "run-sync-none",
+      cwd,
+      null,
+    );
+    await seedSynchronizationRun(
+      ledger,
+      "run-sync-ok",
+      cwd,
+      synchronizationIssue,
+    );
+    await seedSynchronizationRun(
+      ledger,
+      "run-sync-pending",
+      cwd,
+      synchronizationIssue,
+    );
+    await appendCliEvent(
+      ledger,
+      "run-sync-pending",
+      "lane_dispatch_intent",
+      {},
+      { laneId: "lane-1" },
+    );
+    await seedSynchronizationRun(
+      ledger,
+      "run-sync-degraded",
+      cwd,
+      synchronizationIssue,
+    );
+    await appendCliEvent(
+      ledger,
+      "run-sync-degraded",
+      "lane_dispatch_intent",
+      {},
+      { laneId: "lane-1" },
+    );
+    await appendCliEvent(
+      ledger,
+      "run-sync-degraded",
+      "issue_delivery_intended",
+      {
+        deliveryId: "run-sync-degraded:3:start",
+        kind: "start",
+        laneId: null,
+        payloadHash: "payload",
+      },
+    );
+    await appendCliEvent(
+      ledger,
+      "run-sync-degraded",
+      "issue_delivery_failed",
+      {
+        deliveryId: "run-sync-degraded:3:start",
+        reason: "tracker unavailable",
+        retryable: true,
+      },
+    );
+
+    const result = await flow(root, "status");
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(
+      /run-sync-none .*synchronization=none/,
+    );
+    expect(result.stdout).toMatch(
+      /run-sync-ok .*synchronization=ok/,
+    );
+    expect(result.stdout).toMatch(
+      /run-sync-pending .*synchronization=pending/,
+    );
+    expect(result.stdout).toMatch(
+      /run-sync-degraded .*synchronization=degraded/,
+    );
   });
 
   test("inspect keeps four dimensions side by side with fixed point and artifacts", async () => {
@@ -323,6 +663,304 @@ describe("flow CLI external behavior", () => {
     expect(result.stdout).toContain("checkpoint=/tmp/cli-run/checkpoint.md");
     expect(result.stdout).toContain("result=/tmp/cli-run/result.txt");
     expect(result.stdout).toContain("evidence=/tmp/cli-run/evidence.json");
+  });
+
+  test("inspect reports binding and every delivery field with retry disposition", async () => {
+    const root = await tempRoot();
+    const ledger = new FsLedger(root);
+    const runId = "run-sync-inspect";
+    const cwd = join(root, "work");
+    const runDirectory = join(cwd, runId);
+    await seedSynchronizationRun(
+      ledger,
+      runId,
+      cwd,
+      synchronizationIssue,
+    );
+    await appendCliEvent(
+      ledger,
+      runId,
+      "lane_dispatch_intent",
+      {},
+      { laneId: "lane-1" },
+    );
+    await appendCliEvent(
+      ledger,
+      runId,
+      "lane_exited",
+      { exitCode: 0, waitMatched: true },
+      { laneId: "lane-1" },
+    );
+    await appendCliEvent(
+      ledger,
+      runId,
+      "lane_checkpoint",
+      {
+        semanticState: "complete",
+        checkpointFile: join(
+          runDirectory,
+          "checkpoints",
+          "lane-1.md",
+        ),
+      },
+      { laneId: "lane-1", actor: "agent" },
+    );
+    await appendCliEvent(
+      ledger,
+      runId,
+      "lane_contract_evaluated",
+      {
+        contractState: "satisfied",
+        resultFile: join(runDirectory, "results", "lane-1.txt"),
+        errors: [],
+      },
+      { laneId: "lane-1", actor: "validator" },
+    );
+    await appendCliEvent(
+      ledger,
+      runId,
+      "lane_verification_recorded",
+      {
+        verificationState: "verified",
+        evidenceFile: join(
+          runDirectory,
+          "evidence",
+          "lane-1.json",
+        ),
+      },
+      { laneId: "lane-1", actor: "runner" },
+    );
+    await appendCliEvent(ledger, runId, "run_finished", {
+      status: "clean",
+      breakdown: {
+        exitedZero: 1,
+        exitedNonZero: 0,
+        crashed: 0,
+        lost: 0,
+        failedToStart: 0,
+      },
+    });
+    await appendCliEvent(ledger, runId, "issue_binding_resolved", {
+      issueNodeId: "I_kwDO30",
+    });
+    await appendCliEvent(
+      ledger,
+      runId,
+      "issue_delivery_intended",
+      {
+        deliveryId: `${runId}:3:start`,
+        kind: "start",
+        laneId: null,
+        payloadHash: "start-payload",
+      },
+    );
+    await appendCliEvent(
+      ledger,
+      runId,
+      "issue_delivery_failed",
+      {
+        deliveryId: `${runId}:3:start`,
+        reason: "temporary tracker outage",
+        retryable: true,
+      },
+    );
+    await appendCliEvent(
+      ledger,
+      runId,
+      "issue_delivery_intended",
+      {
+        deliveryId: `${runId}:8:complete`,
+        kind: "complete",
+        laneId: null,
+        payloadHash: "complete-payload",
+      },
+    );
+    await appendCliEvent(
+      ledger,
+      runId,
+      "issue_delivery_failed",
+      {
+        deliveryId: `${runId}:8:complete`,
+        reason: "authorization refused",
+        retryable: false,
+      },
+    );
+    await appendCliEvent(
+      ledger,
+      runId,
+      "owner_decision_recorded",
+      {
+        decision: "accepted",
+        note: "ship it",
+        resultingIssueState: null,
+      },
+      { actor: "human" },
+    );
+    await appendCliEvent(
+      ledger,
+      runId,
+      "issue_delivery_intended",
+      {
+        deliveryId: `${runId}:14:decision`,
+        kind: "decision",
+        laneId: null,
+        payloadHash: "decision-payload",
+      },
+    );
+    await appendCliEvent(
+      ledger,
+      runId,
+      "issue_delivery_confirmed",
+      {
+        deliveryId: `${runId}:14:decision`,
+        commentId: 300,
+        commentUrl:
+          "https://github.com/netfishx/agent-flow/issues/30#issuecomment-300",
+        labelTransition: "not-applicable",
+      },
+    );
+    const stdout = sink();
+    const stderr = sink();
+
+    const exitCode = await runFlowCli(
+      ["inspect", runId],
+      stdout.output,
+      stderr.output,
+      {
+        environment: { FLOW_LEDGER_ROOT: root },
+        runtimeFactory: (runtimeLedger) =>
+          new WorkflowRuntime({
+            adapter: new FakeHerdrAdapter({ lanes: [] }),
+            ledger: runtimeLedger,
+            clock: () => 1_000,
+            idgen: () => "unused",
+            readResultFile: async () => "",
+            sleep: async () => {},
+          }),
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(stderr.text()).toBe("");
+    expect(stdout.text()).toContain(
+      "binding=netfishx/agent-flow#30 issueNodeId=I_kwDO30",
+    );
+    expect(stdout.text()).toContain(
+      'synchronization=degraded reason="temporary tracker outage"',
+    );
+    expect(stdout.text()).toMatch(
+      /delivery=run-sync-inspect:3:start kind=start state=failed intents=1 labelTransition=not-applicable failureReason="temporary tracker outage" retryable=true retryDisposition=will-retry commentUrl=null/,
+    );
+    expect(stdout.text()).toMatch(
+      /delivery=run-sync-inspect:8:complete kind=complete state=failed intents=1 labelTransition=not-applicable failureReason="authorization refused" retryable=false retryDisposition=needs-operator commentUrl=null/,
+    );
+    expect(stdout.text()).toMatch(
+      /delivery=run-sync-inspect:14:decision kind=decision state=delivered intents=1 labelTransition=not-applicable failureReason=null retryable=null retryDisposition=not-applicable commentUrl=https:\/\/github.com\/netfishx\/agent-flow\/issues\/30#issuecomment-300/,
+    );
+  });
+
+  test("inspect surfaces a due-list planning failure instead of reporting healthy", async () => {
+    const root = await tempRoot();
+    const ledger = new FsLedger(root);
+    const runId = "run-sync-planning-failure";
+    const cwd = join(root, "work");
+    const runDirectory = join(cwd, runId);
+    await seedSynchronizationRun(
+      ledger,
+      runId,
+      cwd,
+      synchronizationIssue,
+    );
+    await appendCliEvent(
+      ledger,
+      runId,
+      "lane_dispatch_intent",
+      {},
+      { laneId: "lane-1" },
+    );
+    await appendCliEvent(
+      ledger,
+      runId,
+      "lane_checkpoint",
+      {
+        semanticState: "blocked",
+        checkpointFile: join(cwd, "outside-run", "lane-1.md"),
+      },
+      { laneId: "lane-1", actor: "agent" },
+    );
+    await appendCliEvent(
+      ledger,
+      runId,
+      "lane_exited",
+      { exitCode: 0, waitMatched: true },
+      { laneId: "lane-1" },
+    );
+    await appendCliEvent(
+      ledger,
+      runId,
+      "lane_contract_evaluated",
+      {
+        contractState: "satisfied",
+        resultFile: join(runDirectory, "results", "lane-1.txt"),
+        errors: [],
+      },
+      { laneId: "lane-1", actor: "validator" },
+    );
+    await appendCliEvent(
+      ledger,
+      runId,
+      "lane_verification_recorded",
+      {
+        verificationState: "verified",
+        evidenceFile: join(
+          runDirectory,
+          "evidence",
+          "lane-1.json",
+        ),
+      },
+      { laneId: "lane-1", actor: "runner" },
+    );
+    await appendCliEvent(ledger, runId, "run_finished", {
+      status: "clean",
+      breakdown: {
+        exitedZero: 1,
+        exitedNonZero: 0,
+        crashed: 0,
+        lost: 0,
+        failedToStart: 0,
+      },
+    });
+    const stdout = sink();
+    const stderr = sink();
+
+    const exitCode = await runFlowCli(
+      ["inspect", runId],
+      stdout.output,
+      stderr.output,
+      {
+        environment: { FLOW_LEDGER_ROOT: root },
+        runtimeFactory: (runtimeLedger) =>
+          new WorkflowRuntime({
+            adapter: new FakeHerdrAdapter({ lanes: [] }),
+            ledger: runtimeLedger,
+            clock: () => 1_000,
+            idgen: () => "unused",
+            readResultFile: async () => "",
+            sleep: async () => {},
+          }),
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(stderr.text()).toBe("");
+    expect(stdout.text()).toContain(
+      "binding=netfishx/agent-flow#30 issueNodeId=unresolved",
+    );
+    expect(stdout.text()).toContain("synchronization=degraded");
+    expect(stdout.text()).not.toContain("synchronization=ok");
+    expect(stdout.text()).toContain(
+      'reason="checkpointPointer for lane \\"lane-1\\" is outside the run directory"',
+    );
   });
 
   test("fresh inspect reconciles and collects a self-terminated human-owned lane without driving it", async () => {
@@ -955,7 +1593,11 @@ describe("flow CLI external behavior", () => {
         stdout.output,
         stderr.output,
         {
-          environment: { ...process.env, FLOW_LEDGER_ROOT: root },
+          environment: {
+            ...process.env,
+            FLOW_LEDGER_ROOT: root,
+            FLOW_ISSUE_TARGET: "netfishx/agent-flow#29",
+          },
           runtimeFactory: (ledger) =>
             new WorkflowRuntime({
               adapter,

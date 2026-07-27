@@ -1,6 +1,12 @@
 import { RealHerdrAdapter } from "../herdr/real-adapter.ts";
+import { issueApiPath } from "../issue/gh-argv.ts";
+import { projectSynchronization } from "../issue/milestones.ts";
+import { RealIssueTracker } from "../issue/real-tracker.ts";
 import { FsLedger, resolveLedgerRoot } from "../runtime/fs-ledger.ts";
-import type { OwnerDecision } from "../runtime/events.ts";
+import type {
+  IssueRef,
+  OwnerDecision,
+} from "../runtime/events.ts";
 import type { Ledger } from "../runtime/ledger.ts";
 import { projectRunState, type RunView } from "../runtime/reducer.ts";
 import { WorkflowRuntime } from "../runtime/runtime.ts";
@@ -77,8 +83,39 @@ function parseDecideArgs(args: readonly string[]): DecideInput | null {
   };
 }
 
-function value(input: string | number | null): string {
+function value(input: string | number | boolean | null): string {
   return input === null ? "null" : String(input);
+}
+
+function quotedValue(input: string | null): string {
+  return input === null ? "null" : JSON.stringify(input);
+}
+
+function renderSynchronization(run: RunView, stdout: TextSink): void {
+  const synchronization = projectSynchronization(run);
+  const binding =
+    run.issue === null
+      ? "unbound"
+      : `${run.issue.owner}/${run.issue.repo}#${run.issue.number}`;
+  stdout.write(
+    `binding=${binding} issueNodeId=${run.issueNodeId ?? "unresolved"}\n`,
+  );
+  stdout.write(
+    `synchronization=${synchronization.state} reason=${quotedValue(synchronization.reason)}\n`,
+  );
+  for (const deliveryId of run.deliveryOrder) {
+    const delivery = run.deliveries[deliveryId]!;
+    const retryable = delivery.lastFailure?.retryable ?? null;
+    const retryDisposition =
+      retryable === null
+        ? "not-applicable"
+        : retryable
+          ? "will-retry"
+          : "needs-operator";
+    stdout.write(
+      `delivery=${delivery.deliveryId} kind=${delivery.kind} state=${delivery.state} intents=${delivery.intents} labelTransition=${delivery.labelTransition} failureReason=${quotedValue(delivery.lastFailure?.reason ?? null)} retryable=${value(retryable)} retryDisposition=${retryDisposition} commentUrl=${value(delivery.commentUrl)}\n`,
+    );
+  }
 }
 
 function renderRun(run: RunView, stdout: TextSink): void {
@@ -86,6 +123,7 @@ function renderRun(run: RunView, stdout: TextSink): void {
     `runId=${run.runId} workflow=${run.workflow} state=${projectRunState(run)} finishStatus=${value(run.finishStatus)} updatedAt=${run.updatedAt}\n`,
   );
   stdout.write(`fixedPoint=${JSON.stringify(run.fixedPoint)}\n`);
+  renderSynchronization(run, stdout);
   for (const laneId of run.laneOrder) {
     const lane = run.lanes[laneId]!;
     stdout.write(`lane=${laneId}\n`);
@@ -116,7 +154,39 @@ function laneTimeout(environment: NodeJS.ProcessEnv): number {
   return timeout;
 }
 
-function createRealRuntime(ledger: Ledger): WorkflowRuntime {
+export function resolveIssueTarget(
+  environment: NodeJS.ProcessEnv = process.env,
+): IssueRef | null {
+  const configured = environment.FLOW_ISSUE_TARGET;
+  if (configured === undefined) return null;
+  const match = configured.match(
+    /^([^/#]+)\/([^/#]+)#([1-9][0-9]*)$/,
+  );
+  const number = match?.[3] === undefined ? NaN : Number(match[3]);
+  if (
+    match?.[1] === undefined ||
+    match[2] === undefined ||
+    !Number.isSafeInteger(number)
+  ) {
+    throw new Error("FLOW_ISSUE_TARGET must be owner/repo#number");
+  }
+  const target = {
+    owner: match[1],
+    repo: match[2],
+    number,
+  };
+  try {
+    issueApiPath(target);
+  } catch {
+    throw new Error("FLOW_ISSUE_TARGET must be owner/repo#number");
+  }
+  return target;
+}
+
+function createRealRuntime(
+  ledger: Ledger,
+  authorizedTarget: IssueRef | null,
+): WorkflowRuntime {
   return new WorkflowRuntime({
     adapter: new RealHerdrAdapter(),
     ledger,
@@ -125,7 +195,40 @@ function createRealRuntime(ledger: Ledger): WorkflowRuntime {
       `flow-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,
     readResultFile: (path) => Bun.file(path).text(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    ...(authorizedTarget === null
+      ? {}
+      : {
+          issueTracker: new RealIssueTracker({ authorizedTarget }),
+        }),
   });
+}
+
+function sameIssueTarget(left: IssueRef, right: IssueRef): boolean {
+  return (
+    left.owner.toLowerCase() === right.owner.toLowerCase() &&
+    left.repo.toLowerCase() === right.repo.toLowerCase() &&
+    left.number === right.number
+  );
+}
+
+async function deliveryTargetFor(
+  ledger: Ledger,
+  runId: string,
+  environment: NodeJS.ProcessEnv,
+): Promise<IssueRef | null> {
+  const authorizedTarget = resolveIssueTarget(environment);
+  const run = await ledger.load(runId);
+  if (!run) throw new Error(`run not found: "${runId}"`);
+  if (run.issue === null) return authorizedTarget;
+  if (authorizedTarget === null) {
+    throw new Error("bound issue requires an issue tracker");
+  }
+  if (!sameIssueTarget(run.issue, authorizedTarget)) {
+    throw new Error(
+      "FLOW_ISSUE_TARGET does not match the run binding",
+    );
+  }
+  return authorizedTarget;
 }
 
 async function requireLedgerRoot(root: string): Promise<void> {
@@ -176,31 +279,45 @@ export async function runFlowCli(
     const root = resolveLedgerRoot(environment);
     await requireLedgerRoot(root);
     const ledger = new FsLedger(root);
+    const runtimeFor = (authorizedTarget: IssueRef | null) =>
+      options.runtimeFactory?.(ledger) ??
+      createRealRuntime(ledger, authorizedTarget);
     if (command === "status") {
       for (const { runId: listedRunId } of await ledger.list()) {
         const run = await ledger.load(listedRunId);
         if (!run) continue;
+        const synchronization = projectSynchronization(run);
         stdout.write(
-          `${run.runId} workflow=${run.workflow} state=${projectRunState(run)} finishStatus=${value(run.finishStatus)} lanes=${run.laneOrder.length} updatedAt=${run.updatedAt}\n`,
+          `${run.runId} workflow=${run.workflow} state=${projectRunState(run)} finishStatus=${value(run.finishStatus)} lanes=${run.laneOrder.length} updatedAt=${run.updatedAt} synchronization=${synchronization.state}\n`,
         );
       }
       return 0;
     }
 
     if (command === "inspect") {
-      const runtime = (options.runtimeFactory ?? createRealRuntime)(ledger);
+      const runtime = runtimeFor(null);
       await runtime.inspectWorkflow(runId!);
     } else if (command === "resume") {
-      const runtime = (options.runtimeFactory ?? createRealRuntime)(ledger);
+      const authorizedTarget = await deliveryTargetFor(
+        ledger,
+        runId!,
+        environment,
+      );
+      const runtime = runtimeFor(authorizedTarget);
       await runtime.resumeWorkflow(runId!, laneTimeout(environment));
     } else if (command === "takeover") {
-      const runtime = (options.runtimeFactory ?? createRealRuntime)(ledger);
+      const runtime = runtimeFor(null);
       await runtime.takeoverLane(runId!, laneId!);
     } else if (command === "release") {
-      const runtime = (options.runtimeFactory ?? createRealRuntime)(ledger);
+      const runtime = runtimeFor(null);
       await runtime.releaseLane(runId!, laneId!);
     } else if (command === "decide") {
-      const runtime = (options.runtimeFactory ?? createRealRuntime)(ledger);
+      const authorizedTarget = await deliveryTargetFor(
+        ledger,
+        decide!.runId,
+        environment,
+      );
+      const runtime = runtimeFor(authorizedTarget);
       await runtime.recordOwnerDecision(decide!.runId, {
         decision: decide!.decision,
         note: decide!.note,
