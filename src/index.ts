@@ -13,7 +13,10 @@
 // shell quoting live behind the HerdrAdapter seam and never appear here.
 
 export { PartialDispatchError, WorkflowRuntime } from "./runtime/runtime.ts";
-export { InMemoryLedger } from "./runtime/ledger.ts";
+export {
+  ControllerLeaseHeldError,
+  InMemoryLedger,
+} from "./runtime/ledger.ts";
 export { FsLedger, resolveLedgerRoot } from "./runtime/fs-ledger.ts";
 export type { Ledger, LeaseHandle } from "./runtime/ledger.ts";
 export { projectRunState, reduce } from "./runtime/reducer.ts";

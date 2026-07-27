@@ -14,6 +14,7 @@ import {
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FsLedger } from "../src/runtime/fs-ledger.ts";
+import { ControllerLeaseHeldError } from "../src/runtime/ledger.ts";
 import type { RunEvent } from "../src/runtime/events.ts";
 import type { LeaseHandle } from "../src/runtime/ledger.ts";
 import { reduce } from "../src/runtime/reducer.ts";
@@ -602,6 +603,29 @@ describe("FsLedger public capabilities", () => {
     );
   });
 
+  test("load rejects a hand-written owner decision from a non-human actor", async () => {
+    const root = await tempRoot();
+    await seedEventFile(root, [
+      `${JSON.stringify(started())}\n`,
+      `${JSON.stringify({
+        ...started(),
+        eventId: "run-fs#2",
+        sequence: 2,
+        type: "owner_decision_recorded",
+        actor: "agent",
+        data: {
+          decision: "accepted",
+          note: "fabricated outside the local CLI trust domain",
+          resultingIssueState: null,
+        },
+      })}\n`,
+    ]);
+
+    await expect(new FsLedger(root).load("run-fs")).rejects.toThrow(
+      /corrupt event stream.*owner_decision_recorded requires human actor/,
+    );
+  });
+
   test("fails closed on mid-file corruption and event id conflicts", async () => {
     const root = await tempRoot();
     await seedEventFile(root, [
@@ -659,9 +683,14 @@ describe("FsLedger public capabilities", () => {
       pid: 101,
     });
 
-    await expect(
-      ledger.acquireLease("run-fs", { controllerId: "controller-2", pid: 202 }),
-    ).rejects.toThrow(/already held/);
+    const refusal = ledger.acquireLease("run-fs", {
+      controllerId: "controller-2",
+      pid: 202,
+    });
+    await expect(refusal).rejects.toBeInstanceOf(ControllerLeaseHeldError);
+    await expect(refusal).rejects.toThrow(
+      'controller lease for run "run-fs" is already held',
+    );
     await first.release();
     const second = await ledger.acquireLease("run-fs", {
       controllerId: "controller-2",

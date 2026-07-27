@@ -231,6 +231,7 @@ function expectReconstructed(
     {
       sequence: 9,
       at: 900,
+      actor: "human",
       decision: "accepted",
       note: "Retry after recording the blocker.",
       resultingIssueState: "ready-for-agent",

@@ -15,7 +15,11 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { RunEvent } from "./events.ts";
 import { assertHandleId } from "./ids.ts";
-import type { LeaseHandle, Ledger } from "./ledger.ts";
+import {
+  ControllerLeaseHeldError,
+  type LeaseHandle,
+  type Ledger,
+} from "./ledger.ts";
 import { reduce, type RunView } from "./reducer.ts";
 
 interface ReplayResult {
@@ -396,7 +400,9 @@ export class FsLedger implements Ledger {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       const holder = await this.readControllerLease(lockFile, runId);
       if (this.isPidAlive(holder.pid)) {
-        throw new Error(`controller lease for run "${runId}" is already held`);
+        throw new ControllerLeaseHeldError(
+          `controller lease for run "${runId}" is already held`,
+        );
       }
       await this.takeOverControllerLease(
         runDir,

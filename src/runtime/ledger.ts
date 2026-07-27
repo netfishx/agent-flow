@@ -5,6 +5,8 @@ export interface LeaseHandle {
   release(): Promise<void>;
 }
 
+export class ControllerLeaseHeldError extends Error {}
+
 export interface Ledger {
   commit(event: RunEvent): Promise<void>;
   load(runId: string): Promise<RunView | null>;

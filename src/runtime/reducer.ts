@@ -8,6 +8,7 @@ import type {
   MilestoneKind,
   OwnerDecision,
   RunEvent,
+  RunEventActor,
   RunFinishStatus,
   RunOutcomeBreakdown,
   RuntimeState,
@@ -38,6 +39,7 @@ export interface DeliveryView {
 export interface DecisionView {
   readonly sequence: number;
   readonly at: number;
+  readonly actor: RunEventActor;
   readonly decision: OwnerDecision;
   readonly note: string;
   readonly resultingIssueState: string | null;
@@ -637,17 +639,22 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         },
       });
     }
-    case "owner_decision_recorded":
+    case "owner_decision_recorded": {
+      if (event.actor !== "human") {
+        throw new Error("owner_decision_recorded requires human actor");
+      }
       return withRun(state, event, {
         decisions: [
           ...state.decisions,
           {
             sequence: event.sequence,
             at: event.at,
+            actor: event.actor,
             ...event.data,
           },
         ],
       });
+    }
     case "run_finished": {
       if (state.finishStatus !== null) {
         throw new Error("duplicate run_finished");

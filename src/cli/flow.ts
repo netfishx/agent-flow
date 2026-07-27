@@ -1,12 +1,13 @@
 import { RealHerdrAdapter } from "../herdr/real-adapter.ts";
 import { FsLedger, resolveLedgerRoot } from "../runtime/fs-ledger.ts";
+import type { OwnerDecision } from "../runtime/events.ts";
 import type { Ledger } from "../runtime/ledger.ts";
 import { projectRunState, type RunView } from "../runtime/reducer.ts";
 import { WorkflowRuntime } from "../runtime/runtime.ts";
 import { stat } from "node:fs/promises";
 
 const USAGE =
-  "usage: flow status | flow inspect <runId> | flow resume <runId> | flow takeover <runId> <laneId> | flow release <runId> <laneId>";
+  "usage: flow status | flow inspect <runId> | flow resume <runId> | flow takeover <runId> <laneId> | flow release <runId> <laneId> | flow decide <runId> --decision <accepted|rejected|changes-requested> --note <text> [--issue-state <text>]";
 const DEFAULT_LANE_TIMEOUT_MS = 300_000;
 
 interface TextSink {
@@ -16,6 +17,64 @@ interface TextSink {
 export interface FlowCliOptions {
   readonly environment?: NodeJS.ProcessEnv;
   readonly runtimeFactory?: (ledger: Ledger) => WorkflowRuntime;
+}
+
+interface DecideInput {
+  readonly runId: string;
+  readonly decision: OwnerDecision;
+  readonly note: string;
+  readonly resultingIssueState: string | null;
+}
+
+const OWNER_DECISIONS: ReadonlySet<OwnerDecision> = new Set([
+  "accepted",
+  "rejected",
+  "changes-requested",
+]);
+
+function isOwnerDecision(value: string): value is OwnerDecision {
+  for (const decision of OWNER_DECISIONS) {
+    if (decision === value) return true;
+  }
+  return false;
+}
+
+function parseDecideArgs(args: readonly string[]): DecideInput | null {
+  const [runId, ...flagArgs] = args;
+  if (runId === undefined || runId.startsWith("--")) return null;
+
+  const values = new Map<string, string>();
+  for (let index = 0; index < flagArgs.length; index += 2) {
+    const flag = flagArgs[index];
+    const flagValue = flagArgs[index + 1];
+    if (
+      flag === undefined ||
+      flagValue === undefined ||
+      (flag !== "--decision" &&
+        flag !== "--note" &&
+        flag !== "--issue-state") ||
+      values.has(flag)
+    ) {
+      return null;
+    }
+    values.set(flag, flagValue);
+  }
+
+  const decision = values.get("--decision");
+  const note = values.get("--note");
+  if (
+    decision === undefined ||
+    !isOwnerDecision(decision) ||
+    note === undefined
+  ) {
+    return null;
+  }
+  return {
+    runId,
+    decision,
+    note,
+    resultingIssueState: values.get("--issue-state") ?? null,
+  };
 }
 
 function value(input: string | number | null): string {
@@ -91,18 +150,22 @@ export async function runFlowCli(
   options: FlowCliOptions = {},
 ): Promise<number> {
   const [command, runId, laneId, ...extra] = args;
+  const decide =
+    command === "decide" ? parseDecideArgs(args.slice(1)) : null;
   if (
     (command !== "status" &&
       command !== "inspect" &&
       command !== "resume" &&
       command !== "takeover" &&
-      command !== "release") ||
+      command !== "release" &&
+      command !== "decide") ||
     (command === "status" &&
       (runId !== undefined || laneId !== undefined || extra.length > 0)) ||
     ((command === "inspect" || command === "resume") &&
       (runId === undefined || laneId !== undefined || extra.length > 0)) ||
     ((command === "takeover" || command === "release") &&
-      (runId === undefined || laneId === undefined || extra.length > 0))
+      (runId === undefined || laneId === undefined || extra.length > 0)) ||
+    (command === "decide" && decide === null)
   ) {
     stderr.write(`${USAGE}\n`);
     return 2;
@@ -136,6 +199,13 @@ export async function runFlowCli(
     } else if (command === "release") {
       const runtime = (options.runtimeFactory ?? createRealRuntime)(ledger);
       await runtime.releaseLane(runId!, laneId!);
+    } else if (command === "decide") {
+      const runtime = (options.runtimeFactory ?? createRealRuntime)(ledger);
+      await runtime.recordOwnerDecision(decide!.runId, {
+        decision: decide!.decision,
+        note: decide!.note,
+        resultingIssueState: decide!.resultingIssueState,
+      });
     }
     const run = await ledger.load(runId!);
     if (!run) {

@@ -13,6 +13,7 @@ import { dirname, join } from "node:path";
 import type {
   IssueRef,
   NewRunEvent,
+  OwnerDecision,
   RunEvent,
   RunnerEvidence,
   RuntimeState,
@@ -47,7 +48,10 @@ import type {
   WorkflowMetrics,
   WorkflowStatus,
 } from "./types.ts";
-import type { LeaseHandle } from "./ledger.ts";
+import {
+  ControllerLeaseHeldError,
+  type LeaseHandle,
+} from "./ledger.ts";
 
 const TERMINAL_RUNTIME: ReadonlySet<RuntimeState> = new Set([
   "exited",
@@ -445,6 +449,56 @@ export class WorkflowRuntime {
         data: {},
       };
     });
+    return this.workflowStatus(this.getRun(runId));
+  }
+
+  async recordOwnerDecision(
+    runId: string,
+    input: {
+      readonly decision: OwnerDecision;
+      readonly note: string;
+      readonly resultingIssueState?: string | null;
+    },
+  ): Promise<WorkflowStatus> {
+    const loaded = await this.deps.ledger.load(runId);
+    if (!loaded) throw new Error(`run not found: "${runId}"`);
+    this.registerReducedView(loaded);
+    await this.commitEvent(runId, {
+      type: "owner_decision_recorded",
+      actor: "human",
+      data: {
+        decision: input.decision,
+        note: input.note,
+        resultingIssueState: input.resultingIssueState ?? null,
+      },
+    });
+
+    // An unfinished run is delivered by its controller's next drive boundary
+    // or a later resume tail; without a tracker there is no delivery path, so
+    // this command must not create one or touch the controller lease.
+    if (
+      this.getRun(runId).finishStatus === null ||
+      this.deps.issueTracker === undefined
+    ) {
+      return this.workflowStatus(this.getRun(runId));
+    }
+
+    const leaseAlreadyHeld = this.leases.has(runId);
+    if (!leaseAlreadyHeld) {
+      try {
+        await this.acquireControllerLease(runId);
+      } catch (error) {
+        if (error instanceof ControllerLeaseHeldError) {
+          return this.workflowStatus(this.getRun(runId));
+        }
+        throw error;
+      }
+    }
+    try {
+      await this.reconcileBoundIssue(runId);
+    } finally {
+      if (!leaseAlreadyHeld) await this.releaseControllerLease(runId);
+    }
     return this.workflowStatus(this.getRun(runId));
   }
 

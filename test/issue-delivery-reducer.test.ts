@@ -522,6 +522,7 @@ describe("issue delivery reducer", () => {
       {
         sequence: 2,
         at: 200,
+        actor: "human",
         decision: "changes-requested",
         note: "The owner decision remains true without issue delivery.",
         resultingIssueState: null,
@@ -643,6 +644,7 @@ describe("issue delivery reducer", () => {
       {
         sequence: 4,
         at: 400,
+        actor: "human",
         decision: "accepted",
         note: "Proceed with the first delivery.",
         resultingIssueState: "ready-for-agent",
@@ -650,6 +652,7 @@ describe("issue delivery reducer", () => {
       {
         sequence: 10,
         at: 1_000,
+        actor: "human",
         decision: "changes-requested",
         note: "Record the durable evidence.",
         resultingIssueState: null,
@@ -657,6 +660,7 @@ describe("issue delivery reducer", () => {
       {
         sequence: 14,
         at: 1_400,
+        actor: "human",
         decision: "rejected",
         note: "Reject after reviewing the finished run.",
         resultingIssueState: "closed",

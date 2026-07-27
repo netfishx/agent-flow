@@ -269,6 +269,36 @@ describe("reduce", () => {
     ).toThrow(/eventId/);
   });
 
+  test("rejects an owner decision fabricated with a non-human actor", () => {
+    const started = reduce(
+      undefined,
+      event(1, "run_started", {
+        data: {
+          workflow: "wf",
+          workspace: "w1",
+          cwd: "/tmp/run-1",
+          splitDirection: "down",
+          tabId: "w1:t1",
+          controllerPaneId: "w1:p1",
+          fixedPoint: null,
+          issue: null,
+        },
+      }),
+    );
+    const fabricated = event(2, "owner_decision_recorded", {
+      actor: "agent",
+      data: {
+        decision: "accepted",
+        note: "fabricated outside the local CLI trust domain",
+        resultingIssueState: null,
+      },
+    });
+
+    expect(() => reduce(started, fabricated)).toThrow(
+      /owner_decision_recorded.*human actor/,
+    );
+  });
+
   test("fails closed on duplicate or illegal lifecycle transitions", () => {
     const started = reduce(
       undefined,
