@@ -14,6 +14,7 @@ import {
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FsLedger } from "../src/runtime/fs-ledger.ts";
+import { ControllerLeaseHeldError } from "../src/runtime/ledger.ts";
 import type { RunEvent } from "../src/runtime/events.ts";
 import type { LeaseHandle } from "../src/runtime/ledger.ts";
 import { reduce } from "../src/runtime/reducer.ts";
@@ -682,9 +683,14 @@ describe("FsLedger public capabilities", () => {
       pid: 101,
     });
 
-    await expect(
-      ledger.acquireLease("run-fs", { controllerId: "controller-2", pid: 202 }),
-    ).rejects.toThrow(/already held/);
+    const refusal = ledger.acquireLease("run-fs", {
+      controllerId: "controller-2",
+      pid: 202,
+    });
+    await expect(refusal).rejects.toBeInstanceOf(ControllerLeaseHeldError);
+    await expect(refusal).rejects.toThrow(
+      'controller lease for run "run-fs" is already held',
+    );
     await first.release();
     const second = await ledger.acquireLease("run-fs", {
       controllerId: "controller-2",

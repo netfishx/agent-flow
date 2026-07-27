@@ -17,8 +17,16 @@ import type {
   PaneRef,
   SplitPaneOptions,
 } from "../src/herdr/types.ts";
-import { InMemoryLedger } from "../src/runtime/ledger.ts";
-import { WorkflowRuntime } from "../src/runtime/runtime.ts";
+import {
+  ControllerLeaseHeldError,
+  InMemoryLedger,
+  type LeaseHandle,
+  type Ledger,
+} from "../src/runtime/ledger.ts";
+import {
+  PartialDispatchError,
+  WorkflowRuntime,
+} from "../src/runtime/runtime.ts";
 import {
   type CommentRef,
   type IssueTracker,
@@ -62,6 +70,32 @@ class CountingAdapter extends FakeHerdrAdapter {
   ): Promise<PaneRef> {
     this.createdPanes++;
     return super.splitPane(options);
+  }
+}
+
+class LeaseFailureLedger implements Ledger {
+  acquireCalls = 0;
+
+  constructor(
+    private readonly delegate: Ledger,
+    private readonly failure: Error,
+  ) {}
+
+  commit(event: RunEvent): Promise<void> {
+    return this.delegate.commit(event);
+  }
+
+  load(runId: string) {
+    return this.delegate.load(runId);
+  }
+
+  list() {
+    return this.delegate.list();
+  }
+
+  async acquireLease(): Promise<LeaseHandle> {
+    this.acquireCalls += 1;
+    throw this.failure;
   }
 }
 
@@ -372,6 +406,300 @@ describe("WorkflowRuntime issue synchronization", () => {
     await runtime.awaitLane(handle.runId, "review", 1_000);
 
     expect(tracker.calls).toEqual([]);
+  });
+
+  test("records an unfinished owner decision lease-free with the human actor", async () => {
+    const { root, adapter, ledger, runtime } = await setup();
+    const handle = await runtime.startWorkflow(config(root, false));
+    const refusingLedger = new LeaseFailureLedger(
+      ledger,
+      new ControllerLeaseHeldError("live controller"),
+    );
+    const recorder = new WorkflowRuntime({
+      adapter,
+      ledger: refusingLedger,
+      clock: () => 2_000,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+
+    const status = await recorder.recordOwnerDecision(handle.runId, {
+      decision: "accepted",
+      note: "",
+    });
+
+    expect(status.state).toBe("running");
+    expect(refusingLedger.acquireCalls).toBe(0);
+    expect((await ledger.load(handle.runId))?.decisions).toEqual([
+      {
+        sequence: 5,
+        at: 2_000,
+        actor: "human",
+        decision: "accepted",
+        note: "",
+        resultingIssueState: null,
+      },
+    ]);
+  });
+
+  test("records a finished owner decision without a lease when no tracker exists", async () => {
+    const { root, adapter, ledger, runtime } = await setup();
+    const handle = await runtime.startWorkflow(config(root, false));
+    await runtime.confirmLaneStarted(handle.runId, "review");
+    await runtime.awaitLane(handle.runId, "review", 1_000);
+    const refusingLedger = new LeaseFailureLedger(
+      ledger,
+      new Error("a tracker-free decision must not acquire a lease"),
+    );
+    const recorder = new WorkflowRuntime({
+      adapter,
+      ledger: refusingLedger,
+      clock: () => 2_500,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+
+    await recorder.recordOwnerDecision(handle.runId, {
+      decision: "accepted",
+      note: "Recorded locally without a delivery adapter.",
+    });
+
+    expect(refusingLedger.acquireCalls).toBe(0);
+    expect((await ledger.load(handle.runId))?.decisions.at(-1)).toMatchObject({
+      actor: "human",
+      decision: "accepted",
+      resultingIssueState: null,
+    });
+  });
+
+  test("a finished run acquires a lease and reconciles one owner decision", async () => {
+    const tracker = new FakeIssueTracker();
+    const { root, ledger, runtime } = await setup({ tracker });
+    const handle = await runtime.startWorkflow(config(root));
+    await runtime.confirmLaneStarted(handle.runId, "review");
+    await runtime.awaitLane(handle.runId, "review", 1_000);
+    tracker.calls.splice(0);
+
+    await runtime.recordOwnerDecision(handle.runId, {
+      decision: "changes-requested",
+      note: "Address the two review findings.",
+      resultingIssueState: "ready-for-agent",
+    });
+
+    const run = await ledger.load(handle.runId);
+    const decision = run?.decisions.at(-1);
+    if (decision === undefined) throw new Error("expected owner decision");
+    const delivery = run?.deliveries[
+      `${handle.runId}:${decision.sequence}:decision`
+    ];
+    const createdBodies = tracker.calls
+      .filter((call) => call.operation === "createComment")
+      .map((call) => call.arguments[1] as string);
+    expect(delivery).toMatchObject({
+      kind: "decision",
+      state: "delivered",
+      labelTransition: "not-applicable",
+    });
+    expect(createdBodies).toHaveLength(1);
+    expect(createdBodies[0]).toContain(
+      "Recorded from the owner through the trusted local CLI.",
+    );
+    expect(createdBodies[0]).toContain("ready-for-agent");
+    expect(createdBodies[0]).toContain("did not enact the issue state");
+    expect(
+      tracker.calls.some(
+        (call) => call.operation === "compareAndSetTriageLabel",
+      ),
+    ).toBeFalse();
+  });
+
+  test("recording on a finished run preserves a controller lease already held by this runtime", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "agent-flow-issue-sync-held-lease-"),
+    );
+    roots.push(root);
+    const clock = createClock(4_000);
+    const adapter = new CountingAdapter({
+      clock,
+      failRunInPane: true,
+      lanes: [{ laneId: "review", exitCode: 0 }],
+    });
+    const ledger = new InMemoryLedger();
+    const tracker = new FakeIssueTracker();
+    const runtime = new BoundaryReconcileRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run-held-finished-lease",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: tracker,
+    });
+    let runId: string | null = null;
+    try {
+      await runtime.startWorkflow(config(root));
+    } catch (error) {
+      expect(error).toBeInstanceOf(PartialDispatchError);
+      runId = (error as PartialDispatchError).runId;
+    }
+    if (runId === null) throw new Error("expected partial dispatch");
+    expect((await ledger.load(runId))?.finishStatus).toBe("degraded");
+    tracker.calls.splice(0);
+
+    await runtime.recordOwnerDecision(runId, {
+      decision: "accepted",
+      note: "The held controller delivers this decision.",
+    });
+
+    expect(
+      tracker.calls
+        .filter((call) => call.operation === "createComment")
+        .map((call) => call.arguments[1] as string)
+        .filter((body) => body.includes(":decision -->")),
+    ).toHaveLength(1);
+    await appendEvent(
+      ledger,
+      runId,
+      "owner_decision_recorded",
+      {
+        decision: "changes-requested",
+        note: "A later boundary must still own reconciliation.",
+        resultingIssueState: null,
+      },
+      { actor: "human" },
+    );
+    tracker.calls.splice(0);
+
+    await runtime.reconcileAtBoundary(runId, "review");
+
+    expect(
+      tracker.calls
+        .filter((call) => call.operation === "createComment")
+        .map((call) => call.arguments[1] as string)
+        .filter((body) => body.includes(":decision -->")),
+    ).toHaveLength(1);
+  });
+
+  test("a live finished-run lease holder leaves the committed decision for its next boundary", async () => {
+    const tracker = new FakeIssueTracker();
+    const { root, adapter, ledger, runtime } = await setup({ tracker });
+    const handle = await runtime.startWorkflow(config(root));
+    await runtime.confirmLaneStarted(handle.runId, "review");
+    await runtime.awaitLane(handle.runId, "review", 1_000);
+    tracker.calls.splice(0);
+    const held = new LeaseFailureLedger(
+      ledger,
+      new ControllerLeaseHeldError(
+        `controller lease for run "${handle.runId}" is already held`,
+      ),
+    );
+    const recorder = new WorkflowRuntime({
+      adapter,
+      ledger: held,
+      clock: () => 20_000,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: tracker,
+    });
+
+    await recorder.recordOwnerDecision(handle.runId, {
+      decision: "rejected",
+      note: "The controller will deliver this.",
+    });
+
+    expect(held.acquireCalls).toBe(1);
+    expect(tracker.calls).toEqual([]);
+    expect((await ledger.load(handle.runId))?.decisions.at(-1)).toMatchObject({
+      actor: "human",
+      decision: "rejected",
+      resultingIssueState: null,
+    });
+  });
+
+  test("a non-holder lease failure propagates after the owner decision is durable", async () => {
+    const tracker = new FakeIssueTracker();
+    const { root, adapter, ledger, runtime } = await setup({ tracker });
+    const handle = await runtime.startWorkflow(config(root));
+    await runtime.confirmLaneStarted(handle.runId, "review");
+    await runtime.awaitLane(handle.runId, "review", 1_000);
+    const failed = new LeaseFailureLedger(
+      ledger,
+      new Error("lease storage unavailable"),
+    );
+    const recorder = new WorkflowRuntime({
+      adapter,
+      ledger: failed,
+      clock: () => 21_000,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: tracker,
+    });
+
+    await expect(
+      recorder.recordOwnerDecision(handle.runId, {
+        decision: "rejected",
+        note: "Durable before delivery acquisition.",
+      }),
+    ).rejects.toThrow("lease storage unavailable");
+    expect((await ledger.load(handle.runId))?.decisions.at(-1)).toMatchObject({
+      actor: "human",
+      decision: "rejected",
+    });
+  });
+
+  test("multiple owner decisions each receive a distinct decision delivery", async () => {
+    const tracker = new FakeIssueTracker();
+    const { root, ledger, runtime } = await setup({ tracker });
+    const handle = await runtime.startWorkflow(config(root));
+    await runtime.confirmLaneStarted(handle.runId, "review");
+    await runtime.awaitLane(handle.runId, "review", 1_000);
+    tracker.calls.splice(0);
+
+    await runtime.recordOwnerDecision(handle.runId, {
+      decision: "accepted",
+      note: "Ship it.",
+      resultingIssueState: "ready-for-human",
+    });
+    await runtime.recordOwnerDecision(handle.runId, {
+      decision: "changes-requested",
+      note: "One more adjustment.",
+    });
+
+    const run = await ledger.load(handle.runId);
+    const decisionDeliveries = run?.deliveryOrder
+      .map((deliveryId) => run.deliveries[deliveryId]!)
+      .filter((delivery) => delivery.kind === "decision");
+    const bodies = tracker.calls
+      .filter((call) => call.operation === "createComment")
+      .map((call) => call.arguments[1] as string);
+    expect(decisionDeliveries).toHaveLength(2);
+    expect(new Set(decisionDeliveries?.map(({ deliveryId }) => deliveryId)).size)
+      .toBe(2);
+    expect(bodies).toHaveLength(2);
+    expect(new Set(bodies.map((body) => body.split("\n")[0])).size).toBe(2);
+    expect(bodies[1]).toContain(
+      "Resulting issue state stated by the owner:** not stated",
+    );
+    expect(
+      decisionDeliveries?.every(
+        ({ labelTransition }) => labelTransition === "not-applicable",
+      ),
+    ).toBeTrue();
+  });
+
+  test("recording an owner decision rejects an unknown run", async () => {
+    const { runtime } = await setup();
+
+    await expect(
+      runtime.recordOwnerDecision("missing", {
+        decision: "accepted",
+        note: "No run exists.",
+      }),
+    ).rejects.toThrow('run not found: "missing"');
   });
 
   test("inspect leaves a retryable due delivery untouched", async () => {
