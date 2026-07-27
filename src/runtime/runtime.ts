@@ -2,6 +2,7 @@
 // and then folded into memory through the same reducer used by ledger replay.
 
 import type { PaneRef } from "../herdr/types.ts";
+import { dueMilestones } from "../issue/milestones.ts";
 import {
   collectBlockedCheckpoint,
   reconcileIssueSync,
@@ -80,6 +81,16 @@ function assertIssueBinding(issue: IssueRef | null | undefined): void {
     issue.number <= 0
   ) {
     throw new Error("invalid issue binding");
+  }
+}
+
+function hasOutstandingDeliveries(run: RunView): boolean {
+  try {
+    return dueMilestones(run).length > 0;
+  } catch {
+    // A planning failure is outstanding work: only the lease-held reconciler
+    // may contain and classify it.
+    return true;
   }
 }
 
@@ -462,6 +473,9 @@ export class WorkflowRuntime {
   ): Promise<WorkflowStatus> {
     const loaded = await this.deps.ledger.load(runId);
     if (!loaded) throw new Error(`run not found: "${runId}"`);
+    if (loaded.issue !== null && this.deps.issueTracker === undefined) {
+      throw new Error("bound issue requires an issue tracker");
+    }
     this.registerReducedView(loaded);
     await this.commitEvent(runId, {
       type: "owner_decision_recorded",
@@ -474,11 +488,11 @@ export class WorkflowRuntime {
     });
 
     // An unfinished run is delivered by its controller's next drive boundary
-    // or a later resume tail; without a tracker there is no delivery path, so
-    // this command must not create one or touch the controller lease.
+    // or a later resume tail. An unbound run has no delivery path, so neither
+    // case touches the controller lease here.
     if (
       this.getRun(runId).finishStatus === null ||
-      this.deps.issueTracker === undefined
+      this.getRun(runId).issue === null
     ) {
       return this.workflowStatus(this.getRun(runId));
     }
@@ -508,7 +522,43 @@ export class WorkflowRuntime {
   ): Promise<WorkflowStatus> {
     const loaded = await this.deps.ledger.load(runId);
     if (!loaded) throw new Error(`run not found: "${runId}"`);
-    if (loaded.finishStatus !== null) return this.workflowStatus(loaded);
+    if (loaded.issue !== null && this.deps.issueTracker === undefined) {
+      throw new Error("bound issue requires an issue tracker");
+    }
+    if (loaded.finishStatus !== null) {
+      if (
+        loaded.issue === null ||
+        !hasOutstandingDeliveries(loaded)
+      ) {
+        return this.workflowStatus(loaded);
+      }
+
+      await this.acquireControllerLease(runId);
+      try {
+        const authoritative = await this.deps.ledger.load(runId);
+        if (!authoritative) throw new Error(`run not found: "${runId}"`);
+        if (
+          authoritative.issue === null ||
+          !hasOutstandingDeliveries(authoritative)
+        ) {
+          return this.workflowStatus(authoritative);
+        }
+        this.registerReducedView(authoritative);
+        await this.commitEvent(runId, {
+          type: "controller_attached",
+          actor: "runtime",
+          data: {
+            controllerId: this.controllerId(),
+            epoch: authoritative.controllerEpoch + 1,
+            pid: process.pid,
+          },
+        });
+        await this.reconcileBoundIssue(runId);
+        return this.workflowStatus(this.getRun(runId));
+      } finally {
+        await this.releaseControllerLease(runId);
+      }
+    }
 
     await this.acquireControllerLease(runId);
     this.deferredLeaseReleases.add(runId);
