@@ -102,6 +102,17 @@ export type DueMilestone =
       readonly payload: DecisionPayload;
     };
 
+export type SynchronizationState =
+  | "none"
+  | "ok"
+  | "pending"
+  | "degraded";
+
+export interface SynchronizationProjection {
+  readonly state: SynchronizationState;
+  readonly reason: string | null;
+}
+
 export function deliveryIdFor(
   runId: string,
   anchorSequence: number,
@@ -357,4 +368,44 @@ export function dueMilestones(run: RunView): readonly DueMilestone[] {
     if (decision !== null) milestones.push(decision);
   }
   return milestones;
+}
+
+/**
+ * Shared operator projection for issue synchronization. Computing the due list
+ * is part of the health check because planning failures have no delivery fact.
+ */
+export function projectSynchronization(
+  run: RunView,
+): SynchronizationProjection {
+  if (run.issue === null) return { state: "none", reason: null };
+
+  let due: readonly DueMilestone[];
+  try {
+    due = dueMilestones(run);
+  } catch (error) {
+    return {
+      state: "degraded",
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  for (const deliveryId of run.deliveryOrder) {
+    const delivery = run.deliveries[deliveryId];
+    if (delivery?.state === "failed") {
+      return {
+        state: "degraded",
+        reason: delivery.lastFailure?.reason ?? "delivery failed",
+      };
+    }
+  }
+  if (
+    due.length > 0 ||
+    run.deliveryOrder.some(
+      (deliveryId) =>
+        run.deliveries[deliveryId]?.state === "pending",
+    )
+  ) {
+    return { state: "pending", reason: null };
+  }
+  return { state: "ok", reason: null };
 }

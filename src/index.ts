@@ -26,6 +26,7 @@ export {
   deliveryIdFor,
   dueMilestones,
   marker,
+  projectSynchronization,
 } from "./issue/milestones.ts";
 export type {
   BlockedPayload,
@@ -35,6 +36,8 @@ export type {
   DueMilestone,
   MilestonePayload,
   StartPayload,
+  SynchronizationProjection,
+  SynchronizationState,
 } from "./issue/milestones.ts";
 export { canonicalJson, canonicalPayloadHash } from "./issue/hash.ts";
 export { renderMilestone } from "./issue/render.ts";

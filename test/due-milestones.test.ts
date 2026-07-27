@@ -4,6 +4,7 @@ import {
   canonicalPayloadHash,
   dueMilestones,
   InMemoryLedger,
+  projectSynchronization,
   type IssueRef,
   type RunEvent,
   type RunEventActor,
@@ -148,6 +149,57 @@ async function settleDelivery(
 }
 
 describe("dueMilestones", () => {
+  test("projects none, ok, pending, and degraded synchronization states", async () => {
+    const unbound = await RunBuilder.create(false);
+    expect(projectSynchronization(await unbound.view())).toEqual({
+      state: "none",
+      reason: null,
+    });
+
+    const settled = await RunBuilder.create();
+    expect(projectSynchronization(await settled.view())).toEqual({
+      state: "ok",
+      reason: null,
+    });
+
+    const pending = await RunBuilder.create();
+    await pending.register("lane-1");
+    await pending.append("lane_dispatch_intent", {}, { laneId: "lane-1" });
+    expect(projectSynchronization(await pending.view())).toEqual({
+      state: "pending",
+      reason: null,
+    });
+
+    const failed = await RunBuilder.create();
+    await failed.register("lane-1");
+    await failed.append("lane_dispatch_intent", {}, { laneId: "lane-1" });
+    await settleDelivery(
+      failed,
+      "run-due:3:start",
+      "retryable-failure",
+      "start",
+    );
+    expect(projectSynchronization(await failed.view())).toEqual({
+      state: "degraded",
+      reason: "tracker unavailable",
+    });
+  });
+
+  test("projects a due-list planning failure as degraded with its reason", async () => {
+    const builder = await RunBuilder.create();
+    await appendBlockedLane(
+      builder,
+      "lane-1",
+      join(cwd, "outside-run", "checkpoint.md"),
+    );
+
+    expect(projectSynchronization(await builder.view())).toEqual({
+      state: "degraded",
+      reason:
+        'checkpointPointer for lane "lane-1" is outside the run directory',
+    });
+  });
+
   test("an unbound run is silent and start becomes due only at the first dispatch intent", async () => {
     const unbound = await RunBuilder.create(false);
     await unbound.register("lane-1");
