@@ -2,6 +2,7 @@ import { RealHerdrAdapter } from "../herdr/real-adapter.ts";
 import { issueApiPath } from "../issue/gh-argv.ts";
 import { projectSynchronization } from "../issue/milestones.ts";
 import { RealIssueTracker } from "../issue/real-tracker.ts";
+import { sameIssueTarget } from "../issue/target.ts";
 import { FsLedger, resolveLedgerRoot } from "../runtime/fs-ledger.ts";
 import type {
   IssueRef,
@@ -98,10 +99,10 @@ function renderSynchronization(run: RunView, stdout: TextSink): void {
       ? "unbound"
       : `${run.issue.owner}/${run.issue.repo}#${run.issue.number}`;
   stdout.write(
-    `binding=${binding} issueNodeId=${run.issueNodeId ?? "unresolved"}\n`,
+    `issue=${binding} issueNodeId=${run.issueNodeId ?? "unresolved"}\n`,
   );
   stdout.write(
-    `synchronization=${synchronization.state} reason=${quotedValue(synchronization.reason)}\n`,
+    `issueSync=${synchronization.state} reason=${quotedValue(synchronization.reason)}\n`,
   );
   for (const deliveryId of run.deliveryOrder) {
     const delivery = run.deliveries[deliveryId]!;
@@ -203,25 +204,17 @@ function createRealRuntime(
   });
 }
 
-function sameIssueTarget(left: IssueRef, right: IssueRef): boolean {
-  return (
-    left.owner.toLowerCase() === right.owner.toLowerCase() &&
-    left.repo.toLowerCase() === right.repo.toLowerCase() &&
-    left.number === right.number
-  );
-}
-
 async function deliveryTargetFor(
   ledger: Ledger,
   runId: string,
   environment: NodeJS.ProcessEnv,
 ): Promise<IssueRef | null> {
-  const authorizedTarget = resolveIssueTarget(environment);
   const run = await ledger.load(runId);
   if (!run) throw new Error(`run not found: "${runId}"`);
-  if (run.issue === null) return authorizedTarget;
+  if (run.issue === null) return null;
+  const authorizedTarget = resolveIssueTarget(environment);
   if (authorizedTarget === null) {
-    throw new Error("bound issue requires an issue tracker");
+    throw new Error("FLOW_ISSUE_TARGET is required for a bound run");
   }
   if (!sameIssueTarget(run.issue, authorizedTarget)) {
     throw new Error(
@@ -288,7 +281,7 @@ export async function runFlowCli(
         if (!run) continue;
         const synchronization = projectSynchronization(run);
         stdout.write(
-          `${run.runId} workflow=${run.workflow} state=${projectRunState(run)} finishStatus=${value(run.finishStatus)} lanes=${run.laneOrder.length} updatedAt=${run.updatedAt} synchronization=${synchronization.state}\n`,
+          `${run.runId} workflow=${run.workflow} state=${projectRunState(run)} finishStatus=${value(run.finishStatus)} lanes=${run.laneOrder.length} updatedAt=${run.updatedAt} issueSync=${synchronization.state}\n`,
         );
       }
       return 0;

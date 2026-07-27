@@ -379,9 +379,9 @@ export function projectSynchronization(
 ): SynchronizationProjection {
   if (run.issue === null) return { state: "none", reason: null };
 
-  let due: readonly DueMilestone[];
+  let dueMilestoneList: readonly DueMilestone[];
   try {
-    due = dueMilestones(run);
+    dueMilestoneList = dueMilestones(run);
   } catch (error) {
     return {
       state: "degraded",
@@ -399,7 +399,7 @@ export function projectSynchronization(
     }
   }
   if (
-    due.length > 0 ||
+    dueMilestoneList.length > 0 ||
     run.deliveryOrder.some(
       (deliveryId) =>
         run.deliveries[deliveryId]?.state === "pending",

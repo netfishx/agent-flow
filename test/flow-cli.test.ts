@@ -445,6 +445,16 @@ describe("flow CLI external behavior", () => {
         },
       },
     );
+    const missingStdout = sink();
+    const missingStderr = sink();
+    const missingExit = await runFlowCli(
+      ["resume", handle.runId],
+      missingStdout.output,
+      missingStderr.output,
+      {
+        environment: { FLOW_LEDGER_ROOT: root },
+      },
+    );
     const inspectStdout = sink();
     const inspectStderr = sink();
     const inspectExit = await runFlowCli(
@@ -482,12 +492,42 @@ describe("flow CLI external behavior", () => {
     expect(malformedStderr.text()).toContain(
       "FLOW_ISSUE_TARGET must be owner/repo#number",
     );
+    expect(missingExit).toBe(1);
+    expect(missingStdout.text()).toBe("");
+    expect(missingStderr.text()).toContain(
+      "FLOW_ISSUE_TARGET is required for a bound run",
+    );
     expect(inspectExit).toBe(0);
     expect(inspectStderr.text()).toBe("");
     expect(inspectStdout.text()).toContain("runId=run-cli");
     expect(statusExit).toBe(0);
     expect(statusStderr.text()).toBe("");
     expect(statusStdout.text()).toContain("run-cli");
+  });
+
+  test("an unbound resume ignores malformed tracker configuration", async () => {
+    const root = await tempRoot();
+    await seedFinishedRun(root);
+    const before = await new FsLedger(root).load("run-cli");
+    const stdout = sink();
+    const stderr = sink();
+
+    const exitCode = await runFlowCli(
+      ["resume", "run-cli"],
+      stdout.output,
+      stderr.output,
+      {
+        environment: {
+          FLOW_LEDGER_ROOT: root,
+          FLOW_ISSUE_TARGET: "not a target",
+        },
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(stderr.text()).toBe("");
+    expect(stdout.text()).toContain("runId=run-cli");
+    expect(await new FsLedger(root).load("run-cli")).toEqual(before);
   });
 
   test("mismatched delivery target refuses without changing the ledger", async () => {
@@ -632,16 +672,16 @@ describe("flow CLI external behavior", () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toMatch(
-      /run-sync-none .*synchronization=none/,
+      /run-sync-none .*issueSync=none/,
     );
     expect(result.stdout).toMatch(
-      /run-sync-ok .*synchronization=ok/,
+      /run-sync-ok .*issueSync=ok/,
     );
     expect(result.stdout).toMatch(
-      /run-sync-pending .*synchronization=pending/,
+      /run-sync-pending .*issueSync=pending/,
     );
     expect(result.stdout).toMatch(
-      /run-sync-degraded .*synchronization=degraded/,
+      /run-sync-degraded .*issueSync=degraded/,
     );
   });
 
@@ -665,7 +705,7 @@ describe("flow CLI external behavior", () => {
     expect(result.stdout).toContain("evidence=/tmp/cli-run/evidence.json");
   });
 
-  test("inspect reports binding and every delivery field with retry disposition", async () => {
+  test("inspect reports issue and every delivery field with retry disposition", async () => {
     const root = await tempRoot();
     const ledger = new FsLedger(root);
     const runId = "run-sync-inspect";
@@ -843,10 +883,10 @@ describe("flow CLI external behavior", () => {
     expect(exitCode).toBe(0);
     expect(stderr.text()).toBe("");
     expect(stdout.text()).toContain(
-      "binding=netfishx/agent-flow#30 issueNodeId=I_kwDO30",
+      "issue=netfishx/agent-flow#30 issueNodeId=I_kwDO30",
     );
     expect(stdout.text()).toContain(
-      'synchronization=degraded reason="temporary tracker outage"',
+      'issueSync=degraded reason="temporary tracker outage"',
     );
     expect(stdout.text()).toMatch(
       /delivery=run-sync-inspect:3:start kind=start state=failed intents=1 labelTransition=not-applicable failureReason="temporary tracker outage" retryable=true retryDisposition=will-retry commentUrl=null/,
@@ -954,10 +994,10 @@ describe("flow CLI external behavior", () => {
     expect(exitCode).toBe(0);
     expect(stderr.text()).toBe("");
     expect(stdout.text()).toContain(
-      "binding=netfishx/agent-flow#30 issueNodeId=unresolved",
+      "issue=netfishx/agent-flow#30 issueNodeId=unresolved",
     );
-    expect(stdout.text()).toContain("synchronization=degraded");
-    expect(stdout.text()).not.toContain("synchronization=ok");
+    expect(stdout.text()).toContain("issueSync=degraded");
+    expect(stdout.text()).not.toContain("issueSync=ok");
     expect(stdout.text()).toContain(
       'reason="checkpointPointer for lane \\"lane-1\\" is outside the run directory"',
     );

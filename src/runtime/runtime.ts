@@ -88,9 +88,9 @@ function hasOutstandingDeliveries(run: RunView): boolean {
   try {
     return dueMilestones(run).length > 0;
   } catch {
-    // A planning failure is outstanding work: only the lease-held reconciler
-    // may contain and classify it.
-    return true;
+    // Planning cannot deliver anything while the pointer remains invalid.
+    // The shared synchronization projection exposes the failure to operators.
+    return false;
   }
 }
 
@@ -533,7 +533,8 @@ export class WorkflowRuntime {
         return this.workflowStatus(loaded);
       }
 
-      await this.acquireControllerLease(runId);
+      const leaseAlreadyHeld = this.leases.has(runId);
+      if (!leaseAlreadyHeld) await this.acquireControllerLease(runId);
       try {
         const authoritative = await this.deps.ledger.load(runId);
         if (!authoritative) throw new Error(`run not found: "${runId}"`);
@@ -556,7 +557,7 @@ export class WorkflowRuntime {
         await this.reconcileBoundIssue(runId);
         return this.workflowStatus(this.getRun(runId));
       } finally {
-        await this.releaseControllerLease(runId);
+        if (!leaseAlreadyHeld) await this.releaseControllerLease(runId);
       }
     }
 

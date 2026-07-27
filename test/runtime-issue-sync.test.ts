@@ -351,6 +351,16 @@ class BoundaryReconcileRuntime extends WorkflowRuntime {
   }
 }
 
+class LeaseControlRuntime extends WorkflowRuntime {
+  async holdControllerLease(runId: string): Promise<void> {
+    await this.acquireControllerLease(runId);
+  }
+
+  async returnControllerLease(runId: string): Promise<void> {
+    await this.releaseControllerLease(runId);
+  }
+}
+
 /** Runs every already-scheduled microtask and timer callback to completion. */
 async function settleEventLoop(): Promise<void> {
   for (let turn = 0; turn < 5; turn++) {
@@ -616,6 +626,37 @@ describe("WorkflowRuntime issue synchronization", () => {
     });
   });
 
+  test("a finished unbound owner decision ignores an injected tracker and the controller lease", async () => {
+    const tracker = new FakeIssueTracker();
+    const { root, adapter, ledger, runtime } = await setup({ tracker });
+    const handle = await runtime.startWorkflow(config(root, false));
+    await runtime.confirmLaneStarted(handle.runId, "review");
+    await runtime.awaitLane(handle.runId, "review", 1_000);
+    tracker.calls.splice(0);
+    const countingLedger = new BeforeAcquireLedger(
+      ledger,
+      async () => {},
+    );
+    const recorder = new WorkflowRuntime({
+      adapter,
+      ledger: countingLedger,
+      clock: () => 2_625,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: tracker,
+    });
+
+    await recorder.recordOwnerDecision(handle.runId, {
+      decision: "accepted",
+      note: "Unbound decisions remain local.",
+    });
+
+    expect(countingLedger.acquireCalls).toBe(0);
+    expect(countingLedger.releaseCalls).toBe(0);
+    expect(tracker.calls).toEqual([]);
+  });
+
   test("bound resume and owner decision fail closed without a tracker", async () => {
     const tracker = new FakeIssueTracker();
     const { root, adapter, ledger, runtime } = await setup({ tracker });
@@ -735,6 +776,34 @@ describe("WorkflowRuntime issue synchronization", () => {
     ).toHaveLength(0);
   });
 
+  test("finished resume keeps a controller lease the runtime already held", async () => {
+    const {
+      handle,
+      ledger,
+    } = await finishedRunWithOutstandingComplete(
+      "run-finished-held-controller",
+    );
+    const runtime = new LeaseControlRuntime({
+      adapter: new ExplodingHerdrAdapter(),
+      ledger,
+      clock: () => 3_500,
+      idgen: () => "unused",
+      readResultFile: async () => {
+        throw new Error("finished-run retry read a lane artifact");
+      },
+      sleep: async () => {},
+      issueTracker: new FakeIssueTracker(),
+    });
+    await runtime.holdControllerLease(handle.runId);
+    const releasesBefore = ledger.leaseReleases;
+
+    await runtime.resumeWorkflow(handle.runId);
+
+    expect(ledger.leaseReleases).toBe(releasesBefore);
+    await runtime.returnControllerLease(handle.runId);
+    expect(ledger.leaseReleases).toBe(releasesBefore + 1);
+  });
+
   test("finished resume retries deliveries under a new epoch without touching Herdr or lane facts", async () => {
     const {
       completeId,
@@ -842,12 +911,6 @@ describe("WorkflowRuntime issue synchronization", () => {
     expect(reloaded).toMatchObject({
       finishStatus: finished.finishStatus,
       breakdown: finished.breakdown,
-      lanes: {
-        review: {
-          runtimeState: finished.lanes.review!.runtimeState,
-          exitCode: finished.lanes.review!.exitCode,
-        },
-      },
       deliveries: {
         [completeId]: {
           state: "failed",
@@ -859,6 +922,11 @@ describe("WorkflowRuntime issue synchronization", () => {
         },
       },
     });
+    for (const laneId of finished.laneOrder) {
+      expect(reloaded!.lanes[laneId]).toEqual(
+        finished.lanes[laneId],
+      );
+    }
   });
 
   test("finished resume with outstanding delivery refuses a live controller holder", async () => {
@@ -893,7 +961,7 @@ describe("WorkflowRuntime issue synchronization", () => {
     );
   });
 
-  test("finished resume treats a due-list planning failure as outstanding work", async () => {
+  test("finished resume does not attach when a planning failure is the only outstanding condition", async () => {
     const {
       completeId,
       handle,
@@ -954,7 +1022,7 @@ describe("WorkflowRuntime issue synchronization", () => {
 
     expect(
       appended.filter((event) => event.type === "controller_attached"),
-    ).toHaveLength(1);
+    ).toHaveLength(0);
     expect(
       appended.filter((event) =>
         event.type.startsWith("issue_delivery_"),
