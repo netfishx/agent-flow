@@ -3,6 +3,7 @@
 
 import type { PaneRef } from "../herdr/types.ts";
 import {
+  collectBlockedCheckpoint,
   reconcileIssueSync,
   type IssueSyncEvent,
 } from "../issue/reconcile.ts";
@@ -22,6 +23,10 @@ import {
   laneSentinelToken,
   parseExitFromSentinel,
 } from "./ids.ts";
+import {
+  laneCheckpointFile,
+  parseCheckpoint,
+} from "./checkpoint.ts";
 import { measured, REASONS, tokensUnavailable, unavailable } from "./metrics.ts";
 import {
   projectRunState,
@@ -83,7 +88,7 @@ function laneArtifactPaths(
   return {
     logFile: join(runDirectory, "logs", `${laneId}.log`),
     stderrFile: join(runDirectory, "logs", `${laneId}.stderr.log`),
-    checkpointFile: join(runDirectory, "checkpoints", `${laneId}.md`),
+    checkpointFile: laneCheckpointFile(cwd, runId, laneId),
     resultFile: join(runDirectory, "results", `${laneId}-result.txt`),
     evidenceFile: join(runDirectory, "evidence", `${laneId}-evidence.json`),
   };
@@ -855,6 +860,46 @@ export class WorkflowRuntime {
           actor: "runtime",
         } as NewRunEvent);
       },
+      commitLaneCheckpoint: async ({
+        laneId,
+        checkpoint,
+        checkpointFile,
+      }) => {
+        const committed = await this.commitEventConditionally(
+          runId,
+          (current) => {
+            if (!current) {
+              throw new Error(`unknown runId "${runId}"`);
+            }
+            const event = collectBlockedCheckpoint(
+              current,
+              laneId,
+              checkpoint,
+              checkpointFile,
+            );
+            return event === null
+              ? null
+              : { ...event, actor: "agent" };
+          },
+        );
+        return committed !== null;
+      },
+      readLaneCheckpoint: async (laneId: string) => {
+        const run = this.getRun(runId);
+        const { checkpointFile } = laneArtifactPaths(
+          run.cwd,
+          runId,
+          laneId,
+        );
+        try {
+          return {
+            text: await readFile(checkpointFile, "utf8"),
+            checkpointFile,
+          };
+        } catch {
+          return null;
+        }
+      },
       tracker,
     });
   }
@@ -1103,12 +1148,18 @@ export class WorkflowRuntime {
     } catch {
       // An absent/unreadable Agent record leaves the semantic dimension unknown.
     }
-    const status = checkpoint?.match(/^STATUS:\s*(complete|partial)\s*$/m)?.[1];
+    const status =
+      checkpoint === null ? null : parseCheckpoint(checkpoint).status;
     if (status === "complete" || status === "partial") {
       await this.commitEventConditionally(runId, (current) => {
         if (!current) throw new Error(`unknown runId "${runId}"`);
         const currentLane = this.getLane(current, laneId);
-        if (currentLane.checkpointAt !== null) return null;
+        if (
+          currentLane.semanticState === "complete" ||
+          currentLane.semanticState === "partial"
+        ) {
+          return null;
+        }
         return {
           type: "lane_checkpoint",
           actor: "agent",

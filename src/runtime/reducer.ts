@@ -14,6 +14,7 @@ import type {
   SemanticState,
   VerificationState,
 } from "./events.ts";
+import { checkpointSemanticSignature } from "./checkpoint.ts";
 
 export interface DeliveryView {
   readonly deliveryId: string;
@@ -71,6 +72,7 @@ export interface LaneView {
   readonly liveAt: number | null;
   readonly completedAt: number | null;
   readonly checkpointAt: number | null;
+  readonly checkpointSemanticSignature: string | null;
   readonly contractEvaluatedAt: number | null;
   readonly verificationRecordedAt: number | null;
   readonly humanInterruptAt: number | null;
@@ -336,6 +338,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         liveAt: null,
         completedAt: null,
         checkpointAt: null,
+        checkpointSemanticSignature: null,
         contractEvaluatedAt: null,
         verificationRecordedAt: null,
         humanInterruptAt: null,
@@ -416,6 +419,12 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
           semanticState: event.data.semanticState,
           checkpointFile: event.data.checkpointFile,
           checkpointAt: event.at,
+          checkpointSemanticSignature: checkpointSemanticSignature({
+            status: event.data.semanticState,
+            blockers: event.data.blockers,
+            next: event.data.next,
+            gaps: event.data.gaps,
+          }),
           blockedAnchor,
         };
       });

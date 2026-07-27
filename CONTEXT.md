@@ -24,6 +24,11 @@ and design records.
   its stable delivery identity.
 - **Blocked anchor** — a lane's write-once snapshot of its first blocked
   checkpoint, used to keep the blocked delivery stable.
+- **Checkpoint collection** — reading an executing lane's Agent-written
+  checkpoint at a reconciliation boundary and recording a changed blocked fact
+  before delivery planning.
+- **Checkpoint semantic signature** — the comparison key over semantic state
+  and blocker, next, and gap lines, used to suppress unchanged checkpoint facts.
 - **Label transition** — the recorded outcome of the allowed issue-label step:
   not applicable, applied, skipped, or failed.
 - **Marker** — the invisible HTML comment containing a delivery id at the start

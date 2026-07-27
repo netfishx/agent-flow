@@ -10,13 +10,27 @@ import type {
   IssueDeliveryConfirmedData,
   IssueDeliveryFailedData,
   IssueDeliveryIntendedData,
+  LaneCheckpointData,
   MilestoneKind,
+  RuntimeState,
 } from "../runtime/events.ts";
+import type { ParsedCheckpoint } from "../runtime/checkpoint.ts";
+import {
+  checkpointSemanticSignature,
+  parseCheckpoint,
+} from "../runtime/checkpoint.ts";
 import type { RunView } from "../runtime/reducer.ts";
 import { canonicalPayloadHash } from "./hash.ts";
 import { dueMilestones, marker } from "./milestones.ts";
 import { renderMilestone } from "./render.ts";
 import { IssueTrackerError, type IssueTracker } from "./tracker.ts";
+
+const TERMINAL_RUNTIME: ReadonlySet<RuntimeState> = new Set([
+  "exited",
+  "crashed",
+  "lost",
+  "failed_to_start",
+]);
 
 export type IssueSyncEvent =
   | {
@@ -39,7 +53,72 @@ export type IssueSyncEvent =
 export interface ReconcileIssueSyncDeps {
   readonly loadRun: () => Promise<RunView>;
   readonly appendEvent: (event: IssueSyncEvent) => Promise<void>;
+  readonly readLaneCheckpoint?: (
+    laneId: string,
+  ) => Promise<LaneCheckpointRead | null>;
+  readonly commitLaneCheckpoint?: (
+    input: LaneCheckpointCollectionInput,
+  ) => Promise<boolean>;
   readonly tracker: IssueTracker;
+}
+
+export interface LaneCheckpointRead {
+  readonly text: string;
+  readonly checkpointFile: string;
+}
+
+export interface LaneCheckpointCollectionInput {
+  readonly laneId: string;
+  readonly checkpoint: ParsedCheckpoint;
+  readonly checkpointFile: string;
+}
+
+export interface LaneCheckpointCollectionEvent {
+  readonly type: "lane_checkpoint";
+  readonly laneId: string;
+  readonly data: Omit<LaneCheckpointData, "semanticState"> & {
+    readonly semanticState: "blocked";
+  };
+}
+
+export type ReconcileEvent =
+  | IssueSyncEvent
+  | LaneCheckpointCollectionEvent;
+
+export function collectBlockedCheckpoint(
+  run: RunView,
+  laneId: string,
+  checkpoint: ParsedCheckpoint,
+  checkpointFile: string,
+): LaneCheckpointCollectionEvent | null {
+  if (checkpoint.status !== "blocked") return null;
+  const lane = run.lanes[laneId];
+  if (lane === undefined) {
+    throw new Error(`unknown laneId "${laneId}" in run "${run.runId}"`);
+  }
+  if (TERMINAL_RUNTIME.has(lane.runtimeState)) return null;
+  if (
+    lane.checkpointSemanticSignature ===
+    checkpointSemanticSignature({
+      status: checkpoint.status,
+      blockers: checkpoint.blockers,
+      next: checkpoint.next,
+      gaps: checkpoint.gaps,
+    })
+  ) {
+    return null;
+  }
+  return {
+    type: "lane_checkpoint",
+    laneId,
+    data: {
+      semanticState: "blocked",
+      checkpointFile,
+      blockers: checkpoint.blockers,
+      next: checkpoint.next,
+      gaps: checkpoint.gaps,
+    },
+  };
 }
 
 export type ReconcileDeliverySummary =
@@ -88,7 +167,46 @@ export async function reconcileIssueSync(
 ): Promise<ReconcileIssueSyncSummary> {
   let milestones;
   try {
-    const run = await deps.loadRun();
+    let run = await deps.loadRun();
+    if (run.issue !== null && deps.readLaneCheckpoint !== undefined) {
+      const commitLaneCheckpoint = deps.commitLaneCheckpoint;
+      if (commitLaneCheckpoint === undefined) {
+        throw new Error(
+          "readLaneCheckpoint requires commitLaneCheckpoint",
+        );
+      }
+      for (const laneId of run.laneOrder) {
+        const lane = run.lanes[laneId];
+        if (lane === undefined) {
+          throw new Error(
+            `unknown laneId "${laneId}" in run "${run.runId}"`,
+          );
+        }
+        // Read-time filtering only avoids unnecessary filesystem I/O. The
+        // commit callback owns correctness by checking the commit-chain view.
+        if (TERMINAL_RUNTIME.has(lane.runtimeState)) continue;
+        let checkpoint: ParsedCheckpoint;
+        let checkpointFile: string;
+        try {
+          const read = await deps.readLaneCheckpoint(laneId);
+          if (read === null) continue;
+          checkpoint = parseCheckpoint(read.text);
+          checkpointFile = read.checkpointFile;
+        } catch {
+          // An absent, unreadable, or unparseable Agent report is not an
+          // issue-delivery failure and does not abort the pass.
+          continue;
+        }
+        const committed = await commitLaneCheckpoint({
+          laneId,
+          checkpoint,
+          checkpointFile,
+        });
+        if (committed) {
+          run = await deps.loadRun();
+        }
+      }
+    }
     milestones = dueMilestones(run);
   } catch (error) {
     return {

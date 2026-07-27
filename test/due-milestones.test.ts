@@ -403,6 +403,7 @@ describe("dueMilestones", () => {
       {
         semanticState: "complete",
         checkpointFile: join(runDirectory, "checkpoints", "lane-1.md"),
+        gaps: ["routed onward instead of changing the complete payload"],
       },
       { laneId: "lane-1", actor: "agent" },
     );
@@ -450,6 +451,7 @@ describe("dueMilestones", () => {
       (milestone) => milestone.kind === "complete",
     );
     expect(first).toBeDefined();
+    expect(first!.payload.hashVersion).toBe(1);
     expect(first!.payload.lanes[0]!.gaps).toEqual([]);
     const firstHash = canonicalPayloadHash(first!.payload);
 
