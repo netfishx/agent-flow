@@ -26,11 +26,18 @@ interface DecideInput {
   readonly resultingIssueState: string | null;
 }
 
-const OWNER_DECISIONS: ReadonlySet<string> = new Set([
+const OWNER_DECISIONS: ReadonlySet<OwnerDecision> = new Set([
   "accepted",
   "rejected",
   "changes-requested",
 ]);
+
+function isOwnerDecision(value: string): value is OwnerDecision {
+  for (const decision of OWNER_DECISIONS) {
+    if (decision === value) return true;
+  }
+  return false;
+}
 
 function parseDecideArgs(args: readonly string[]): DecideInput | null {
   const [runId, ...flagArgs] = args;
@@ -57,14 +64,14 @@ function parseDecideArgs(args: readonly string[]): DecideInput | null {
   const note = values.get("--note");
   if (
     decision === undefined ||
-    !OWNER_DECISIONS.has(decision) ||
+    !isOwnerDecision(decision) ||
     note === undefined
   ) {
     return null;
   }
   return {
     runId,
-    decision: decision as OwnerDecision,
+    decision,
     note,
     resultingIssueState: values.get("--issue-state") ?? null,
   };

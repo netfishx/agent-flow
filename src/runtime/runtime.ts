@@ -473,6 +473,9 @@ export class WorkflowRuntime {
       },
     });
 
+    // An unfinished run is delivered by its controller's next drive boundary
+    // or a later resume tail; without a tracker there is no delivery path, so
+    // this command must not create one or touch the controller lease.
     if (
       this.getRun(runId).finishStatus === null ||
       this.deps.issueTracker === undefined
