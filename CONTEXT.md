@@ -43,3 +43,11 @@ and design records.
 - **Planning failure** — a reconciliation pass that could not compute the due
   list at all. It is contained rather than thrown, and it produces no delivery
   record, so no delivery state carries it.
+- **Synchronization state** — the shared operator projection of a run's issue
+  delivery health: `none` when unbound, `ok` when settled, `pending` when work
+  is due or in flight, and `degraded` when a delivery or planning failure needs
+  attention.
+- **`will-retry`** — the operator disposition for a retryable delivery failure;
+  a later reconciliation pass will attempt the delivery again.
+- **`needs-operator`** — the operator disposition for a non-retryable delivery
+  failure; automated reconciliation will not attempt it again.

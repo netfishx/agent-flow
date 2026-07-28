@@ -15,6 +15,7 @@ import {
   parseCurrentLabels,
   parseResolvedIssue,
 } from "./gh-json.ts";
+import { sameIssueTarget } from "./target.ts";
 import type {
   AuthorizedIssueTargetConfig,
   CommentRef,
@@ -70,14 +71,6 @@ export function classifyGhFailure(
   return new IssueTrackerError(
     `issue tracker ${operation} failed${statusDetail}`,
     retryable,
-  );
-}
-
-function sameTarget(left: IssueRef, right: IssueRef): boolean {
-  return (
-    left.owner.toLowerCase() === right.owner.toLowerCase() &&
-    left.repo.toLowerCase() === right.repo.toLowerCase() &&
-    left.number === right.number
   );
 }
 
@@ -152,7 +145,7 @@ export class RealIssueTracker implements IssueTracker {
         false,
       );
     }
-    if (!sameTarget(ref, this.authorizedTarget)) {
+    if (!sameIssueTarget(ref, this.authorizedTarget)) {
       throw new IssueTrackerError("issue tracker target not authorized", false);
     }
     return this.authorizedTarget;

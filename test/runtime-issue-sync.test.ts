@@ -30,7 +30,9 @@ import {
 import {
   type CommentRef,
   type IssueTracker,
+  IssueTrackerError,
 } from "../src/issue/tracker.ts";
+import type { HerdrAdapter } from "../src/herdr/adapter.ts";
 import type {
   IssueRef,
   LaneResult,
@@ -99,6 +101,43 @@ class LeaseFailureLedger implements Ledger {
   }
 }
 
+class BeforeAcquireLedger implements Ledger {
+  acquireCalls = 0;
+  releaseCalls = 0;
+
+  constructor(
+    private readonly delegate: Ledger,
+    private readonly beforeAcquire: () => Promise<void>,
+  ) {}
+
+  commit(event: RunEvent): Promise<void> {
+    return this.delegate.commit(event);
+  }
+
+  load(runId: string) {
+    return this.delegate.load(runId);
+  }
+
+  list() {
+    return this.delegate.list();
+  }
+
+  async acquireLease(
+    runId: string,
+    controller: { controllerId: string; pid: number },
+  ): Promise<LeaseHandle> {
+    this.acquireCalls += 1;
+    await this.beforeAcquire();
+    const lease = await this.delegate.acquireLease(runId, controller);
+    return {
+      release: async () => {
+        await lease.release();
+        this.releaseCalls += 1;
+      },
+    };
+  }
+}
+
 class RememberingTracker extends FakeIssueTracker {
   private readonly comments = new Map<string, CommentRef>();
 
@@ -148,10 +187,77 @@ class ArmableConfirmationLossLedger extends InMemoryLedger {
 
 class RecordingLedger extends InMemoryLedger {
   readonly events: RunEvent[] = [];
+  leaseAcquisitions = 0;
+  leaseReleases = 0;
 
   override async commit(event: RunEvent): Promise<void> {
     await super.commit(event);
     this.events.push(structuredClone(event));
+  }
+
+  override async acquireLease(
+    runId: string,
+    controller: { controllerId: string; pid: number },
+  ): Promise<LeaseHandle> {
+    this.leaseAcquisitions += 1;
+    const lease = await super.acquireLease(runId, controller);
+    return {
+      release: async () => {
+        await lease.release();
+        this.leaseReleases += 1;
+      },
+    };
+  }
+}
+
+class CompleteFailingTracker extends FakeIssueTracker {
+  override async createComment(
+    ref: IssueRef,
+    body: string,
+  ): Promise<CommentRef> {
+    if (body.includes(":complete -->")) {
+      throw new IssueTrackerError(
+        "injected complete delivery failure",
+        true,
+      );
+    }
+    return super.createComment(ref, body);
+  }
+}
+
+class ExplodingHerdrAdapter implements HerdrAdapter {
+  private fail(method: string): Promise<never> {
+    return Promise.reject(
+      new Error(`finished-run retry called HerdrAdapter.${method}`),
+    );
+  }
+
+  createTab(): Promise<never> {
+    return this.fail("createTab");
+  }
+
+  splitPane(): Promise<never> {
+    return this.fail("splitPane");
+  }
+
+  runInPane(): Promise<never> {
+    return this.fail("runInPane");
+  }
+
+  waitForOutput(): Promise<never> {
+    return this.fail("waitForOutput");
+  }
+
+  processInfo(): Promise<never> {
+    return this.fail("processInfo");
+  }
+
+  focusPane(): Promise<never> {
+    return this.fail("focusPane");
+  }
+
+  interruptPane(): Promise<never> {
+    return this.fail("interruptPane");
   }
 }
 
@@ -242,6 +348,16 @@ class BoundaryReconcileRuntime extends WorkflowRuntime {
     laneId: string,
   ): Promise<void> {
     await this.onDriveSliceBoundary(runId, laneId);
+  }
+}
+
+class LeaseControlRuntime extends WorkflowRuntime {
+  async holdControllerLease(runId: string): Promise<void> {
+    await this.acquireControllerLease(runId);
+  }
+
+  async returnControllerLease(runId: string): Promise<void> {
+    await this.releaseControllerLease(runId);
   }
 }
 
@@ -339,6 +455,42 @@ async function appendEvent<T extends RunEventType>(
       ? {}
       : { laneId: options.laneId }),
   } as RunEvent);
+}
+
+async function finishedRunWithOutstandingComplete(runId: string) {
+  const root = await mkdtemp(
+    join(tmpdir(), "agent-flow-finished-delivery-"),
+  );
+  roots.push(root);
+  const clock = createClock(3_000);
+  const adapter = new CountingAdapter({
+    clock,
+    lanes: [{ laneId: "review", exitCode: 0 }],
+  });
+  const ledger = new RecordingLedger();
+  const runtime = new WorkflowRuntime({
+    adapter,
+    ledger,
+    clock: clock.now,
+    idgen: () => runId,
+    readResultFile: adapter.readResultFile,
+    sleep: async () => {},
+    issueTracker: new CompleteFailingTracker(),
+  });
+  const handle = await runtime.startWorkflow(config(root));
+  await runtime.confirmLaneStarted(handle.runId, "review");
+  await runtime.awaitLane(handle.runId, "review", 1_000);
+  const finished = await ledger.load(handle.runId);
+  if (finished === null || finished.finishedSequence === null) {
+    throw new Error("expected a finished source run");
+  }
+  const completeId =
+    `${handle.runId}:${finished.finishedSequence}:complete`;
+  expect(finished.deliveries[completeId]).toMatchObject({
+    state: "failed",
+    lastFailure: { retryable: true },
+  });
+  return { adapter, clock, completeId, finished, handle, ledger, root };
 }
 
 describe("WorkflowRuntime issue synchronization", () => {
@@ -472,6 +624,411 @@ describe("WorkflowRuntime issue synchronization", () => {
       decision: "accepted",
       resultingIssueState: null,
     });
+  });
+
+  test("a finished unbound owner decision ignores an injected tracker and the controller lease", async () => {
+    const tracker = new FakeIssueTracker();
+    const { root, adapter, ledger, runtime } = await setup({ tracker });
+    const handle = await runtime.startWorkflow(config(root, false));
+    await runtime.confirmLaneStarted(handle.runId, "review");
+    await runtime.awaitLane(handle.runId, "review", 1_000);
+    tracker.calls.splice(0);
+    const countingLedger = new BeforeAcquireLedger(
+      ledger,
+      async () => {},
+    );
+    const recorder = new WorkflowRuntime({
+      adapter,
+      ledger: countingLedger,
+      clock: () => 2_625,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: tracker,
+    });
+
+    await recorder.recordOwnerDecision(handle.runId, {
+      decision: "accepted",
+      note: "Unbound decisions remain local.",
+    });
+
+    expect(countingLedger.acquireCalls).toBe(0);
+    expect(countingLedger.releaseCalls).toBe(0);
+    expect(tracker.calls).toEqual([]);
+  });
+
+  test("bound resume and owner decision fail closed without a tracker", async () => {
+    const tracker = new FakeIssueTracker();
+    const { root, adapter, ledger, runtime } = await setup({ tracker });
+    const handle = await runtime.startWorkflow(config(root));
+    await runtime.confirmLaneStarted(handle.runId, "review");
+    await runtime.awaitLane(handle.runId, "review", 1_000);
+    const decisionCount = (await ledger.load(handle.runId))!.decisions.length;
+    const unconfigured = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: () => 2_750,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+
+    await expect(
+      unconfigured.resumeWorkflow(handle.runId),
+    ).rejects.toThrow("bound issue requires an issue tracker");
+    await expect(
+      unconfigured.recordOwnerDecision(handle.runId, {
+        decision: "accepted",
+        note: "must not be recorded without its configured delivery path",
+      }),
+    ).rejects.toThrow("bound issue requires an issue tracker");
+
+    expect((await ledger.load(handle.runId))!.decisions).toHaveLength(
+      decisionCount,
+    );
+  });
+
+  test("finished bound resume stays read-only when every delivery is settled", async () => {
+    const tracker = new FakeIssueTracker();
+    const { root, adapter, ledger, runtime } = await setup({ tracker });
+    const handle = await runtime.startWorkflow(config(root));
+    await runtime.confirmLaneStarted(handle.runId, "review");
+    await runtime.awaitLane(handle.runId, "review", 1_000);
+    const refusingLedger = new LeaseFailureLedger(
+      ledger,
+      new Error("settled finished run must not acquire a lease"),
+    );
+
+    const status = await new WorkflowRuntime({
+      adapter,
+      ledger: refusingLedger,
+      clock: () => 2_900,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: tracker,
+    }).resumeWorkflow(handle.runId);
+
+    expect(status.state).toBe("complete");
+    expect(refusingLedger.acquireCalls).toBe(0);
+  });
+
+  test("finished resume reloads under the lease and returns when another controller settled the work", async () => {
+    const {
+      adapter,
+      clock,
+      completeId,
+      handle,
+      ledger,
+    } = await finishedRunWithOutstandingComplete(
+      "run-finished-settled-race",
+    );
+    const failed = (await ledger.load(handle.runId))!.deliveries[
+      completeId
+    ]!;
+    const eventsBefore = ledger.events.length;
+    let settled = false;
+    const racingLedger = new BeforeAcquireLedger(ledger, async () => {
+      if (settled) return;
+      settled = true;
+      await appendEvent(
+        ledger,
+        handle.runId,
+        "issue_delivery_intended",
+        {
+          deliveryId: completeId,
+          kind: "complete",
+          laneId: null,
+          payloadHash: failed.payloadHash,
+        },
+      );
+      await appendEvent(
+        ledger,
+        handle.runId,
+        "issue_delivery_confirmed",
+        {
+          deliveryId: completeId,
+          commentId: 31,
+          commentUrl:
+            "https://example.invalid/issues/30#issuecomment-31",
+          labelTransition: "not-applicable",
+        },
+      );
+    });
+
+    const status = await new WorkflowRuntime({
+      adapter,
+      ledger: racingLedger,
+      clock: clock.now,
+      idgen: () => "unused",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+      issueTracker: new FakeIssueTracker(),
+    }).resumeWorkflow(handle.runId);
+
+    expect(status.state).toBe("complete");
+    expect(racingLedger.acquireCalls).toBe(1);
+    expect(racingLedger.releaseCalls).toBe(1);
+    expect(
+      ledger.events
+        .slice(eventsBefore)
+        .filter((event) => event.type === "controller_attached"),
+    ).toHaveLength(0);
+  });
+
+  test("finished resume keeps a controller lease the runtime already held", async () => {
+    const {
+      handle,
+      ledger,
+    } = await finishedRunWithOutstandingComplete(
+      "run-finished-held-controller",
+    );
+    const runtime = new LeaseControlRuntime({
+      adapter: new ExplodingHerdrAdapter(),
+      ledger,
+      clock: () => 3_500,
+      idgen: () => "unused",
+      readResultFile: async () => {
+        throw new Error("finished-run retry read a lane artifact");
+      },
+      sleep: async () => {},
+      issueTracker: new FakeIssueTracker(),
+    });
+    await runtime.holdControllerLease(handle.runId);
+    const releasesBefore = ledger.leaseReleases;
+
+    await runtime.resumeWorkflow(handle.runId);
+
+    expect(ledger.leaseReleases).toBe(releasesBefore);
+    await runtime.returnControllerLease(handle.runId);
+    expect(ledger.leaseReleases).toBe(releasesBefore + 1);
+  });
+
+  test("finished resume retries deliveries under a new epoch without touching Herdr or lane facts", async () => {
+    const {
+      completeId,
+      finished,
+      handle,
+      ledger,
+    } = await finishedRunWithOutstandingComplete(
+      "run-finished-delivery-retry",
+    );
+    const eventsBefore = ledger.events.length;
+    const acquisitionsBefore = ledger.leaseAcquisitions;
+    const releasesBefore = ledger.leaseReleases;
+    const tracker = new FakeIssueTracker({
+      createdComment: {
+        commentId: 30,
+        commentUrl:
+          "https://example.invalid/issues/30#issuecomment-30",
+      },
+    });
+
+    const status = await new WorkflowRuntime({
+      adapter: new ExplodingHerdrAdapter(),
+      ledger,
+      clock: () => 4_000,
+      idgen: () => "unused",
+      readResultFile: async () => {
+        throw new Error("finished-run retry read a lane artifact");
+      },
+      sleep: async () => {},
+      issueTracker: tracker,
+    }).resumeWorkflow(handle.runId);
+    const reloaded = await ledger.load(handle.runId);
+    const appended = ledger.events.slice(eventsBefore);
+
+    expect(status).toMatchObject({
+      state: "complete",
+      lanes: [{ laneId: "review", state: "complete", exitCode: 0 }],
+    });
+    expect(reloaded).toMatchObject({
+      finishStatus: finished.finishStatus,
+      breakdown: finished.breakdown,
+      controllerEpoch: finished.controllerEpoch + 1,
+      lanes: {
+        review: {
+          runtimeState: finished.lanes.review!.runtimeState,
+          exitCode: finished.lanes.review!.exitCode,
+          contractState: finished.lanes.review!.contractState,
+          verificationState: finished.lanes.review!.verificationState,
+        },
+      },
+      deliveries: {
+        [completeId]: {
+          state: "delivered",
+          intents: 2,
+          commentUrl:
+            "https://example.invalid/issues/30#issuecomment-30",
+        },
+      },
+    });
+    expect(ledger.leaseAcquisitions).toBe(acquisitionsBefore + 1);
+    expect(ledger.leaseReleases).toBe(releasesBefore + 1);
+    expect(appended[0]).toMatchObject({
+      type: "controller_attached",
+      controllerEpoch: finished.controllerEpoch,
+      data: { epoch: finished.controllerEpoch + 1 },
+    });
+    expect(
+      appended.filter((event) => event.type === "controller_attached"),
+    ).toHaveLength(1);
+    expect(
+      appended.filter((event) => event.type === "run_finished"),
+    ).toHaveLength(0);
+    expect(
+      appended.filter((event) => event.type.startsWith("lane_")),
+    ).toHaveLength(0);
+  });
+
+  test("finished resume contains a retry failure without changing runtime outcomes", async () => {
+    const {
+      completeId,
+      finished,
+      handle,
+      ledger,
+    } = await finishedRunWithOutstandingComplete(
+      "run-finished-delivery-failure",
+    );
+
+    const status = await new WorkflowRuntime({
+      adapter: new ExplodingHerdrAdapter(),
+      ledger,
+      clock: () => 4_500,
+      idgen: () => "unused",
+      readResultFile: async () => {
+        throw new Error("finished-run retry read a lane artifact");
+      },
+      sleep: async () => {},
+      issueTracker: new CompleteFailingTracker(),
+    }).resumeWorkflow(handle.runId);
+    const reloaded = await ledger.load(handle.runId);
+
+    expect(status).toMatchObject({
+      state: "complete",
+      lanes: [{ laneId: "review", state: "complete", exitCode: 0 }],
+    });
+    expect(reloaded).toMatchObject({
+      finishStatus: finished.finishStatus,
+      breakdown: finished.breakdown,
+      deliveries: {
+        [completeId]: {
+          state: "failed",
+          intents: 2,
+          lastFailure: {
+            reason: "injected complete delivery failure",
+            retryable: true,
+          },
+        },
+      },
+    });
+    for (const laneId of finished.laneOrder) {
+      expect(reloaded!.lanes[laneId]).toEqual(
+        finished.lanes[laneId],
+      );
+    }
+  });
+
+  test("finished resume with outstanding delivery refuses a live controller holder", async () => {
+    const {
+      adapter,
+      clock,
+      finished,
+      handle,
+      ledger,
+    } = await finishedRunWithOutstandingComplete(
+      "run-finished-live-controller",
+    );
+    const held = new LeaseFailureLedger(
+      ledger,
+      new ControllerLeaseHeldError("live controller"),
+    );
+
+    await expect(
+      new WorkflowRuntime({
+        adapter,
+        ledger: held,
+        clock: clock.now,
+        idgen: () => "unused",
+        readResultFile: adapter.readResultFile,
+        sleep: async () => {},
+        issueTracker: new FakeIssueTracker(),
+      }).resumeWorkflow(handle.runId),
+    ).rejects.toThrow("live controller");
+
+    expect((await ledger.load(handle.runId))!.controllerEpoch).toBe(
+      finished.controllerEpoch,
+    );
+  });
+
+  test("finished resume does not attach when a planning failure is the only outstanding condition", async () => {
+    const {
+      completeId,
+      handle,
+      ledger,
+      root,
+    } = await finishedRunWithOutstandingComplete(
+      "run-finished-planning-failure",
+    );
+    const failed = (await ledger.load(handle.runId))!.deliveries[
+      completeId
+    ]!;
+    await appendEvent(
+      ledger,
+      handle.runId,
+      "issue_delivery_intended",
+      {
+        deliveryId: completeId,
+        kind: "complete",
+        laneId: null,
+        payloadHash: failed.payloadHash,
+      },
+    );
+    await appendEvent(
+      ledger,
+      handle.runId,
+      "issue_delivery_failed",
+      {
+        deliveryId: completeId,
+        reason: "requires operator",
+        retryable: false,
+      },
+    );
+    await appendEvent(
+      ledger,
+      handle.runId,
+      "lane_checkpoint",
+      {
+        semanticState: "blocked",
+        checkpointFile: join(root, "work", "outside-run", "review.md"),
+      },
+      { laneId: "review", actor: "agent" },
+    );
+    const eventsBefore = ledger.events.length;
+    const tracker = new FakeIssueTracker();
+
+    await new WorkflowRuntime({
+      adapter: new ExplodingHerdrAdapter(),
+      ledger,
+      clock: () => 5_000,
+      idgen: () => "unused",
+      readResultFile: async () => {
+        throw new Error("finished-run retry read a lane artifact");
+      },
+      sleep: async () => {},
+      issueTracker: tracker,
+    }).resumeWorkflow(handle.runId);
+    const appended = ledger.events.slice(eventsBefore);
+
+    expect(
+      appended.filter((event) => event.type === "controller_attached"),
+    ).toHaveLength(0);
+    expect(
+      appended.filter((event) =>
+        event.type.startsWith("issue_delivery_"),
+      ),
+    ).toHaveLength(0);
+    expect(tracker.calls).toEqual([]);
   });
 
   test("a finished run acquires a lease and reconciles one owner decision", async () => {
