@@ -30,7 +30,7 @@ export function parseResolvedIssue(raw: string): ResolvedIssue {
   return { nodeId };
 }
 
-interface ParsedComment {
+export interface ParsedIssueComment {
   readonly ref: CommentRef;
   readonly body: string;
 }
@@ -58,7 +58,7 @@ function parseCommentRef(
   return { commentId, commentUrl };
 }
 
-function parseComment(value: unknown): ParsedComment {
+function parseComment(value: unknown): ParsedIssueComment {
   const ref = parseCommentRef(value, "find comment by marker");
   const body = isRecord(value) ? value.body : undefined;
   if (typeof body !== "string") {
@@ -109,14 +109,20 @@ export function commentBodyHasMarkerLine(
     .some((line) => line.trimEnd() === marker);
 }
 
+export function parseIssueComments(
+  raw: string,
+): readonly ParsedIssueComment[] {
+  return commentValues(parseJson("find comment by marker", raw)).map(
+    parseComment,
+  );
+}
+
 export function parseCommentByMarker(
   raw: string,
   marker: string,
 ): CommentRef | null {
   assertMarkerArgument(marker);
-  const values = commentValues(parseJson("find comment by marker", raw));
-  const matches = values
-    .map(parseComment)
+  const matches = parseIssueComments(raw)
     .filter((comment) => commentBodyHasMarkerLine(comment.body, marker));
   if (matches.length > 1) {
     throw new IssueTrackerError(
