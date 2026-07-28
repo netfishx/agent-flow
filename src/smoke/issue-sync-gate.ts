@@ -6,8 +6,7 @@ export type IssueSyncGateRefusalReason =
   | "owner-authorization-missing"
   | "ci-environment-refused"
   | "issue-target-missing"
-  | "issue-target-malformed"
-  | "protected-specification-issue";
+  | "issue-target-malformed";
 
 export type IssueSyncGateResult =
   | {
@@ -19,14 +18,6 @@ export type IssueSyncGateResult =
       readonly ok: false;
       readonly reason: IssueSyncGateRefusalReason;
     };
-
-function protectedSpecificationIssue(target: IssueRef): boolean {
-  return (
-    target.owner.toLowerCase() === "netfishx" &&
-    target.repo.toLowerCase() === "agent-flow" &&
-    target.number === 6
-  );
-}
 
 export function issueSyncGate(
   environment: NodeJS.ProcessEnv,
@@ -54,9 +45,6 @@ export function issueSyncGate(
   }
   if (target === null) {
     return { ok: false, reason: "issue-target-missing" };
-  }
-  if (protectedSpecificationIssue(target)) {
-    return { ok: false, reason: "protected-specification-issue" };
   }
   return { ok: true, target, authorizationStatement };
 }

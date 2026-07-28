@@ -79,18 +79,6 @@ describe("real-GitHub issue-sync smoke authorization gate", () => {
     });
   });
 
-  test("refuses protected specification issue #6 despite case variance", () => {
-    expect(
-      issueSyncGate({
-        ...acceptedEnvironment,
-        FLOW_ISSUE_TARGET: "NETFISHX/Agent-Flow#6",
-      }),
-    ).toEqual({
-      ok: false,
-      reason: "protected-specification-issue",
-    });
-  });
-
   test("accepts an authorized non-CI target and echoes the authorization", () => {
     expect(issueSyncGate(acceptedEnvironment)).toEqual({
       ok: true,

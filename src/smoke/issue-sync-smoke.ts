@@ -6,19 +6,23 @@
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ghArgvBuilders } from "../issue/gh-argv.ts";
+import { parseIssueComments } from "../issue/gh-json.ts";
 import { canonicalPayloadHash } from "../issue/hash.ts";
 import {
   dueMilestones,
   marker,
   type DueMilestone,
 } from "../issue/milestones.ts";
-import { RealIssueTracker } from "../issue/real-tracker.ts";
+import {
+  classifyGhFailure,
+  RealIssueTracker,
+} from "../issue/real-tracker.ts";
 import { renderMilestone } from "../issue/render.ts";
 import {
   type CommentRef,
   IssueTrackerError,
 } from "../issue/tracker.ts";
-import { ghArgvBuilders } from "../issue/gh-argv.ts";
 import type {
   IssueRef,
   NewRunEvent,
@@ -41,6 +45,8 @@ interface CliResult extends CommandResult {
 interface CliObservation {
   readonly runId: string;
   readonly exitCode: number;
+  readonly stdout?: string;
+  readonly stderr?: string;
 }
 
 interface MarkerObservation {
@@ -66,9 +72,17 @@ interface SmokeEvidence {
   labels: Record<string, readonly string[]>;
   cli: CliObservation[];
   commentUrls: string[];
-  parsePremise: {
+  parseFailClosedPremise: {
     readonly status: "not-run" | "observed";
     readonly commentCounts: readonly number[];
+  };
+  primaryRateLimit: {
+    observed: boolean;
+    detail: string | null;
+  };
+  retainedComments: {
+    readonly disposition: "accepted-persistent-trace";
+    commentUrls: string[];
   };
   redaction: Record<string, unknown> | null;
   restoration: Record<string, unknown>;
@@ -82,6 +96,12 @@ interface CannedRun {
   readonly runId: string;
   readonly paneIdentifiers: readonly string[];
   readonly sentinelIdentifiers: readonly string[];
+}
+
+interface VettedDirectGh {
+  addLabel(label: string): Promise<void>;
+  removeLabel(label: string): Promise<void>;
+  readCommentBodies(): Promise<Map<number, string>>;
 }
 
 const TRIAGE_LABELS: ReadonlySet<string> = new Set([
@@ -121,13 +141,28 @@ function errorObservation(error: unknown): Record<string, unknown> {
       operation: error.operation,
       exitCode: error.exitCode,
       httpStatus: error.httpStatus,
-      retryable: error.retryable,
     };
   }
   return {
     name: error instanceof Error ? error.name : "UnknownError",
     message: error instanceof Error ? error.message : String(error),
   };
+}
+
+function observePrimaryRateLimit(
+  evidence: SmokeEvidence,
+  error: unknown,
+): void {
+  if (
+    error instanceof IssueTrackerError &&
+    error.retryable === false &&
+    error.reason.includes("(HTTP 403)")
+  ) {
+    evidence.primaryRateLimit = {
+      observed: true,
+      detail: error.reason,
+    };
+  }
 }
 
 async function spawnGh(
@@ -148,20 +183,6 @@ async function spawnGh(
   return { exitCode, stdout, stderr };
 }
 
-function commentCount(raw: string): number | null {
-  try {
-    const root: unknown = JSON.parse(raw);
-    if (!Array.isArray(root)) return null;
-    if (root.length === 0) return 0;
-    if (root.every(Array.isArray)) {
-      return root.reduce((total, page) => total + page.length, 0);
-    }
-    return root.some(Array.isArray) ? null : root.length;
-  } catch {
-    return null;
-  }
-}
-
 class ObservedGhRunner {
   readonly lookupCommentCounts: number[] = [];
 
@@ -175,8 +196,9 @@ class ObservedGhRunner {
       argv[1]?.endsWith("/comments") === true &&
       argv.includes("--slurp")
     ) {
-      const count = commentCount(result.stdout);
-      if (count !== null) this.lookupCommentCounts.push(count);
+      this.lookupCommentCounts.push(
+        parseIssueComments(result.stdout).length,
+      );
     }
     return result;
   };
@@ -185,7 +207,6 @@ class ObservedGhRunner {
 class DirectGhError extends Error {
   override readonly name = "DirectGhError";
   readonly httpStatus: number | null;
-  readonly retryable: boolean;
 
   constructor(
     readonly operation: string,
@@ -195,88 +216,66 @@ class DirectGhError extends Error {
     const match = stderr.match(/HTTP\s+([0-9]{3})/i);
     const status =
       match?.[1] === undefined ? null : Number.parseInt(match[1], 10);
-    const secondary =
-      /secondary[- ]rate[- ]limit|retry[- ]after/i.test(stderr);
     super(
       `${operation} failed${status === null ? "" : ` (HTTP ${status})`}`,
     );
     this.httpStatus = status;
-    this.retryable =
-      status === null ||
-      status === 429 ||
-      (status !== null && status >= 500) ||
-      (status === 403 && secondary);
   }
 }
 
 async function directGh(
   operation: string,
+  classificationOperation: Parameters<typeof classifyGhFailure>[0],
   argv: readonly string[],
+  observeFailure: (error: IssueTrackerError) => void,
 ): Promise<string> {
   const result = await spawnGh(argv, null);
   if (result.exitCode !== 0) {
+    observeFailure(
+      classifyGhFailure(classificationOperation, result.stderr),
+    );
     throw new DirectGhError(operation, result.exitCode, result.stderr);
   }
   return result.stdout;
 }
 
-async function addLabelDirect(
-  target: IssueRef,
-  label: string,
-): Promise<void> {
-  await directGh(
-    `add label ${label}`,
-    ghArgvBuilders.addLabel(target, label),
-  );
-}
-
-async function removeLabelDirect(
-  target: IssueRef,
-  label: string,
-): Promise<void> {
-  await directGh(
-    `remove label ${label}`,
-    ghArgvBuilders.removeLabel(target, label),
-  );
-}
-
-function flattenedComments(raw: string): readonly unknown[] {
-  const root: unknown = JSON.parse(raw);
-  requireCondition(Array.isArray(root), "direct comment read-back was not an array");
-  if (root.length === 0) return [];
-  if (root.every(Array.isArray)) return root.flat();
-  requireCondition(
-    !root.some(Array.isArray),
-    "direct comment read-back mixed page and comment values",
-  );
-  return root;
-}
-
-async function readCommentBodiesDirect(
-  target: IssueRef,
-): Promise<Map<number, string>> {
-  const raw = await directGh(
-    "read back comments",
-    ghArgvBuilders.listComments(target),
-  );
-  const bodies = new Map<number, string>();
-  for (const value of flattenedComments(raw)) {
-    requireCondition(
-      typeof value === "object" && value !== null && !Array.isArray(value),
-      "direct comment read-back contained a non-object",
-    );
-    const id = (value as Record<string, unknown>).id;
-    const body = (value as Record<string, unknown>).body;
-    requireCondition(
-      typeof id === "number" &&
-        Number.isSafeInteger(id) &&
-        id > 0 &&
-        typeof body === "string",
-      "direct comment read-back contained an invalid id or body",
-    );
-    bodies.set(id, body);
-  }
-  return bodies;
+function createVettedDirectGh(
+  vettedTarget: IssueRef,
+  observeFailure: (error: IssueTrackerError) => void,
+): VettedDirectGh {
+  const target = Object.freeze({ ...vettedTarget });
+  return {
+    async addLabel(label) {
+      await directGh(
+        `add label ${label}`,
+        "add triage label",
+        ghArgvBuilders.addLabel(target, label),
+        observeFailure,
+      );
+    },
+    async removeLabel(label) {
+      await directGh(
+        `remove label ${label}`,
+        "remove triage label",
+        ghArgvBuilders.removeLabel(target, label),
+        observeFailure,
+      );
+    },
+    async readCommentBodies() {
+      const raw = await directGh(
+        "read back comments",
+        "find comment by marker",
+        ghArgvBuilders.listComments(target),
+        observeFailure,
+      );
+      return new Map(
+        parseIssueComments(raw).map((comment) => [
+          comment.ref.commentId,
+          comment.body,
+        ]),
+      );
+    },
+  };
 }
 
 async function appendEvent(
@@ -487,10 +486,31 @@ async function flowResume(run: CannedRun): Promise<CliResult> {
 }
 
 function requireCliSuccess(observation: CliResult): void {
-  requireCondition(
-    observation.exitCode === 0,
-    `flow resume "${observation.runId}" exited ${observation.exitCode}`,
+  if (observation.exitCode === 0) return;
+  const stdout = observation.stdout.trim();
+  throw new Error(
+    `flow resume "${observation.runId}" exited ${observation.exitCode}: stderr=${observation.stderr.trim()}${
+      stdout.length === 0 ? "" : ` stdout=${stdout}`
+    }`,
   );
+}
+
+function recordCliEvidence(
+  evidence: SmokeEvidence,
+  result: CliResult,
+): void {
+  evidence.cli.push({
+    runId: result.runId,
+    exitCode: result.exitCode,
+    ...(result.exitCode === 0
+      ? {}
+      : {
+          stderr: result.stderr,
+          ...(result.stdout.length === 0
+            ? {}
+            : { stdout: result.stdout }),
+        }),
+  });
 }
 
 function requireDueKinds(
@@ -628,17 +648,40 @@ async function assertAdapterRefusals(
   ] as const;
   const capabilityRefusals: Record<string, unknown>[] = [];
   for (const ref of differing) {
-    for (const invoke of [
-      () => tracker.createComment(ref, "must not be posted"),
-      () =>
-        tracker.compareAndSetTriageLabel(
-          ref,
-          "ready-for-agent",
-          "needs-info",
-        ),
+    for (const operation of [
+      {
+        capability: "resolveIssue",
+        invoke: () => tracker.resolveIssue(ref),
+      },
+      {
+        capability: "findCommentByMarker",
+        invoke: () =>
+          tracker.findCommentByMarker(
+            ref,
+            marker("issue-sync-smoke-allowlist-probe"),
+          ),
+      },
+      {
+        capability: "createComment",
+        invoke: () =>
+          tracker.createComment(ref, "must not be posted"),
+      },
+      {
+        capability: "readCurrentLabels",
+        invoke: () => tracker.readCurrentLabels(ref),
+      },
+      {
+        capability: "compareAndSetTriageLabel",
+        invoke: () =>
+          tracker.compareAndSetTriageLabel(
+            ref,
+            "ready-for-agent",
+            "needs-info",
+          ),
+      },
     ]) {
       try {
-        await invoke();
+        await operation.invoke();
         throw new Error("unauthorized issue target was accepted");
       } catch (error) {
         requireCondition(
@@ -647,7 +690,10 @@ async function assertAdapterRefusals(
             error.retryable === false,
           "target allowlist refusal did not match the approved contract",
         );
-        capabilityRefusals.push(errorObservation(error));
+        capabilityRefusals.push({
+          capability: operation.capability,
+          ...errorObservation(error),
+        });
       }
     }
   }
@@ -664,6 +710,7 @@ async function assertAdapterRefusals(
 
 async function restoreTriageLabels(
   tracker: RealIssueTracker,
+  direct: VettedDirectGh,
   target: IssueRef,
   startingLabels: readonly string[],
 ): Promise<Record<string, unknown>> {
@@ -673,11 +720,11 @@ async function restoreTriageLabels(
   const before = await tracker.readCurrentLabels(target);
   for (const label of before) {
     if (TRIAGE_LABELS.has(label) && !desired.includes(label)) {
-      await removeLabelDirect(target, label);
+      await direct.removeLabel(label);
     }
   }
   for (const label of desired) {
-    if (!before.includes(label)) await addLabelDirect(target, label);
+    if (!before.includes(label)) await direct.addLabel(label);
   }
   const after = await tracker.readCurrentLabels(target);
   const restored = after
@@ -774,7 +821,15 @@ async function runIssueSyncSmoke(): Promise<number> {
     labels: {},
     cli: [],
     commentUrls: [],
-    parsePremise: { status: "not-run", commentCounts: [] },
+    parseFailClosedPremise: {
+      status: "not-run",
+      commentCounts: [],
+    },
+    primaryRateLimit: { observed: false, detail: null },
+    retainedComments: {
+      disposition: "accepted-persistent-trace",
+      commentUrls: [],
+    },
     redaction: null,
     restoration: { attempted: false },
     cleanup: { attempted: false },
@@ -782,19 +837,28 @@ async function runIssueSyncSmoke(): Promise<number> {
   };
 
   const observedRunner = new ObservedGhRunner();
-  const tracker = new RealIssueTracker({
-    authorizedTarget: gate.target,
-    run: observedRunner.run,
-  });
   const createdComments: CreatedComment[] = [];
   const paneIdentifiers: string[] = [];
   const sentinelIdentifiers: string[] = [];
+  let trackerForRestore: RealIssueTracker | null = null;
+  let directForRestore: VettedDirectGh | null = null;
   let tempRoot: string | null = null;
   let startingLabels: readonly string[] | null = null;
   let labelsMayNeedRestore = false;
   let primaryFailure: unknown = null;
 
   try {
+    const tracker = new RealIssueTracker({
+      authorizedTarget: gate.target,
+      run: observedRunner.run,
+    });
+    trackerForRestore = tracker;
+    const direct = createVettedDirectGh(
+      gate.target,
+      (error) => observePrimaryRateLimit(evidence, error),
+    );
+    directForRestore = direct;
+
     evidence.scenarios.adapterRefusals =
       await assertAdapterRefusals(gate.target);
 
@@ -829,10 +893,7 @@ async function runIssueSyncSmoke(): Promise<number> {
     );
     labelsMayNeedRestore = true;
     const aFirstCli = await flowResume(scenarioA);
-    evidence.cli.push({
-      runId: aFirstCli.runId,
-      exitCode: aFirstCli.exitCode,
-    });
+    recordCliEvidence(evidence, aFirstCli);
     requireCliSuccess(aFirstCli);
     const aFirst = await loadRun(scenarioA);
     evidence.scenarios.a = {
@@ -860,7 +921,7 @@ async function runIssueSyncSmoke(): Promise<number> {
       gate.target,
       aComments,
     );
-    evidence.parsePremise = {
+    evidence.parseFailClosedPremise = {
       status: "observed",
       commentCounts: aMarkerRoundTrip.map(
         (observation) => observation.parsedCommentCount,
@@ -879,10 +940,7 @@ async function runIssueSyncSmoke(): Promise<number> {
       ]),
     );
     const aSecondCli = await flowResume(scenarioA);
-    evidence.cli.push({
-      runId: aSecondCli.runId,
-      exitCode: aSecondCli.exitCode,
-    });
+    recordCliEvidence(evidence, aSecondCli);
     requireCliSuccess(aSecondCli);
     const aSecond = await loadRun(scenarioA);
     const intentsAfter = Object.fromEntries(
@@ -952,10 +1010,7 @@ async function runIssueSyncSmoke(): Promise<number> {
     createdComments.push(bCreated);
     evidence.commentUrls.push(preposted.commentUrl);
     const bCli = await flowResume(scenarioB);
-    evidence.cli.push({
-      runId: bCli.runId,
-      exitCode: bCli.exitCode,
-    });
+    recordCliEvidence(evidence, bCli);
     requireCliSuccess(bCli);
     const bAfter = await loadRun(scenarioB);
     const bDelivery = bAfter.deliveries[bStart.deliveryId];
@@ -990,8 +1045,8 @@ async function runIssueSyncSmoke(): Promise<number> {
       labelsAfterA.includes("needs-info"),
       "scenario A did not leave needs-info for scenario C setup",
     );
-    await removeLabelDirect(gate.target, "needs-info");
-    await addLabelDirect(gate.target, "needs-triage");
+    await direct.removeLabel("needs-info");
+    await direct.addLabel("needs-triage");
     const labelsBeforeC = await tracker.readCurrentLabels(gate.target);
     evidence.labels.beforeScenarioC = labelsBeforeC;
     requireCondition(
@@ -1013,10 +1068,7 @@ async function runIssueSyncSmoke(): Promise<number> {
     sentinelIdentifiers.push(...scenarioC.sentinelIdentifiers);
     const cDue = requireDueKinds(await loadRun(scenarioC), ["blocked"]);
     const cCli = await flowResume(scenarioC);
-    evidence.cli.push({
-      runId: cCli.runId,
-      exitCode: cCli.exitCode,
-    });
+    recordCliEvidence(evidence, cCli);
     requireCliSuccess(cCli);
     const cAfter = await loadRun(scenarioC);
     recordDeliveredUrls(evidence, cAfter);
@@ -1042,7 +1094,7 @@ async function runIssueSyncSmoke(): Promise<number> {
       labelsAfter: labelsAfterC,
     };
 
-    const allCommentBodies = await readCommentBodiesDirect(gate.target);
+    const allCommentBodies = await direct.readCommentBodies();
     const createdBodies = createdComments.map(({ deliveryId, ref }) => {
       const body = allCommentBodies.get(ref.commentId);
       requireCondition(
@@ -1059,21 +1111,26 @@ async function runIssueSyncSmoke(): Promise<number> {
     });
   } catch (error) {
     primaryFailure = error;
+    observePrimaryRateLimit(evidence, error);
     evidence.failure = errorObservation(error);
   } finally {
     if (
       labelsMayNeedRestore &&
-      startingLabels !== null
+      startingLabels !== null &&
+      trackerForRestore !== null &&
+      directForRestore !== null
     ) {
       try {
         evidence.restoration = await restoreTriageLabels(
-          tracker,
+          trackerForRestore,
+          directForRestore,
           gate.target,
           startingLabels,
         );
         evidence.labels.restored =
           (evidence.restoration.after as readonly string[]) ?? [];
       } catch (error) {
+        observePrimaryRateLimit(evidence, error);
         evidence.restoration = {
           attempted: true,
           ok: false,
@@ -1100,6 +1157,7 @@ async function runIssueSyncSmoke(): Promise<number> {
   }
 
   evidence.ok = primaryFailure === null;
+  evidence.retainedComments.commentUrls = [...evidence.commentUrls];
   let evidencePath: string;
   try {
     evidencePath = await writeEvidence(evidenceDir, evidence);
