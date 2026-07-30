@@ -113,8 +113,6 @@ export interface AgentLaneSpec {
   readonly agentKind: ReviewAgentKind;
   readonly model: string;
   readonly effort: string;
-  /** Grok output surface; "plain" unless the visibility gate required a stream. */
-  readonly grokOutputFormat?: "plain" | "streaming-json";
 }
 
 export type LaneSpec = SimulatedLaneSpec | AgentLaneSpec;

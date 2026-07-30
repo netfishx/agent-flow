@@ -544,6 +544,120 @@ describe("isolation outcomes", () => {
   });
 });
 
+describe("human ownership and recovery", () => {
+  test("a human-owned agent lane that self-terminates is still collected", async () => {
+    const sessionId = "00000000-0000-4000-8000-000000000001";
+    const { runtime, fake, ledger, cwd } = await setup({
+      lanes: [
+        {
+          laneId: "claude-standards",
+          exitCode: 0,
+          rawReport: claudeRaw(VALID_REPORT, sessionId),
+          // The lane keeps running past its wait; the human owns it.
+          waitMatches: false,
+        },
+      ],
+    });
+    const handle = await start(runtime, cwd, [
+      agentLane("claude-standards", "claude", "standards"),
+    ]);
+    await runtime.confirmLaneStarted(handle.runId, "claude-standards");
+    await runtime.takeoverLane(handle.runId, "claude-standards");
+
+    // Automatic drive is suspended: awaiting returns without driving, and
+    // the ledger still shows a live, undriven lane.
+    await runtime.awaitLane(handle.runId, "claude-standards", 60_000);
+    const parkedLane = (await ledger.load(handle.runId))!.lanes[
+      "claude-standards"
+    ]!;
+    expect(parkedLane.runtimeState).toBe("running");
+    expect(parkedLane.exitCode).toBeNull();
+
+    // The reviewer exits on its own under human ownership.
+    fake.finishLane("claude-standards");
+    await runtime.inspectWorkflow(handle.runId);
+
+    const run = (await ledger.load(handle.runId))!;
+    const lane = run.lanes["claude-standards"]!;
+    expect(lane.runtimeState).toBe("exited");
+    expect(lane.controlMode).toBe("human_owned");
+    expect(lane.contractState).toBe("satisfied");
+    expect(lane.verificationState).toBe("verified");
+    expect(lane.sessionIdentity).toMatchObject({ kind: "measured" });
+    expect(lane.isolationPost).toMatchObject({ headOk: true, cleanOk: true });
+    expect(run.finishStatus).toBe("clean");
+  });
+
+  test("a fresh controller resumes and collects agent lanes after loss", async () => {
+    const sessionId = "00000000-0000-4000-8000-000000000001";
+    const cwdSeed = await mkdtemp(join(tmpdir(), "flow-agent-"));
+    const clock = createClock(0);
+    const fake = new FakeHerdrAdapter({
+      clock,
+      lanes: [
+        {
+          laneId: "claude-standards",
+          exitCode: 0,
+          rawReport: claudeRaw(VALID_REPORT, sessionId),
+        },
+        {
+          laneId: "codex-spec",
+          exitCode: 0,
+          rawReport: VALID_REPORT,
+          stderrContent: "session id: 019fb080-9dc7-7173-8893-97f6f777329b\n",
+        },
+      ],
+    });
+    const ledger = new RecordingLedger();
+    const isolation = new FakeReviewIsolation();
+    let sessions = 0;
+    const makeRuntime = () =>
+      new WorkflowRuntime({
+        adapter: fake,
+        ledger,
+        clock: clock.now,
+        idgen: () => "run-agent",
+        readResultFile: fake.readResultFile,
+        sleep: async () => {},
+        reviewIsolation: isolation,
+        sessionIdgen: () =>
+          `00000000-0000-4000-8000-00000000000${(sessions += 1)}`,
+      });
+
+    // The first controller dispatches and is then lost without driving.
+    const first = makeRuntime();
+    const handle = await first.startWorkflow({
+      workflow: "review",
+      workspace: "w1",
+      cwd: cwdSeed,
+      lanes: [
+        agentLane("claude-standards", "claude", "standards"),
+        agentLane("codex-spec", "codex", "spec"),
+      ],
+      fixedPoint: FIXED_POINT,
+      inputBundle: BUNDLE,
+    });
+
+    // A fresh controller process resumes from the ledger alone.
+    const second = makeRuntime();
+    await second.resumeWorkflow(handle.runId, 60_000);
+
+    const run = (await ledger.load(handle.runId))!;
+    expect(run.finishStatus).toBe("clean");
+    for (const laneId of ["claude-standards", "codex-spec"]) {
+      const lane = run.lanes[laneId]!;
+      expect(lane.runtimeState).toBe("exited");
+      expect(lane.exitCode).toBe(0);
+      expect(lane.contractState).toBe("satisfied");
+      expect(lane.verificationState).toBe("verified");
+      expect(lane.sessionIdentity).toMatchObject({ kind: "measured" });
+      expect(lane.isolationPost).toMatchObject({ headOk: true });
+    }
+    const types = ledger.events.map((event) => event.type);
+    expect(types).toContain("controller_attached");
+  });
+});
+
 describe("finish-status fail-closed rule", () => {
   test("a terminal agent lane WITHOUT a post-flight record forces invalid", async () => {
     const { reduce } = await import("../src/runtime/reducer.ts");

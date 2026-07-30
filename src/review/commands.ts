@@ -25,8 +25,6 @@ export interface AgentLaneCommandInput {
   readonly stderrFile: string;
   /** Pre-assigned session UUID; required for claude and grok lanes. */
   readonly sessionId: string | null;
-  /** Grok output surface; "plain" unless the visibility gate required a stream. */
-  readonly grokOutputFormat?: "plain" | "streaming-json";
 }
 
 // The permission allowlist for claude lanes. `--tools` only restricts which
@@ -108,7 +106,10 @@ export function buildAgentCliArgv(input: AgentLaneCommandInput): string[] {
         "--disable-web-search",
         "--always-approve",
         "--output-format",
-        input.grokOutputFormat ?? "plain",
+        // Plain output is the ratified surface; both rehearsals proved its
+        // pre-completion visibility, so the streaming contingency never
+        // activated and is deliberately not wired.
+        "plain",
       ];
     }
   }

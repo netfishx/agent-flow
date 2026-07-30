@@ -108,13 +108,19 @@ export interface RunnerEvidence {
   readonly executionTimeout: string | null;
   /** The immutable raw report artifact; null for simulated lanes. */
   readonly rawReportArtifact?: string | null;
-  /** Best-effort token counts parsed only from the lane's own output. */
-  readonly tokens?: {
-    readonly source: string;
-    readonly inputTokens: number | null;
-    readonly outputTokens: number | null;
-    readonly totalTokens: number | null;
-  } | null;
+  /**
+   * Best-effort token counts parsed only from the lane's own output, or an
+   * explicit unavailability reason; null for lanes that never ran a CLI.
+   */
+  readonly tokens?:
+    | {
+        readonly source: string;
+        readonly inputTokens: number | null;
+        readonly outputTokens: number | null;
+        readonly totalTokens: number | null;
+      }
+    | { readonly unavailable: string }
+    | null;
   readonly termination:
     | "sentinel-exit"
     | "crashed"

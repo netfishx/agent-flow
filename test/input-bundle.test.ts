@@ -60,6 +60,15 @@ describe("assembleInputBundle", () => {
     ).toThrow('duplicate bundle path');
   });
 
+  test.each(["bundle/../escape.md", "bundle/a/../../b.md", "bundle//x.md", "bundle/./x.md"])(
+    "a traversal-shaped path %s never escapes the run directory",
+    (path) => {
+      expect(() =>
+        assembleInputBundle([{ path, role: "issue", content: "x" }]),
+      ).toThrow("unsafe segment");
+    },
+  );
+
   test("a file without a trailing newline still numbers every line", () => {
     const bundle = assembleInputBundle([
       { path: "bundle/a.md", role: "spec", content: "one\ntwo" },

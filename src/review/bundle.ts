@@ -44,6 +44,20 @@ export interface AssembledInputBundle {
 
 const BUNDLE_PATH = /^bundle\/[A-Za-z0-9._/-]+$/;
 
+/** Bundle paths are joined under the run directory; no segment may escape it. */
+function assertSafeBundlePath(path: string): void {
+  if (!BUNDLE_PATH.test(path)) {
+    throw new Error(
+      `bundle path "${path}" must match bundle/<name> with safe characters`,
+    );
+  }
+  for (const segment of path.split("/")) {
+    if (segment === "" || segment === "." || segment === "..") {
+      throw new Error(`bundle path "${path}" contains an unsafe segment`);
+    }
+  }
+}
+
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
@@ -67,11 +81,7 @@ export function assembleInputBundle(
   }
   const seen = new Set<string>();
   for (const file of files) {
-    if (!BUNDLE_PATH.test(file.path)) {
-      throw new Error(
-        `bundle path "${file.path}" must match bundle/<name> with safe characters`,
-      );
-    }
+    assertSafeBundlePath(file.path);
     if (seen.has(file.path)) {
       throw new Error(`duplicate bundle path "${file.path}"`);
     }

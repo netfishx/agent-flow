@@ -20,6 +20,7 @@ import {
   type AgentLaneDerivation,
 } from "../review/derive.ts";
 import {
+  failedVerification,
   verificationPassed,
   type WorktreeVerification,
 } from "../review/isolation.ts";
@@ -50,7 +51,6 @@ import {
   projectRunState,
   projectRunOutcomeBreakdown,
   reduce,
-  type LaneIsolationView,
   type LaneView,
   type RunView,
 } from "./reducer.ts";
@@ -96,10 +96,6 @@ interface LaneArtifactPaths {
 
 function isAgentSpec(spec: LaneSpec): spec is AgentLaneSpec {
   return spec.kind === "agent";
-}
-
-function isolationViewPassed(view: LaneIsolationView | null): boolean {
-  return view !== null && view.headOk && view.cleanOk && view.diffHashOk;
 }
 
 function assertIssueBinding(issue: IssueRef | null | undefined): void {
@@ -483,9 +479,6 @@ export class WorkflowRuntime {
                   logFile: item.logFile,
                   stderrFile: item.artifacts.stderrFile,
                   sessionId: item.agent.preassignedSessionId,
-                  ...(item.agent.spec.grokOutputFormat === undefined
-                    ? {}
-                    : { grokOutputFormat: item.agent.spec.grokOutputFormat }),
                 }),
         });
       }
@@ -619,12 +612,7 @@ export class WorkflowRuntime {
       });
     } catch (cause) {
       // A port failure proves nothing about the worktree — fail closed.
-      return {
-        headOk: false,
-        cleanOk: false,
-        diffHashOk: false,
-        detail: rejectionMessage(cause),
-      };
+      return failedVerification(rejectionMessage(cause));
     }
   }
 
@@ -648,12 +636,9 @@ export class WorkflowRuntime {
       run.fixedPoint === null ||
       lane.worktreePath === null
     ) {
-      verification = {
-        headOk: false,
-        cleanOk: false,
-        diffHashOk: false,
-        detail: "review isolation port unavailable for post-flight",
-      };
+      verification = failedVerification(
+        "review isolation port unavailable for post-flight",
+      );
     } else {
       try {
         verification = await isolation.verifyWorktree({
@@ -661,12 +646,7 @@ export class WorkflowRuntime {
           fixedPoint: run.fixedPoint,
         });
       } catch (cause) {
-        verification = {
-          headOk: false,
-          cleanOk: false,
-          diffHashOk: false,
-          detail: rejectionMessage(cause),
-        };
+        verification = failedVerification(rejectionMessage(cause));
       }
     }
     await this.commitEventConditionally(runId, (current) => {
@@ -1695,7 +1675,8 @@ export class WorkflowRuntime {
     if (
       finalLane.kind === "agent" &&
       finalLane.runtimeState !== "failed_to_start" &&
-      isolationViewPassed(finalLane.isolationPost) &&
+      finalLane.isolationPost !== null &&
+      verificationPassed(finalLane.isolationPost) &&
       this.deps.reviewIsolation !== undefined &&
       finalLane.worktreePath !== null &&
       this.getRun(runId).fixedPoint !== null

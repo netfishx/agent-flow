@@ -51,3 +51,28 @@ and design records.
   a later reconciliation pass will attempt the delivery again.
 - **`needs-operator`** — the operator disposition for a non-retryable delivery
   failure; automated reconciliation will not attempt it again.
+- **Agent lane** — a lane that runs a real reviewer CLI headlessly in its own
+  review worktree; a **simulated lane** runs the scripted stand-in.
+- **Review axis** — the reviewer charter dimension of an agent lane:
+  `standards` or `spec`.
+- **Input bundle** — the immutable review materials captured once at run
+  start, persisted as line-numbered artifacts with per-file content hashes.
+- **Bundle hash** — the SHA-256 over the input bundle's canonical manifest;
+  all briefs of one run must record the same value.
+- **Review worktree** — a detached, disposable git worktree pinned at the
+  captured head commit; the reviewer's working directory, never the
+  implementation worktree.
+- **Isolation verification** — the pre-flight/post-flight check of a review
+  worktree (HEAD, clean state, diff hash). A verification that cannot run
+  proves nothing and fails closed.
+- **Raw report** — a lane's CLI output captured byte-for-byte; the
+  first-class artifact from which the report text, checkpoint, and contract
+  outcome are derived without rewriting.
+- **Report contract** — the required `VERDICT` / `CONFIDENCE` / `FINDINGS`
+  form of a reviewer's report; validated for form only, never for truth.
+- **Session identity** — a lane's CLI session id, recorded only from evidence
+  causally tied to that lane (pre-assigned id or the lane's own output):
+  measured, or unavailable with a reason.
+- **`invalid`** — the run finish status when an agent lane that ran to a
+  terminal state lacks a passing post-flight verification; an invalid run is
+  never carried forward, and a rerun gets a new run id.

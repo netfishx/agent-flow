@@ -33,6 +33,11 @@ export interface LaneTokenFacts {
   readonly totalTokens: number | null;
 }
 
+/** Token counts are measured from the lane's own output, or explicitly not. */
+export type LaneTokens =
+  | LaneTokenFacts
+  | { readonly unavailable: string };
+
 export interface AgentLaneDerivation {
   /** The reviewer's report text; null when derivation failed. */
   readonly reportText: string | null;
@@ -41,21 +46,21 @@ export interface AgentLaneDerivation {
   /** Derived checkpoint markdown; null leaves the semantic dimension unknown. */
   readonly checkpointText: string | null;
   readonly session: SessionIdentity;
-  readonly tokens: LaneTokenFacts | null;
+  readonly tokens: LaneTokens;
 }
 
 function deriveReport(capture: AgentLaneCapture): {
   reportText: string | null;
   errors: string[];
   sessionEcho: string | null;
-  tokens: LaneTokenFacts | null;
+  tokens: LaneTokens;
 } {
   if (capture.raw === null) {
     return {
       reportText: null,
       errors: [`raw report unavailable: ${capture.rawPath}`],
       sessionEcho: null,
-      tokens: null,
+      tokens: { unavailable: "raw report unavailable" },
     };
   }
   if (capture.agentKind === "claude") {
@@ -65,7 +70,7 @@ function deriveReport(capture: AgentLaneCapture): {
         reportText: null,
         errors: [`${extraction.error} (raw artifact: ${capture.rawPath})`],
         sessionEcho: null,
-        tokens: null,
+        tokens: { unavailable: "raw stream not derivable" },
       };
     }
     return {
@@ -74,7 +79,7 @@ function deriveReport(capture: AgentLaneCapture): {
       sessionEcho: extraction.sessionId,
       tokens:
         extraction.tokens === null
-          ? null
+          ? { unavailable: "result event carried no usage" }
           : {
               source: "claude result event",
               inputTokens: extraction.tokens.inputTokens,
@@ -84,23 +89,34 @@ function deriveReport(capture: AgentLaneCapture): {
             },
     };
   }
-  const tokens =
-    capture.agentKind === "codex" && capture.stderr !== null
-      ? parseCodexTokensUsed(capture.stderr)
-      : null;
+  if (capture.agentKind === "codex") {
+    const tokens =
+      capture.stderr === null ? null : parseCodexTokensUsed(capture.stderr);
+    return {
+      reportText: capture.raw,
+      errors: [],
+      sessionEcho: null,
+      tokens:
+        tokens === null
+          ? {
+              unavailable:
+                capture.stderr === null
+                  ? "lane stderr artifact is unreadable"
+                  : "no tokens-used line in the lane's stderr",
+            }
+          : {
+              source: "codex stderr tokens-used line",
+              inputTokens: null,
+              outputTokens: null,
+              totalTokens: tokens,
+            },
+    };
+  }
   return {
     reportText: capture.raw,
     errors: [],
     sessionEcho: null,
-    tokens:
-      tokens === null
-        ? null
-        : {
-            source: "codex stderr tokens-used line",
-            inputTokens: null,
-            outputTokens: null,
-            totalTokens: tokens,
-          },
+    tokens: { unavailable: "grok plain output carries no token counts" },
   };
 }
 
@@ -172,10 +188,13 @@ function checkpoint(
   const gapLines =
     gaps.length === 0 ? "- none" : gaps.map((gap) => `- ${gap}`).join("\n");
   const artifactLines = artifacts.map((path) => `- ${path}`).join("\n");
+  // This file is a mechanical projection of the lane's raw report, written by
+  // the runtime — it must never impersonate the Agent's own voice or claim
+  // verification (runner evidence and contract events own those dimensions).
   return `STATUS: ${status}
-PHASE: review
+PHASE: derived-from-raw-report
 COMPLETED:
-- reviewer report captured
+- derived mechanically from the lane's raw report
 NEXT:
 - none
 BLOCKERS:
@@ -183,7 +202,7 @@ ${blockers}
 ARTIFACTS:
 ${artifactLines}
 VERIFICATION_CLAIMS:
-- report contract validated mechanically
+- none
 GAPS:
 ${gapLines}
 `;

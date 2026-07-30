@@ -42,10 +42,20 @@ export interface ReviewIsolationPort {
   }): Promise<void>;
 }
 
-export function verificationPassed(verification: WorktreeVerification): boolean {
+/** The one shared pass predicate for any isolation-verification shape. */
+export function verificationPassed(verification: {
+  readonly headOk: boolean;
+  readonly cleanOk: boolean;
+  readonly diffHashOk: boolean;
+}): boolean {
   return (
     verification.headOk && verification.cleanOk && verification.diffHashOk
   );
+}
+
+/** A verification that proves nothing — the fail-closed outcome. */
+export function failedVerification(detail: string): WorktreeVerification {
+  return { headOk: false, cleanOk: false, diffHashOk: false, detail };
 }
 
 interface GitRunner {
@@ -170,12 +180,9 @@ export class GitReviewIsolation implements ReviewIsolationPort {
       };
     } catch (error) {
       // Verification that cannot run proves nothing — fail closed.
-      return {
-        headOk: false,
-        cleanOk: false,
-        diffHashOk: false,
-        detail: error instanceof Error ? error.message : String(error),
-      };
+      return failedVerification(
+        error instanceof Error ? error.message : String(error),
+      );
     }
   }
 

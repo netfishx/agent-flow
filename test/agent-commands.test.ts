@@ -105,13 +105,6 @@ describe("buildAgentCliArgv", () => {
     ]);
   });
 
-  test("the grok streaming-json contingency surface is selectable", () => {
-    const argv = buildAgentCliArgv(
-      input({ agentKind: "grok", grokOutputFormat: "streaming-json" }),
-    );
-    expect(argv.slice(-2)).toEqual(["--output-format", "streaming-json"]);
-  });
-
   test.each(["claude", "grok"] as const)(
     "a %s lane refuses to build without a pre-assigned session id",
     (agentKind) => {

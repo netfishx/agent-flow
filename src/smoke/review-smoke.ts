@@ -63,36 +63,40 @@ interface ModelChoice {
   readonly effort: string;
 }
 
+// The D6 model/effort batteries. Formal runs use these EXACTLY — no
+// environment override can weaken a formal run's lanes, models, or efforts.
+const FORMAL_MODELS: Record<Family, ModelChoice> = {
+  claude: { model: "claude-opus-5", effort: "high" },
+  codex: { model: "gpt-5.6-sol", effort: "high" },
+  grok: { model: "grok-4.5", effort: "high" },
+};
+
 function modelFor(mode: ReviewSmokeMode, family: Family): ModelChoice {
-  const defaults: Record<ReviewSmokeMode, Record<Family, ModelChoice>> = {
-    rehearsal: {
-      claude: { model: "claude-haiku-4-5-20251001", effort: "low" },
-      codex: { model: "gpt-5.6-sol", effort: "low" },
-      grok: { model: "grok-4.5", effort: "low" },
-    },
-    formal: {
-      claude: { model: "claude-opus-5", effort: "high" },
-      codex: { model: "gpt-5.6-sol", effort: "high" },
-      grok: { model: "grok-4.5", effort: "high" },
-    },
+  if (mode === "formal") return FORMAL_MODELS[family];
+  const rehearsalDefaults: Record<Family, ModelChoice> = {
+    claude: { model: "claude-haiku-4-5-20251001", effort: "low" },
+    codex: { model: "gpt-5.6-sol", effort: "low" },
+    grok: { model: "grok-4.5", effort: "low" },
   };
   const prefix = `FLOW_REVIEW_${family.toUpperCase()}`;
   return {
-    model: env(`${prefix}_MODEL`, defaults[mode][family].model),
-    effort: env(`${prefix}_EFFORT`, defaults[mode][family].effort),
+    model: env(`${prefix}_MODEL`, rehearsalDefaults[family].model),
+    effort: env(`${prefix}_EFFORT`, rehearsalDefaults[family].effort),
   };
 }
 
 function laneSpecs(mode: ReviewSmokeMode): AgentLaneSpec[] {
-  const families = env("FLOW_REVIEW_FAMILIES", FAMILIES.join(","))
-    .split(",")
-    .map((family) => family.trim())
-    .filter((family): family is Family =>
-      (FAMILIES as readonly string[]).includes(family),
-    );
-  const grokOutputFormat = env("FLOW_GROK_OUTPUT_FORMAT", "plain") as
-    | "plain"
-    | "streaming-json";
+  // Only a rehearsal may narrow the family set (cheap debugging); a formal
+  // run always fields all three families x both axes.
+  const families =
+    mode === "formal"
+      ? [...FAMILIES]
+      : env("FLOW_REVIEW_FAMILIES", FAMILIES.join(","))
+          .split(",")
+          .map((family) => family.trim())
+          .filter((family): family is Family =>
+            (FAMILIES as readonly string[]).includes(family),
+          );
   return families.flatMap((family) => {
     const { model, effort } = modelFor(mode, family);
     return (["standards", "spec"] as const).map((axis) => ({
@@ -102,7 +106,6 @@ function laneSpecs(mode: ReviewSmokeMode): AgentLaneSpec[] {
       agentKind: family,
       model,
       effort,
-      ...(family === "grok" ? { grokOutputFormat } : {}),
     }));
   });
 }
@@ -417,6 +420,8 @@ function laneSummary(run: RunView) {
     const lane = run.lanes[laneId]!;
     return {
       laneId,
+      model: lane.model,
+      effort: lane.effort,
       runtimeState: lane.runtimeState,
       exitCode: lane.exitCode,
       semanticState: lane.semanticState,
@@ -601,11 +606,23 @@ async function formalRun(): Promise<void> {
     return;
   }
   const c = config();
+  // A formal run reviews a bound issue: its materials are the issue and spec
+  // texts themselves, captured explicitly — the rehearsal defaults are not
+  // acceptable review inputs here.
+  const materialsFile = process.env.FLOW_REVIEW_MATERIALS;
+  if (materialsFile === undefined || materialsFile.length === 0) {
+    throw new Error(
+      "a formal run requires FLOW_REVIEW_MATERIALS pointing at the captured issue/spec/standards materials",
+    );
+  }
   await mkdir(c.evidenceDir, { recursive: true });
   const fixedPoint = await captureFixedPoint(c.mode, c.repoRoot);
   const materials = await captureMaterials(c.repoRoot, fixedPoint.headCommit);
   const runtime = new WorkflowRuntime(makeDeps(c.runId, gate));
   const lanes = laneSpecs(c.mode);
+  if (lanes.length !== 6) {
+    throw new Error(`a formal run fields exactly six lanes, got ${lanes.length}`);
+  }
 
   line("== agent-flow cross-review FORMAL run ==");
   line(
@@ -660,13 +677,17 @@ async function formalRun(): Promise<void> {
     finishStatus: run.finishStatus,
     lanes: laneSummary(run),
     deliveries,
+    // A formal run is acceptable only when every lane produced a verified,
+    // contract-satisfying report — a lost or malformed report is the stop
+    // line's "unrecoverable report loss", never a quiet pass.
     ok:
       run.finishStatus !== "invalid" &&
       run.laneOrder.every((laneId) => {
         const lane = run.lanes[laneId]!;
         return (
           lane.runtimeState === "exited" &&
-          lane.verificationState === "verified"
+          lane.verificationState === "verified" &&
+          lane.contractState === "satisfied"
         );
       }),
   };

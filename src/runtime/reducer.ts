@@ -18,6 +18,7 @@ import type {
 } from "./events.ts";
 import type { ReviewAxis } from "../review/brief.ts";
 import type { ReviewAgentKind } from "../review/commands.ts";
+import { verificationPassed } from "../review/isolation.ts";
 import type { SessionIdentity } from "../review/session.ts";
 import { checkpointSemanticSignature } from "./checkpoint.ts";
 
@@ -249,15 +250,6 @@ function deliveryFor(state: RunView, deliveryId: string): DeliveryView {
   return delivery;
 }
 
-function isolationPassed(isolation: LaneIsolationView | null): boolean {
-  return (
-    isolation !== null &&
-    isolation.headOk &&
-    isolation.cleanOk &&
-    isolation.diffHashOk
-  );
-}
-
 /**
  * The one finish-status rule, shared by the reducer's run_finished guard and
  * the runtime's finish committer. Fail-closed on isolation: an agent lane that
@@ -270,10 +262,9 @@ export function expectedFinishStatus(state: RunView): RunFinishStatus {
   const isolationBroken = lanes.some(
     (lane) =>
       lane.kind === "agent" &&
-      (lane.runtimeState === "exited" ||
-        lane.runtimeState === "crashed" ||
-        lane.runtimeState === "lost") &&
-      !isolationPassed(lane.isolationPost),
+      TERMINAL_RUNTIME.has(lane.runtimeState) &&
+      lane.runtimeState !== "failed_to_start" &&
+      (lane.isolationPost === null || !verificationPassed(lane.isolationPost)),
   );
   if (isolationBroken) return "invalid";
   const breakdown = projectRunOutcomeBreakdown(state);
