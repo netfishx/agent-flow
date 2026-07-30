@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { RealHerdrAdapter } from "../herdr/real-adapter.ts";
 import { issueApiPath } from "../issue/gh-argv.ts";
+import { GitReviewIsolation } from "../review/isolation.ts";
 import { projectSynchronization } from "../issue/milestones.ts";
 import { RealIssueTracker } from "../issue/real-tracker.ts";
 import { sameIssueTarget } from "../issue/target.ts";
@@ -219,6 +221,10 @@ function createRealRuntime(
       `flow-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,
     readResultFile: (path) => Bun.file(path).text(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    // A resuming controller must be able to vouch for reviewer isolation;
+    // without the port, post-flight fails closed and marks the run invalid.
+    reviewIsolation: new GitReviewIsolation(),
+    sessionIdgen: () => randomUUID(),
     ...(authorizedTarget === null
       ? {}
       : {

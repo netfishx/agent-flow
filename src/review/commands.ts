@@ -29,8 +29,14 @@ export interface AgentLaneCommandInput {
   readonly grokOutputFormat?: "plain" | "streaming-json";
 }
 
-/** Read-only git prefixes allowed through the claude Bash tool. */
-const CLAUDE_READONLY_GIT = [
+// The permission allowlist for claude lanes. `--tools` only restricts which
+// tools are REGISTERED; `--permission-mode dontAsk` silently denies anything
+// not explicitly allowed, so the read tools themselves must be allowed too
+// (rehearsal-proven: without these, every read is denied).
+const CLAUDE_ALLOWED_TOOLS = [
+  "Read",
+  "Glob",
+  "Grep",
   "Bash(git diff:*)",
   "Bash(git log:*)",
   "Bash(git show:*)",
@@ -63,7 +69,7 @@ export function buildAgentCliArgv(input: AgentLaneCommandInput): string[] {
         "--tools",
         "Bash,Read,Glob,Grep",
         "--allowedTools",
-        ...CLAUDE_READONLY_GIT,
+        ...CLAUDE_ALLOWED_TOOLS,
         "--permission-mode",
         "dontAsk",
         "--strict-mcp-config",

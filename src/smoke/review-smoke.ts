@@ -494,21 +494,30 @@ async function rehearsalParent(): Promise<void> {
         .join(" ")}`,
     );
 
-    // Wait for the scheduled interrupt to land (sentinel 130 in that lane's
-    // durable log), then kill the controller while other lanes still run.
-    const interruptDeadline = Date.now() + c.interruptAfterMs + 120_000;
-    let interrupted = false;
+    // Wait for the scheduled interrupt to land: the target lane must reach
+    // its sentinel shortly after the SIGINT. CLIs are free to catch SIGINT
+    // and exit with their own code (codex exits 1), so any sentinel counts;
+    // the recorded exit code stays honest.
+    const interruptDeadline = Date.now() + c.interruptAfterMs + 60_000;
+    let interruptExit: number | null = null;
+    const sentinelPattern = new RegExp(
+      `${laneSentinelToken(c.runId, c.interruptLane)}=(\\d+)`,
+    );
     while (Date.now() < interruptDeadline) {
       const log = await readOrEmpty(
         join(c.evidenceDir, c.runId, "logs", `${c.interruptLane}.log`),
       );
-      if (log.includes(`${laneSentinelToken(c.runId, c.interruptLane)}=130`)) {
-        interrupted = true;
+      const match = log.match(sentinelPattern);
+      if (match) {
+        interruptExit = Number.parseInt(match[1]!, 10);
         break;
       }
       await sleep(500);
     }
-    line(`interrupt observed: lane=${c.interruptLane} sentinel130=${interrupted}`);
+    const interrupted = interruptExit !== null && interruptExit !== 0;
+    line(
+      `interrupt observed: lane=${c.interruptLane} exit=${interruptExit} accepted=${interrupted}`,
+    );
 
     let aliveAtKill = 0;
     for (const laneId of lanes) {
@@ -551,7 +560,8 @@ async function rehearsalParent(): Promise<void> {
       visibility,
       interrupt: {
         laneId: c.interruptLane,
-        sentinel130: interrupted,
+        exitCode: interruptExit,
+        accepted: interrupted,
         evidence: JSON.parse(
           await readOrEmpty(interruptEvidenceFile) || "null",
         ),
