@@ -111,6 +111,51 @@ export type { HerdrAdapter } from "./herdr/adapter.ts";
 export { RealHerdrAdapter } from "./herdr/real-adapter.ts";
 export type { RealHerdrAdapterOptions } from "./herdr/real-adapter.ts";
 
+export {
+  REPORT_CONTRACT_BLOCK,
+  validateReportContract,
+} from "./review/contract.ts";
+export type {
+  FindingSeverity,
+  ReportContractOutcome,
+  ReportFinding,
+  ReviewConfidence,
+  ReviewVerdict,
+} from "./review/contract.ts";
+export { assembleInputBundle } from "./review/bundle.ts";
+export type {
+  AssembledInputBundle,
+  BundleArtifact,
+  BundleFileRecord,
+  BundleFileRole,
+  BundleSourceFile,
+  InputBundleManifest,
+} from "./review/bundle.ts";
+export { assembleBrief } from "./review/brief.ts";
+export type { BriefInput, ReviewAxis } from "./review/brief.ts";
+export {
+  buildAgentCliArgv,
+  buildAgentLaneCommand,
+} from "./review/commands.ts";
+export type { AgentLaneCommandInput, ReviewAgentKind } from "./review/commands.ts";
+export { extractClaudeReport } from "./review/claude-stream.ts";
+export type { ClaudeReportExtraction } from "./review/claude-stream.ts";
+export {
+  parseCodexSessionId,
+  parseCodexTokensUsed,
+} from "./review/session.ts";
+export type { SessionIdentity } from "./review/session.ts";
+export {
+  diffHashOf,
+  GitReviewIsolation,
+  verificationPassed,
+} from "./review/isolation.ts";
+export type {
+  CaptureFixedPointInput,
+  ReviewIsolationPort,
+  WorktreeVerification,
+} from "./review/isolation.ts";
+
 // Test infrastructure (fake adapter, clock, quoting inverse) is intentionally
 // NOT re-exported here — it lives in `./testing.ts` so the production entry
 // stays limited to the runtime surface.
