@@ -71,6 +71,10 @@ export class FakeReviewIsolation implements ReviewIsolationPort {
     readonly repoRoot: string;
     readonly path: string;
   }): Promise<void> {
+    // Mirror real git: removing an already-removed worktree fails.
+    if (this.removed.some((entry) => entry.path === input.path)) {
+      throw new Error(`fake: worktree already removed: ${input.path}`);
+    }
     this.removed.push({ ...input });
   }
 }

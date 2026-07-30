@@ -140,6 +140,29 @@ function renderRun(run: RunView, stdout: TextSink): void {
     stdout.write(
       `  artifacts stdout=${lane.logFile} stderr=${lane.stderrFile} checkpoint=${value(lane.checkpointFile)} result=${value(lane.resultFile)} evidence=${value(lane.evidenceFile)}\n`,
     );
+    if (lane.kind === "agent") {
+      const session =
+        lane.sessionIdentity === null
+          ? "unrecorded"
+          : lane.sessionIdentity.kind === "measured"
+            ? `measured:${lane.sessionIdentity.id}`
+            : `unavailable(${JSON.stringify(lane.sessionIdentity.reason)})`;
+      const isolation = (view: typeof lane.isolationPre): string =>
+        view === null
+          ? "unrecorded"
+          : view.headOk && view.cleanOk && view.diffHashOk
+            ? "pass"
+            : `fail(${quotedValue(view.detail)})`;
+      stdout.write(
+        `  agent axis=${value(lane.axis)} agentKind=${value(lane.agentKind)} model=${value(lane.model)} effort=${value(lane.effort)}\n`,
+      );
+      stdout.write(
+        `  review raw=${value(lane.rawReportFile)} brief=${value(lane.promptFile)} bundleHash=${value(lane.bundleHash)}\n`,
+      );
+      stdout.write(
+        `  isolation pre=${isolation(lane.isolationPre)} post=${isolation(lane.isolationPost)} session=${session}\n`,
+      );
+    }
   }
 }
 

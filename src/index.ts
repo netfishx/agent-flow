@@ -91,10 +91,12 @@ export type {
   VerificationState,
 } from "./runtime/events.ts";
 export type {
+  AgentLaneSpec,
   InterruptOutcome,
   LanePhaseTiming,
   LaneResult,
   LaneSpec,
+  SimulatedLaneSpec,
   LaneState,
   LaneStatus,
   RunHandle,

@@ -9,6 +9,21 @@ import {
   type IssueSyncEvent,
 } from "../issue/reconcile.ts";
 import { buildLaneCommand } from "../smoke/lane.ts";
+import { assembleBrief } from "../review/brief.ts";
+import {
+  assembleInputBundle,
+  type AssembledInputBundle,
+} from "../review/bundle.ts";
+import { buildAgentLaneCommand } from "../review/commands.ts";
+import {
+  deriveAgentLaneFacts,
+  type AgentLaneDerivation,
+} from "../review/derive.ts";
+import {
+  verificationPassed,
+  type WorktreeVerification,
+} from "../review/isolation.ts";
+import type { SessionIdentity } from "../review/session.ts";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type {
@@ -31,16 +46,20 @@ import {
 } from "./checkpoint.ts";
 import { measured, REASONS, tokensUnavailable, unavailable } from "./metrics.ts";
 import {
+  expectedFinishStatus,
   projectRunState,
   projectRunOutcomeBreakdown,
   reduce,
+  type LaneIsolationView,
   type LaneView,
   type RunView,
 } from "./reducer.ts";
 import type {
+  AgentLaneSpec,
   InterruptOutcome,
   LanePhaseTiming,
   LaneResult,
+  LaneSpec,
   LaneState,
   LaneStatus,
   RunHandle,
@@ -70,6 +89,17 @@ interface LaneArtifactPaths {
   readonly checkpointFile: string;
   readonly resultFile: string;
   readonly evidenceFile: string;
+  readonly rawReportFile: string;
+  readonly promptFile: string;
+  readonly worktreePath: string;
+}
+
+function isAgentSpec(spec: LaneSpec): spec is AgentLaneSpec {
+  return spec.kind === "agent";
+}
+
+function isolationViewPassed(view: LaneIsolationView | null): boolean {
+  return view !== null && view.headOk && view.cleanOk && view.diffHashOk;
 }
 
 function assertIssueBinding(issue: IssueRef | null | undefined): void {
@@ -106,6 +136,9 @@ function laneArtifactPaths(
     checkpointFile: laneCheckpointFile(cwd, runId, laneId),
     resultFile: join(runDirectory, "results", `${laneId}-result.txt`),
     evidenceFile: join(runDirectory, "evidence", `${laneId}-evidence.json`),
+    rawReportFile: join(runDirectory, "reports", `${laneId}.raw`),
+    promptFile: join(runDirectory, "briefs", `${laneId}.md`),
+    worktreePath: join(runDirectory, "worktrees", laneId),
   };
 }
 
@@ -214,6 +247,37 @@ export class WorkflowRuntime {
       seen.add(lane.laneId);
     }
 
+    const agentSpecs = config.lanes.filter(isAgentSpec);
+    if (agentSpecs.length > 0) {
+      if (config.fixedPoint === undefined || config.fixedPoint === null) {
+        throw new Error("agent lanes require a captured fixed point");
+      }
+      if (
+        config.inputBundle === undefined ||
+        config.inputBundle === null ||
+        config.inputBundle.length === 0
+      ) {
+        throw new Error("agent lanes require a captured input bundle");
+      }
+      if (this.deps.reviewIsolation === undefined) {
+        throw new Error("agent lanes require a review isolation port");
+      }
+      if (
+        this.deps.sessionIdgen === undefined &&
+        agentSpecs.some(
+          (spec) => spec.agentKind === "claude" || spec.agentKind === "grok",
+        )
+      ) {
+        throw new Error(
+          "claude and grok lanes require a session id generator",
+        );
+      }
+    }
+    const bundle =
+      agentSpecs.length > 0
+        ? assembleInputBundle(config.inputBundle!)
+        : null;
+
     const startedAt = this.deps.clock();
     const { tab, controllerPane } = await this.deps.adapter.createTab({
       workspace: config.workspace,
@@ -222,6 +286,11 @@ export class WorkflowRuntime {
     });
 
     const direction = config.splitDirection ?? "down";
+    interface AgentLanePlan {
+      readonly spec: AgentLaneSpec;
+      readonly preassignedSessionId: string | null;
+      readonly brief: string;
+    }
     const topology: Array<{
       spec: StartWorkflowConfig["lanes"][number];
       pane: PaneRef;
@@ -229,6 +298,8 @@ export class WorkflowRuntime {
       sentinelToken: string;
       stepDelaySeconds: number;
       artifacts: LaneArtifactPaths;
+      agent: AgentLanePlan | null;
+      skipDispatch: boolean;
     }> = [];
     const dispatchPlan: Array<{
       item: (typeof topology)[number];
@@ -243,13 +314,32 @@ export class WorkflowRuntime {
       });
       previous = pane;
       const artifacts = laneArtifactPaths(config.cwd, runId, spec.laneId);
+      const agent: AgentLanePlan | null = isAgentSpec(spec)
+        ? {
+            spec,
+            preassignedSessionId:
+              spec.agentKind === "claude" || spec.agentKind === "grok"
+                ? this.deps.sessionIdgen!()
+                : null,
+            brief: assembleBrief({
+              axis: spec.axis,
+              agentKind: spec.agentKind,
+              fixedPoint: config.fixedPoint!,
+              bundle: bundle!,
+              artifactRoot: join(config.cwd, runId),
+            }),
+          }
+        : null;
       const item = {
         spec,
         pane,
         logFile: artifacts.logFile,
         sentinelToken: laneSentinelToken(runId, spec.laneId),
-        stepDelaySeconds: spec.stepDelaySeconds ?? 0.2,
+        stepDelaySeconds:
+          isAgentSpec(spec) ? 0 : spec.stepDelaySeconds ?? 0.2,
         artifacts,
+        agent,
+        skipDispatch: false,
       };
       topology.push(item);
     }
@@ -279,22 +369,50 @@ export class WorkflowRuntime {
       throw error;
     }
     try {
+      if (bundle !== null) {
+        await this.commitEvent(runId, {
+          type: "input_bundle_captured",
+          actor: "runtime",
+          data: {
+            files: bundle.manifest.files,
+            bundleHash: bundle.manifest.bundleHash,
+          },
+        });
+      }
       for (const item of topology) {
         const { spec } = item;
+        const common = {
+          laneId: spec.laneId,
+          paneId: item.pane.id,
+          logFile: item.logFile,
+          stderrFile: item.artifacts.stderrFile,
+          sentinelToken: item.sentinelToken,
+        };
         await this.commitEvent(runId, {
           type: "lane_registered",
           actor: "runtime",
           laneId: spec.laneId,
-          data: {
-            laneId: spec.laneId,
-            paneId: item.pane.id,
-            logFile: item.logFile,
-            stderrFile: item.artifacts.stderrFile,
-            sentinelToken: item.sentinelToken,
-            steps: spec.steps,
-            stepDelaySeconds: item.stepDelaySeconds,
-            ...(spec.role === undefined ? {} : { role: spec.role }),
-          },
+          data: isAgentSpec(spec)
+            ? {
+                ...common,
+                kind: "agent",
+                axis: spec.axis,
+                agentKind: spec.agentKind,
+                model: spec.model,
+                effort: spec.effort,
+                promptFile: item.artifacts.promptFile,
+                bundleHash: bundle!.manifest.bundleHash,
+                rawReportFile: item.artifacts.rawReportFile,
+                worktreePath: item.artifacts.worktreePath,
+                preassignedSessionId: item.agent!.preassignedSessionId,
+                role: `${spec.agentKind}:${spec.axis}`,
+              }
+            : {
+                ...common,
+                steps: spec.steps,
+                stepDelaySeconds: item.stepDelaySeconds,
+                ...(spec.role === undefined ? {} : { role: spec.role }),
+              },
         });
       }
       for (const item of topology) {
@@ -302,21 +420,73 @@ export class WorkflowRuntime {
         await writeFile(item.logFile, "", "utf8");
         await writeFile(item.artifacts.stderrFile, "", "utf8");
       }
+      if (bundle !== null) {
+        await this.persistBundle(config.cwd, runId, bundle);
+      }
+      for (const item of topology) {
+        if (item.agent === null) continue;
+        await mkdir(dirname(item.artifacts.promptFile), { recursive: true });
+        await writeFile(item.artifacts.promptFile, item.agent.brief, "utf8");
+      }
+      for (const item of topology) {
+        if (item.agent === null) continue;
+        const verification = await this.buildReviewWorktree(
+          config.fixedPoint!,
+          item.artifacts.worktreePath,
+        );
+        await this.commitEvent(runId, {
+          type: "lane_isolation_verified",
+          actor: "runner",
+          laneId: item.spec.laneId,
+          data: { phase: "pre", ...verification },
+        });
+        if (!verificationPassed(verification)) {
+          await this.commitEvent(runId, {
+            type: "lane_failed_to_start",
+            actor: "runtime",
+            laneId: item.spec.laneId,
+            data: {
+              rejection: `isolation pre-flight failed: ${verification.detail ?? "verification failed"}`,
+              command: null,
+            },
+          });
+          item.skipDispatch = true;
+        }
+      }
 
       await this.settle(config.startupSettleMs ?? 0);
       for (const item of topology) {
+        if (item.skipDispatch) continue;
         dispatchPlan.push({
           item,
-          command: (this.deps.laneCommandBuilder ?? buildLaneCommand)({
-            runId,
-            laneId: item.spec.laneId,
-            logFile: item.logFile,
-            stderrFile: item.artifacts.stderrFile,
-            checkpointFile: item.artifacts.checkpointFile,
-            resultFile: item.artifacts.resultFile,
-            steps: item.spec.steps,
-            stepDelaySeconds: item.stepDelaySeconds,
-          }),
+          command:
+            item.agent === null
+              ? (this.deps.laneCommandBuilder ?? buildLaneCommand)({
+                  runId,
+                  laneId: item.spec.laneId,
+                  logFile: item.logFile,
+                  stderrFile: item.artifacts.stderrFile,
+                  checkpointFile: item.artifacts.checkpointFile,
+                  resultFile: item.artifacts.resultFile,
+                  steps: isAgentSpec(item.spec) ? 0 : item.spec.steps,
+                  stepDelaySeconds: item.stepDelaySeconds,
+                })
+              : (this.deps.agentLaneCommandBuilder ?? buildAgentLaneCommand)({
+                  runId,
+                  laneId: item.spec.laneId,
+                  agentKind: item.agent.spec.agentKind,
+                  model: item.agent.spec.model,
+                  effort: item.agent.spec.effort,
+                  worktreePath: item.artifacts.worktreePath,
+                  promptFile: item.artifacts.promptFile,
+                  rawReportFile: item.artifacts.rawReportFile,
+                  logFile: item.logFile,
+                  stderrFile: item.artifacts.stderrFile,
+                  sessionId: item.agent.preassignedSessionId,
+                  ...(item.agent.spec.grokOutputFormat === undefined
+                    ? {}
+                    : { grokOutputFormat: item.agent.spec.grokOutputFormat }),
+                }),
         });
       }
     } catch (cause) {
@@ -359,11 +529,11 @@ export class WorkflowRuntime {
             laneId: item.spec.laneId,
             data: { rejection: rejectionMessage(cause), command },
           });
-          for (const aborted of topology.slice(index + 1)) {
+          for (const aborted of dispatchPlan.slice(index + 1)) {
             await this.commitEvent(runId, {
               type: "lane_failed_to_start",
               actor: "runtime",
-              laneId: aborted.spec.laneId,
+              laneId: aborted.item.spec.laneId,
               data: {
                 rejection: "dispatch aborted after earlier lane failed",
                 command: null,
@@ -394,8 +564,122 @@ export class WorkflowRuntime {
       started.push(item.spec.laneId);
     }
 
+    // Every lane may already be terminal when isolation pre-flight refused
+    // them all; close the run instead of leaving it undrivable.
+    const afterDispatch = this.getRun(runId);
+    if (
+      afterDispatch.laneOrder.every((laneId) =>
+        TERMINAL_RUNTIME.has(this.getLane(afterDispatch, laneId).runtimeState),
+      )
+    ) {
+      await this.finishIfTerminal(runId);
+      for (const laneId of afterDispatch.laneOrder) {
+        await this.recordTerminalFacts(runId, laneId, null);
+      }
+    }
+
     await this.reconcileBoundIssue(runId);
     return { runId, laneIds: topology.map((item) => item.spec.laneId) };
+  }
+
+  private async persistBundle(
+    cwd: string,
+    runId: string,
+    bundle: AssembledInputBundle,
+  ): Promise<void> {
+    const runDirectory = join(cwd, runId);
+    for (const artifact of bundle.artifacts) {
+      const target = join(runDirectory, artifact.path);
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(target, artifact.numberedText, "utf8");
+    }
+    const manifestFile = join(runDirectory, "bundle", "manifest.json");
+    await mkdir(dirname(manifestFile), { recursive: true });
+    await writeFile(
+      manifestFile,
+      `${JSON.stringify(bundle.manifest, null, 2)}\n`,
+      "utf8",
+    );
+  }
+
+  private async buildReviewWorktree(
+    fixedPoint: NonNullable<StartWorkflowConfig["fixedPoint"]>,
+    worktreePath: string,
+  ): Promise<WorktreeVerification> {
+    const isolation = this.deps.reviewIsolation!;
+    try {
+      await isolation.createWorktree({
+        repoRoot: fixedPoint.repoRoot,
+        headCommit: fixedPoint.headCommit,
+        path: worktreePath,
+      });
+      return await isolation.verifyWorktree({
+        path: worktreePath,
+        fixedPoint,
+      });
+    } catch (cause) {
+      // A port failure proves nothing about the worktree — fail closed.
+      return {
+        headOk: false,
+        cleanOk: false,
+        diffHashOk: false,
+        detail: rejectionMessage(cause),
+      };
+    }
+  }
+
+  /**
+   * Post-flight isolation verification, committed BEFORE a lane's terminal
+   * event so run_finished can fold isolation into the finish status. The
+   * reducer fails closed: a ran-to-terminal agent lane without a passing
+   * post-flight makes the run invalid.
+   */
+  private async recordPostFlightIsolation(
+    runId: string,
+    laneId: string,
+  ): Promise<void> {
+    const run = this.getRun(runId);
+    const lane = this.getLane(run, laneId);
+    if (lane.kind !== "agent" || lane.isolationPost !== null) return;
+    let verification: WorktreeVerification;
+    const isolation = this.deps.reviewIsolation;
+    if (
+      isolation === undefined ||
+      run.fixedPoint === null ||
+      lane.worktreePath === null
+    ) {
+      verification = {
+        headOk: false,
+        cleanOk: false,
+        diffHashOk: false,
+        detail: "review isolation port unavailable for post-flight",
+      };
+    } else {
+      try {
+        verification = await isolation.verifyWorktree({
+          path: lane.worktreePath,
+          fixedPoint: run.fixedPoint,
+        });
+      } catch (cause) {
+        verification = {
+          headOk: false,
+          cleanOk: false,
+          diffHashOk: false,
+          detail: rejectionMessage(cause),
+        };
+      }
+    }
+    await this.commitEventConditionally(runId, (current) => {
+      if (!current) throw new Error(`unknown runId "${runId}"`);
+      const currentLane = this.getLane(current, laneId);
+      if (currentLane.isolationPost !== null) return null;
+      return {
+        type: "lane_isolation_verified",
+        actor: "runner",
+        laneId,
+        data: { phase: "post", ...verification },
+      };
+    });
   }
 
   async inspectWorkflow(runId: string): Promise<WorkflowStatus> {
@@ -604,6 +888,7 @@ export class WorkflowRuntime {
 
         const output = await this.readDurable(lane.logFile);
         const exitCode = parseExitFromSentinel(runId, laneId, output);
+        await this.recordPostFlightIsolation(runId, laneId);
         if (exitCode !== null) {
           await this.commitEvent(runId, {
             type: "lane_exited",
@@ -1163,6 +1448,9 @@ export class WorkflowRuntime {
   ): Promise<void> {
     const lane = this.getLane(this.getRun(runId), laneId);
     if (TERMINAL_RUNTIME.has(lane.runtimeState)) return;
+    // Post-flight isolation must precede the terminal event (see the note on
+    // recordPostFlightIsolation); the lane's process is already gone here.
+    await this.recordPostFlightIsolation(runId, laneId);
     const output = await this.readDurable(lane.logFile);
     const exitCode = parseExitFromSentinel(runId, laneId, output);
     if (exitCode === null) {
@@ -1247,6 +1535,24 @@ export class WorkflowRuntime {
       laneId,
     );
 
+    // Agent lanes derive checkpoint, report, contract, and session facts from
+    // the lane's own captured bytes — copies, never rewrites of the raw
+    // artifacts. A lane that never started has nothing to derive from.
+    const derivation =
+      lane.kind === "agent" && lane.runtimeState !== "failed_to_start"
+        ? await this.deriveAgentLane(lane, parsedExitCode ?? lane.exitCode)
+        : null;
+    if (derivation !== null) {
+      if (derivation.reportText !== null) {
+        await mkdir(dirname(resultFile), { recursive: true });
+        await writeFile(resultFile, derivation.reportText, "utf8");
+      }
+      if (derivation.checkpointText !== null) {
+        await mkdir(dirname(checkpointFile), { recursive: true });
+        await writeFile(checkpointFile, derivation.checkpointText, "utf8");
+      }
+    }
+
     let checkpoint: string | null = null;
     try {
       checkpoint = await readFile(checkpointFile, "utf8");
@@ -1279,16 +1585,38 @@ export class WorkflowRuntime {
       contractErrors.push("lane never started");
     }
     if (parsedExitCode === null) contractErrors.push("completion sentinel missing");
-    let result = "";
-    try {
-      result = await readFile(resultFile, "utf8");
-    } catch (error) {
-      contractErrors.push(`result file unavailable: ${rejectionMessage(error)}`);
+    if (lane.kind === "agent") {
+      if (derivation !== null) contractErrors.push(...derivation.contractErrors);
+    } else {
+      let result = "";
+      try {
+        result = await readFile(resultFile, "utf8");
+      } catch (error) {
+        contractErrors.push(`result file unavailable: ${rejectionMessage(error)}`);
+      }
+      if (result.length > 0 && !/^RESULT: (?:ok|interrupted) steps=\d+\s*$/.test(result)) {
+        contractErrors.push("result file is malformed");
+      } else if (result.length === 0 && !contractErrors.some((error) => error.startsWith("result file unavailable"))) {
+        contractErrors.push("result file is empty");
+      }
     }
-    if (result.length > 0 && !/^RESULT: (?:ok|interrupted) steps=\d+\s*$/.test(result)) {
-      contractErrors.push("result file is malformed");
-    } else if (result.length === 0 && !contractErrors.some((error) => error.startsWith("result file unavailable"))) {
-      contractErrors.push("result file is empty");
+
+    if (lane.kind === "agent") {
+      const session: SessionIdentity =
+        lane.runtimeState === "failed_to_start"
+          ? { kind: "unavailable", reason: "lane never started" }
+          : derivation!.session;
+      await this.commitEventConditionally(runId, (current) => {
+        if (!current) throw new Error(`unknown runId "${runId}"`);
+        const currentLane = this.getLane(current, laneId);
+        if (currentLane.sessionIdentity !== null) return null;
+        return {
+          type: "lane_session_recorded",
+          actor: "runner",
+          laneId,
+          data: { session },
+        };
+      });
     }
     await this.commitEventConditionally(runId, (current) => {
       if (!current) throw new Error(`unknown runId "${runId}"`);
@@ -1329,6 +1657,8 @@ export class WorkflowRuntime {
       signal: terminalLane.signal,
       environmentFailure,
       executionTimeout: null,
+      rawReportArtifact: lane.kind === "agent" ? lane.rawReportFile : null,
+      tokens: derivation?.tokens ?? null,
       ...termination,
     };
     await mkdir(dirname(evidenceFile), { recursive: true });
@@ -1358,10 +1688,59 @@ export class WorkflowRuntime {
         },
       };
     });
+    // A review worktree is disposable only once its post-flight verification
+    // passed and every derived artifact has landed; any failure retains it
+    // for forensics.
+    const finalLane = this.getLane(this.getRun(runId), laneId);
+    if (
+      finalLane.kind === "agent" &&
+      finalLane.runtimeState !== "failed_to_start" &&
+      isolationViewPassed(finalLane.isolationPost) &&
+      this.deps.reviewIsolation !== undefined &&
+      finalLane.worktreePath !== null &&
+      this.getRun(runId).fixedPoint !== null
+    ) {
+      try {
+        await this.deps.reviewIsolation.removeWorktree({
+          repoRoot: this.getRun(runId).fixedPoint!.repoRoot,
+          path: finalLane.worktreePath,
+        });
+      } catch {
+        // Retention is the safe failure direction; the worktree stays.
+      }
+    }
+
     await this.synchronizeIssueAndReleaseControllerLeaseAfterTerminalFacts(
       runId,
       synchronizeIssue,
     );
+  }
+
+  private async deriveAgentLane(
+    lane: LaneView,
+    exitCode: number | null,
+  ): Promise<AgentLaneDerivation> {
+    const rawPath = lane.rawReportFile!;
+    let raw: string | null = null;
+    try {
+      raw = await readFile(rawPath, "utf8");
+    } catch {
+      raw = null;
+    }
+    let stderrText: string | null = null;
+    try {
+      stderrText = await readFile(lane.stderrFile, "utf8");
+    } catch {
+      stderrText = null;
+    }
+    return deriveAgentLaneFacts({
+      agentKind: lane.agentKind!,
+      raw,
+      rawPath,
+      stderr: stderrText,
+      preassignedSessionId: lane.preassignedSessionId,
+      exitCode,
+    });
   }
 
   protected async writeRunnerEvidenceFile(
@@ -1380,11 +1759,10 @@ export class WorkflowRuntime {
         return null;
       }
       const breakdown = projectRunOutcomeBreakdown(run);
-      const clean = breakdown.exitedZero === lanes.length;
       return {
         type: "run_finished",
         actor: "runtime",
-        data: { status: clean ? "clean" : "degraded", breakdown },
+        data: { status: expectedFinishStatus(run), breakdown },
       };
     });
   }
@@ -1436,7 +1814,11 @@ export class WorkflowRuntime {
         lane.liveAt !== null && lane.dispatchedAt !== null
           ? measured(lane.liveAt - lane.dispatchedAt)
           : unavailable(REASONS.laneNotStarted),
-      modelInference: unavailable(REASONS.simulatedNoModel),
+      modelInference: unavailable(
+        lane.kind === "agent"
+          ? REASONS.headlessNoInferenceSplit
+          : REASONS.simulatedNoModel,
+      ),
       executionWait:
         lane.completedAt !== null && lane.liveAt !== null
           ? measured(lane.completedAt - lane.liveAt)
@@ -1458,12 +1840,17 @@ export class WorkflowRuntime {
       .filter((at): at is number => at !== null);
     const lastDispatchedAt =
       dispatched.length === 0 ? null : Math.max(...dispatched);
+    const hasAgentLane = run.laneOrder.some(
+      (laneId) => this.getLane(run, laneId).kind === "agent",
+    );
     return {
       startupLatency:
         lastDispatchedAt === null
           ? unavailable(REASONS.runNotDispatched)
           : measured(lastDispatchedAt - run.startedAt),
-      tokenUsage: tokensUnavailable(REASONS.simulatedNoTokens),
+      tokenUsage: tokensUnavailable(
+        hasAgentLane ? REASONS.agentTokensInEvidence : REASONS.simulatedNoTokens,
+      ),
       perLane,
     };
   }

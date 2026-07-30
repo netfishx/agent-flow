@@ -1,5 +1,11 @@
+import type { BundleFileRecord } from "../review/bundle.ts";
+import type { ReviewAxis } from "../review/brief.ts";
+import type { ReviewAgentKind } from "../review/commands.ts";
+import type { SessionIdentity } from "../review/session.ts";
+
 export type RunEventType =
   | "run_started"
+  | "input_bundle_captured"
   | "lane_registered"
   | "lane_dispatch_intent"
   | "lane_dispatched"
@@ -9,6 +15,8 @@ export type RunEventType =
   | "lane_crashed"
   | "lane_lost"
   | "lane_failed_to_start"
+  | "lane_isolation_verified"
+  | "lane_session_recorded"
   | "lane_contract_evaluated"
   | "lane_verification_recorded"
   | "checkpoint_announced"
@@ -48,7 +56,13 @@ export type SemanticState =
 export type ContractState = "unknown" | "satisfied" | "violated";
 export type VerificationState = "unverified" | "verified" | "failed";
 export type ControlMode = "managed" | "human_owned";
-export type RunFinishStatus = "clean" | "degraded";
+/**
+ * `invalid` marks a run whose reviewer isolation cannot be trusted: an agent
+ * lane reached a terminal state through execution with a failed — or missing —
+ * post-flight verification. An invalid run is never carried forward; a rerun
+ * runs under a new runId.
+ */
+export type RunFinishStatus = "clean" | "degraded" | "invalid";
 
 export interface IssueRef {
   readonly owner: string;
@@ -92,6 +106,15 @@ export interface RunnerEvidence {
   readonly environmentFailure: string | null;
   /** No simulated-run execution deadline exists in #14. */
   readonly executionTimeout: string | null;
+  /** The immutable raw report artifact; null for simulated lanes. */
+  readonly rawReportArtifact?: string | null;
+  /** Best-effort token counts parsed only from the lane's own output. */
+  readonly tokens?: {
+    readonly source: string;
+    readonly inputTokens: number | null;
+    readonly outputTokens: number | null;
+    readonly totalTokens: number | null;
+  } | null;
   readonly termination:
     | "sentinel-exit"
     | "crashed"
@@ -112,15 +135,56 @@ export interface RunStartedData {
   readonly issue: IssueRef | null;
 }
 
-export interface LaneRegisteredData {
+interface LaneRegisteredCommon {
   readonly laneId: string;
   readonly paneId: string;
   readonly logFile: string;
   readonly stderrFile: string;
   readonly sentinelToken: string;
+  readonly role?: string;
+}
+
+/** The pre-#7 shape; `kind` is absent on replayed historical events. */
+export interface SimulatedLaneRegisteredData extends LaneRegisteredCommon {
+  readonly kind?: "simulated";
   readonly steps: number;
   readonly stepDelaySeconds: number;
-  readonly role?: string;
+}
+
+export interface AgentLaneRegisteredData extends LaneRegisteredCommon {
+  readonly kind: "agent";
+  readonly axis: ReviewAxis;
+  readonly agentKind: ReviewAgentKind;
+  readonly model: string;
+  readonly effort: string;
+  /** Runtime-assembled brief; the caller never supplies it. */
+  readonly promptFile: string;
+  readonly bundleHash: string;
+  readonly rawReportFile: string;
+  readonly worktreePath: string;
+  /** Pre-assigned session UUID for CLI families that accept one. */
+  readonly preassignedSessionId: string | null;
+}
+
+export type LaneRegisteredData =
+  | SimulatedLaneRegisteredData
+  | AgentLaneRegisteredData;
+
+export interface InputBundleCapturedData {
+  readonly files: readonly BundleFileRecord[];
+  readonly bundleHash: string;
+}
+
+export interface LaneIsolationVerifiedData {
+  readonly phase: "pre" | "post";
+  readonly headOk: boolean;
+  readonly cleanOk: boolean;
+  readonly diffHashOk: boolean;
+  readonly detail: string | null;
+}
+
+export interface LaneSessionRecordedData {
+  readonly session: SessionIdentity;
 }
 
 export interface LaneDispatchedData {
@@ -216,6 +280,7 @@ export interface OwnerDecisionRecordedData {
 
 export interface RunEventDataByType {
   readonly run_started: RunStartedData;
+  readonly input_bundle_captured: InputBundleCapturedData;
   readonly lane_registered: LaneRegisteredData;
   readonly lane_dispatch_intent: EmptyEventData;
   readonly lane_dispatched: LaneDispatchedData;
@@ -225,6 +290,8 @@ export interface RunEventDataByType {
   readonly lane_crashed: EmptyEventData;
   readonly lane_lost: LaneLostData;
   readonly lane_failed_to_start: LaneFailedToStartData;
+  readonly lane_isolation_verified: LaneIsolationVerifiedData;
+  readonly lane_session_recorded: LaneSessionRecordedData;
   readonly lane_contract_evaluated: LaneContractEvaluatedData;
   readonly lane_verification_recorded: LaneVerificationRecordedData;
   readonly checkpoint_announced: EmptyEventData;
@@ -265,6 +332,7 @@ type EventFor<
 
 export type RunEvent =
   | EventFor<"run_started", "runtime">
+  | EventFor<"input_bundle_captured", "runtime">
   | EventFor<"lane_registered", "runtime", string>
   | EventFor<"lane_dispatch_intent", "runtime", string>
   | EventFor<"lane_dispatched", "runtime", string>
@@ -274,6 +342,8 @@ export type RunEvent =
   | EventFor<"lane_crashed", "runtime", string>
   | EventFor<"lane_lost", "runtime", string>
   | EventFor<"lane_failed_to_start", "runtime", string>
+  | EventFor<"lane_isolation_verified", "runner", string>
+  | EventFor<"lane_session_recorded", "runner", string>
   | EventFor<"lane_contract_evaluated", "validator", string>
   | EventFor<"lane_verification_recorded", "runner", string>
   | EventFor<"checkpoint_announced", "runtime">

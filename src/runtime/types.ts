@@ -7,6 +7,13 @@ import type { IssueTracker } from "../issue/tracker.ts";
 import type { Ledger } from "./ledger.ts";
 import type { FixedPoint, IssueRef } from "./events.ts";
 import type { RunState as ProjectedRunState } from "./reducer.ts";
+import type { BundleSourceFile } from "../review/bundle.ts";
+import type { ReviewAxis } from "../review/brief.ts";
+import type {
+  AgentLaneCommandInput,
+  ReviewAgentKind,
+} from "../review/commands.ts";
+import type { ReviewIsolationPort } from "../review/isolation.ts";
 
 export type LaneState =
   | "starting"
@@ -85,12 +92,32 @@ export interface InterruptOutcome {
   readonly delivered: boolean;
 }
 
-export interface LaneSpec {
+/** The pre-#7 simulated shape; `kind` may be omitted by existing callers. */
+export interface SimulatedLaneSpec {
+  readonly kind?: "simulated";
   readonly laneId: string;
   readonly role?: string;
   readonly steps: number;
   readonly stepDelaySeconds?: number;
 }
+
+/**
+ * A real reviewer lane. External input declares only axis, agent family,
+ * model, and effort — the runtime owns the brief, the session pre-assignment,
+ * and the review worktree.
+ */
+export interface AgentLaneSpec {
+  readonly kind: "agent";
+  readonly laneId: string;
+  readonly axis: ReviewAxis;
+  readonly agentKind: ReviewAgentKind;
+  readonly model: string;
+  readonly effort: string;
+  /** Grok output surface; "plain" unless the visibility gate required a stream. */
+  readonly grokOutputFormat?: "plain" | "streaming-json";
+}
+
+export type LaneSpec = SimulatedLaneSpec | AgentLaneSpec;
 
 export interface StartWorkflowConfig {
   readonly workflow: string;
@@ -105,6 +132,12 @@ export interface StartWorkflowConfig {
   readonly fixedPoint?: FixedPoint | null;
   /** Optional immutable GitHub issue binding, validated locally before startup. */
   readonly issue?: IssueRef | null;
+  /**
+   * Raw review materials, captured once by the caller. Required when any lane
+   * is an agent lane; the runtime hashes, persists, and records them as the
+   * immutable input bundle.
+   */
+  readonly inputBundle?: readonly BundleSourceFile[] | null;
 }
 
 export interface LaneCommandInput {
@@ -138,6 +171,12 @@ export interface RuntimeDeps {
   readonly readResultFile: (path: string) => Promise<string>;
   /** Builds the exact command persisted at the physical dispatch boundary. */
   readonly laneCommandBuilder?: (input: LaneCommandInput) => string;
+  /** Builds the exact agent-lane command; defaults to the real CLI batteries. */
+  readonly agentLaneCommandBuilder?: (input: AgentLaneCommandInput) => string;
+  /** Review worktree lifecycle and verification; required for agent lanes. */
+  readonly reviewIsolation?: ReviewIsolationPort;
+  /** Pre-assigned session UUIDs for claude/grok lanes; injectable for tests. */
+  readonly sessionIdgen?: () => string;
   /** Structured environment/setup failure reported by the runner, if any. */
   readonly runnerEnvironmentFailure?: (
     runId: string,

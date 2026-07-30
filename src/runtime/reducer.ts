@@ -3,6 +3,7 @@ import type {
   ControlMode,
   DeliveryState,
   FixedPoint,
+  InputBundleCapturedData,
   IssueRef,
   LabelTransition,
   MilestoneKind,
@@ -15,6 +16,9 @@ import type {
   SemanticState,
   VerificationState,
 } from "./events.ts";
+import type { ReviewAxis } from "../review/brief.ts";
+import type { ReviewAgentKind } from "../review/commands.ts";
+import type { SessionIdentity } from "../review/session.ts";
 import { checkpointSemanticSignature } from "./checkpoint.ts";
 
 export interface DeliveryView {
@@ -53,15 +57,37 @@ export interface BlockedAnchor {
   readonly gaps: readonly string[];
 }
 
+export interface LaneIsolationView {
+  readonly headOk: boolean;
+  readonly cleanOk: boolean;
+  readonly diffHashOk: boolean;
+  readonly detail: string | null;
+  readonly at: number;
+}
+
 export interface LaneView {
   readonly laneId: string;
   readonly paneId: string;
   readonly logFile: string;
   readonly stderrFile: string;
   readonly sentinelToken: string;
+  readonly kind: "simulated" | "agent";
   readonly steps: number;
   readonly stepDelaySeconds: number;
   readonly role?: string;
+  /** Agent-lane registration facts; null on simulated lanes. */
+  readonly axis: ReviewAxis | null;
+  readonly agentKind: ReviewAgentKind | null;
+  readonly model: string | null;
+  readonly effort: string | null;
+  readonly promptFile: string | null;
+  readonly bundleHash: string | null;
+  readonly rawReportFile: string | null;
+  readonly worktreePath: string | null;
+  readonly preassignedSessionId: string | null;
+  readonly isolationPre: LaneIsolationView | null;
+  readonly isolationPost: LaneIsolationView | null;
+  readonly sessionIdentity: SessionIdentity | null;
   readonly runtimeState: RuntimeState;
   readonly semanticState: SemanticState;
   readonly contractState: ContractState;
@@ -103,6 +129,8 @@ export interface RunView {
   readonly fixedPoint: FixedPoint | null;
   readonly issue: IssueRef | null;
   readonly issueNodeId: string | null;
+  /** The captured immutable input bundle manifest; null when no agent lanes. */
+  readonly inputBundle: InputBundleCapturedData | null;
   readonly startedAt: number;
   readonly updatedAt: number;
   readonly checkpointAnnouncedAt: number | null;
@@ -221,6 +249,37 @@ function deliveryFor(state: RunView, deliveryId: string): DeliveryView {
   return delivery;
 }
 
+function isolationPassed(isolation: LaneIsolationView | null): boolean {
+  return (
+    isolation !== null &&
+    isolation.headOk &&
+    isolation.cleanOk &&
+    isolation.diffHashOk
+  );
+}
+
+/**
+ * The one finish-status rule, shared by the reducer's run_finished guard and
+ * the runtime's finish committer. Fail-closed on isolation: an agent lane that
+ * reached a terminal state through execution must carry a PASSING post-flight
+ * verification, or the whole run is `invalid`. (`failed_to_start` lanes never
+ * ran, so they degrade the run without invalidating it.)
+ */
+export function expectedFinishStatus(state: RunView): RunFinishStatus {
+  const lanes = state.laneOrder.map((laneId) => state.lanes[laneId]!);
+  const isolationBroken = lanes.some(
+    (lane) =>
+      lane.kind === "agent" &&
+      (lane.runtimeState === "exited" ||
+        lane.runtimeState === "crashed" ||
+        lane.runtimeState === "lost") &&
+      !isolationPassed(lane.isolationPost),
+  );
+  if (isolationBroken) return "invalid";
+  const breakdown = projectRunOutcomeBreakdown(state);
+  return breakdown.exitedZero === lanes.length ? "clean" : "degraded";
+}
+
 export function projectRunOutcomeBreakdown(
   state: RunView,
 ): RunOutcomeBreakdown {
@@ -295,6 +354,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       fixedPoint: event.data.fixedPoint,
       issue: issue === null ? null : { ...issue },
       issueNodeId: null,
+      inputBundle: null,
       startedAt: event.at,
       updatedAt: event.at,
       checkpointAnnouncedAt: null,
@@ -319,6 +379,17 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
   }
 
   switch (event.type) {
+    case "input_bundle_captured": {
+      if (state.inputBundle !== null) {
+        throw new Error("duplicate input_bundle_captured");
+      }
+      return withRun(state, event, {
+        inputBundle: {
+          files: [...event.data.files],
+          bundleHash: event.data.bundleHash,
+        },
+      });
+    }
     case "lane_registered": {
       if (event.data.laneId !== event.laneId) {
         throw new Error("lane_registered laneId does not match its envelope");
@@ -326,8 +397,48 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       if (state.lanes[event.laneId]) {
         throw new Error(`lane "${event.laneId}" is already registered`);
       }
+      const registration =
+        event.data.kind === "agent"
+          ? {
+              kind: "agent" as const,
+              steps: 0,
+              stepDelaySeconds: 0,
+              axis: event.data.axis,
+              agentKind: event.data.agentKind,
+              model: event.data.model,
+              effort: event.data.effort,
+              promptFile: event.data.promptFile,
+              bundleHash: event.data.bundleHash,
+              rawReportFile: event.data.rawReportFile,
+              worktreePath: event.data.worktreePath,
+              preassignedSessionId: event.data.preassignedSessionId,
+            }
+          : {
+              // Replayed pre-#7 events carry no `kind`; they are simulated.
+              kind: "simulated" as const,
+              steps: event.data.steps,
+              stepDelaySeconds: event.data.stepDelaySeconds,
+              axis: null,
+              agentKind: null,
+              model: null,
+              effort: null,
+              promptFile: null,
+              bundleHash: null,
+              rawReportFile: null,
+              worktreePath: null,
+              preassignedSessionId: null,
+            };
       const lane: LaneView = {
-        ...event.data,
+        laneId: event.data.laneId,
+        paneId: event.data.paneId,
+        logFile: event.data.logFile,
+        stderrFile: event.data.stderrFile,
+        sentinelToken: event.data.sentinelToken,
+        ...(event.data.role === undefined ? {} : { role: event.data.role }),
+        ...registration,
+        isolationPre: null,
+        isolationPost: null,
+        sessionIdentity: null,
         runtimeState: "pending",
         semanticState: "unknown",
         contractState: "unknown",
@@ -472,6 +583,43 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
           startRejection: event.data.rejection,
           dispatchedCommand: event.data.command,
         };
+      });
+    case "lane_isolation_verified": {
+      const data = event.data;
+      return withLane(state, event, (lane) => {
+        if (lane.kind !== "agent") {
+          throw new Error(
+            "lane_isolation_verified applies to agent lanes only",
+          );
+        }
+        const view: LaneIsolationView = {
+          headOk: data.headOk,
+          cleanOk: data.cleanOk,
+          diffHashOk: data.diffHashOk,
+          detail: data.detail,
+          at: event.at,
+        };
+        if (data.phase === "pre") {
+          if (lane.isolationPre !== null) {
+            throw new Error("duplicate pre-flight lane_isolation_verified");
+          }
+          return { ...lane, isolationPre: view };
+        }
+        if (lane.isolationPost !== null) {
+          throw new Error("duplicate post-flight lane_isolation_verified");
+        }
+        return { ...lane, isolationPost: view };
+      });
+    }
+    case "lane_session_recorded":
+      return withLane(state, event, (lane) => {
+        if (lane.kind !== "agent") {
+          throw new Error("lane_session_recorded applies to agent lanes only");
+        }
+        if (lane.sessionIdentity !== null) {
+          throw new Error("duplicate lane_session_recorded");
+        }
+        return { ...lane, sessionIdentity: event.data.session };
       });
     case "lane_contract_evaluated":
       return withLane(state, event, (lane) => ({
@@ -670,8 +818,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       if (!sameBreakdown(event.data.breakdown, breakdown)) {
         throw new Error("run_finished breakdown does not match current lane states");
       }
-      const expectedStatus =
-        breakdown.exitedZero === lanes.length ? "clean" : "degraded";
+      const expectedStatus = expectedFinishStatus(state);
       if (event.data.status !== expectedStatus) {
         throw new Error(
           `run_finished status must be "${expectedStatus}" for current lane states`,
