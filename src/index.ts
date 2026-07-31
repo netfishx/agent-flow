@@ -132,12 +132,6 @@ export type {
 } from "./review/bundle.ts";
 export { assembleBrief } from "./review/brief.ts";
 export type { BriefInput } from "./review/brief.ts";
-export { extractClaudeReport } from "./review/claude-stream.ts";
-export type { ClaudeReportExtraction } from "./review/claude-stream.ts";
-export {
-  parseCodexSessionId,
-  parseCodexTokensUsed,
-} from "./review/session.ts";
 export { GitReviewIsolation } from "./review/isolation.ts";
 export type { ReviewIsolationPort } from "./review/isolation.ts";
 export { verificationPassed } from "./review/verification.ts";
@@ -152,9 +146,14 @@ export type {
   WorktreeVerification,
 } from "./review/types.ts";
 
-// The agent-lane command builders are deliberately NOT exported: like
-// `buildLaneCommand`, they emit sentinels and shell quoting, which this entry
-// promises never to surface. Their tests import them by package-internal path.
+// Deliberately NOT exported, each for the reason this entry already states:
+//   - the agent-lane command builders emit sentinels and shell quoting;
+//   - `extractClaudeReport`, `parseCodexSessionId`, and `parseCodexTokensUsed`
+//     parse one CLI family's own output, and the design keeps Agent-specific
+//     mechanics and session identifiers inside the implementation
+//     (docs/design/observable-multi-agent-runtime.md section 6).
+// `assembleBrief` stays: it is the runtime's own deterministic input builder,
+// not a parser of any Agent's output. Their tests use internal paths.
 
 // Test infrastructure (fake adapter, clock, quoting inverse) is intentionally
 // NOT re-exported here — it lives in `./testing.ts` so the production entry

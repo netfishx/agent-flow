@@ -16,11 +16,18 @@ describe("package entry surface", () => {
     "buildAgentCliArgv",
     "buildLaneCommand",
     "diffHashOf",
+    // Agent-specific output parsers: one CLI family's stream shape and its
+    // session-id banner are implementation mechanics, not package surface.
+    "extractClaudeReport",
+    "parseCodexSessionId",
+    "parseCodexTokensUsed",
   ])("does not publish %s", (name) => {
     expect(Object.keys(entry)).not.toContain(name);
   });
 
   test("still publishes the review vocabulary and the isolation port", () => {
+    // The runtime's own deterministic input builder is not an Agent parser.
+    expect(Object.keys(entry)).toContain("assembleBrief");
     expect(Object.keys(entry)).toContain("verificationPassed");
     expect(Object.keys(entry)).toContain("GitReviewIsolation");
     expect(Object.keys(entry)).toContain("validateReportContract");

@@ -31,6 +31,7 @@ import type {
 } from "../runtime/types.ts";
 import type { ReviewAgentKind } from "../review/types.ts";
 import {
+  implementationWorktreeRefusal,
   resolveEvidenceRoot,
   runEvidencePath,
   volatileEvidenceRootRefusal,
@@ -261,6 +262,19 @@ async function captureMaterials(
       role: "standards",
       content: await readFile(join(repoRoot, "CONTEXT.md"), "utf8"),
     },
+    // AGENTS.md names these three as the repository's tracker and domain
+    // conventions, so a standards-axis reviewer cannot check its charter
+    // without them.
+    ...(await Promise.all(
+      ["domain", "issue-tracker", "triage-labels"].map(async (name) => ({
+        path: `bundle/standards/${name}.md`,
+        role: "standards" as const,
+        content: await readFile(
+          join(repoRoot, "docs", "agents", `${name}.md`),
+          "utf8",
+        ),
+      })),
+    )),
   ];
 }
 
@@ -695,6 +709,13 @@ async function formalRun(): Promise<void> {
   const volatileRefusal = volatileEvidenceRootRefusal(c.evidenceDir);
   if (volatileRefusal !== null) {
     throw new Error(`formal run refused: ${volatileRefusal}`);
+  }
+  const insideRepoRefusal = implementationWorktreeRefusal(
+    c.evidenceDir,
+    c.repoRoot,
+  );
+  if (insideRepoRefusal !== null) {
+    throw new Error(`formal run refused: ${insideRepoRefusal}`);
   }
   const originUrl = await git(c.repoRoot, "remote", "get-url", "origin");
   if (!issueTargetMatchesOrigin(gate.target!, originUrl)) {

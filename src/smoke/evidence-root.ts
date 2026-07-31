@@ -62,6 +62,25 @@ export function runEvidencePath(
 }
 
 /**
+ * Why this evidence root may not sit inside the repository under review, or
+ * null when it may. D2 forbids a review worktree from living inside any
+ * implementation worktree, and the evidence root is that worktree's parent, so
+ * this is where the rule can actually be enforced. Pure over both inputs.
+ */
+export function implementationWorktreeRefusal(
+  evidenceRoot: string,
+  repoRoot: string,
+): string | null {
+  if (!isAbsolute(evidenceRoot)) {
+    return `evidence root "${evidenceRoot}" is not an absolute path`;
+  }
+  if (!isAbsolute(repoRoot)) return null;
+  return isUnder(evidenceRoot, repoRoot)
+    ? `evidence root "${evidenceRoot}" is inside the repository under review "${withoutTrailingSeparator(repoRoot)}"; a review worktree may never live inside an implementation worktree`
+    : null;
+}
+
+/**
  * Why this evidence root may not hold a formal run's acceptance evidence, or
  * null when it may. Pure over the two inputs so the rule is unit-testable:
  * `tmpRoot` is injected rather than read from the process, and no filesystem

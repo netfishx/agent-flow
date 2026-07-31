@@ -58,7 +58,12 @@ The runtime unifies orchestration and state. It does not centralize execution in
 
 ### Executing Agent records semantic progress
 
-Each lane writes a checkpoint/result before yielding:
+Each executing Agent lane writes a checkpoint/result before yielding. A
+read-only reviewer lane writes neither: the runtime derives its terminal record
+from the lane's own captured raw report and records it under the `runtime`
+actor, so a derivation is never published as an Agent's claim.
+
+The record's shape is the same either way:
 
 ```text
 STATUS: working | complete | partial | blocked

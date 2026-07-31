@@ -150,6 +150,10 @@ function laneState(lane: LaneView): LaneState {
       return "running";
     case "exited":
       if (lane.exitCode === 0) return "complete";
+      // A real CLI catches SIGINT and exits with a status of its own — codex
+      // exits 1 — so the interrupt fact comes from the ledger. Keying this off
+      // exit code 130 projected a genuinely interrupted reviewer as `failed`.
+      if (lane.humanInterruptAt !== null) return "interrupted";
       if (lane.exitCode === 130) return "interrupted";
       return "failed";
     case "crashed":
@@ -251,6 +255,23 @@ export class WorkflowRuntime {
     if (agentSpecs.length > 0) {
       if (config.fixedPoint === undefined || config.fixedPoint === null) {
         throw new Error("agent lanes require a captured fixed point");
+      }
+      // The first acceptance criterion is mechanical: the fixed point resolves
+      // and the diff is non-empty BEFORE any reviewer starts. The git port
+      // enforces it while capturing, but a caller may hand the runtime a
+      // fabricated fixed point, so the boundary checks what it can prove.
+      const fixed = config.fixedPoint;
+      if (
+        fixed.baseCommit.length === 0 ||
+        fixed.headCommit.length === 0 ||
+        fixed.diffHash.length === 0
+      ) {
+        throw new Error("a captured fixed point requires base, head, and diff hash");
+      }
+      if (fixed.baseCommit === fixed.headCommit) {
+        throw new Error(
+          "a fixed point whose base and head are the same commit has an empty diff",
+        );
       }
       if (
         config.inputBundle === undefined ||

@@ -107,13 +107,14 @@ function start(
   runtime: WorkflowRuntime,
   cwd: string,
   lanes: LaneSpec[],
+  overrides: { readonly fixedPoint?: Record<string, string> } = {},
 ) {
   return runtime.startWorkflow({
     workflow: "review",
     workspace: "w1",
     cwd,
     lanes,
-    fixedPoint: FIXED_POINT,
+    fixedPoint: { ...FIXED_POINT, ...overrides.fixedPoint },
     inputBundle: BUNDLE,
   });
 }
@@ -487,7 +488,11 @@ describe("terminal records and checkpoint authorship", () => {
     ]);
     await runtime.confirmLaneStarted(handle.runId, "codex-spec");
     await runtime.interruptLane(handle.runId, "codex-spec");
-    await runtime.awaitLane(handle.runId, "codex-spec", 60_000);
+    const awaited = await runtime.awaitLane(handle.runId, "codex-spec", 60_000);
+    // The projected state comes from the recorded interrupt, not from exit 130:
+    // a real CLI catching SIGINT exits its own way, and calling that `failed`
+    // loses the one fact that explains it.
+    expect(awaited.state).toBe("interrupted");
 
     const run = (await ledger.load(handle.runId))!;
     const lane = run.lanes["codex-spec"]!;
@@ -552,6 +557,51 @@ describe("terminal records and checkpoint authorship", () => {
     expect(record).toContain("the lane was lost before it could report");
     expect(record).toContain("dispatch-outcome-unknown");
   });
+});
+
+describe("fixed point preconditions", () => {
+  // AC 1: the fixed point resolves and the diff is non-empty BEFORE any
+  // reviewer starts. The git port enforces it while capturing; the runtime
+  // boundary must not trust a fixed point handed to it.
+  const cases: readonly {
+    readonly name: string;
+    readonly patch: Record<string, string>;
+    readonly message: RegExp;
+  }[] = [
+    {
+      name: "an empty base commit",
+      patch: { baseCommit: "" },
+      message: /requires base, head, and diff hash/,
+    },
+    {
+      name: "an empty head commit",
+      patch: { headCommit: "" },
+      message: /requires base, head, and diff hash/,
+    },
+    {
+      name: "an empty diff hash",
+      patch: { diffHash: "" },
+      message: /requires base, head, and diff hash/,
+    },
+    {
+      name: "a base and head that are the same commit",
+      patch: { baseCommit: "same", headCommit: "same" },
+      message: /empty diff/,
+    },
+  ];
+
+  for (const { name, patch, message } of cases) {
+    test(`refuses ${name}`, async () => {
+      const { runtime, cwd } = await setup({
+        lanes: [{ laneId: "grok-spec", exitCode: 0, rawReport: VALID_REPORT }],
+      });
+      await expect(
+        start(runtime, cwd, [agentLane("grok-spec", "grok", "spec")], {
+          fixedPoint: patch,
+        }),
+      ).rejects.toThrow(message);
+    });
+  }
 });
 
 describe("review worktree disposition", () => {

@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { extractClaudeReport, parseCodexSessionId, parseCodexTokensUsed } from "../src/index.ts";
+import { extractClaudeReport } from "../src/review/claude-stream.ts";
+import {
+  parseCodexSessionId,
+  parseCodexTokensUsed,
+} from "../src/review/session.ts";
 
 const RESULT_EVENT = {
   type: "result",

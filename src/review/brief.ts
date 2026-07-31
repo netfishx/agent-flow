@@ -48,10 +48,16 @@ function embedArtifacts(artifacts: readonly BundleArtifact[]): string {
 
 const AGENT_NOTES: Readonly<Record<ReviewAgentKind, string>> = {
   claude:
-    "Your tool surface is read-only: Read, Glob, Grep, and Bash restricted to " +
-    "git diff, git log, git show, and git status. Do not attempt writes; " +
-    "denied tools mean the action is out of contract, not that you should " +
-    "retry it another way.",
+    // D4 names this the claude branch's distinguishing content: point the
+    // reviewer explicitly at the captured materials as its ruler. Claude
+    // carries strong review habits of its own, and an unstated ruler is the
+    // one it would fall back on.
+    "The captured materials above are your ONLY ruler. Judge the change " +
+    "against them, not against conventions you bring with you, and cite the " +
+    "captured text when a rule is at stake. Your tool surface is read-only: " +
+    "Read, Glob, Grep, and Bash restricted to git diff, git log, git show, " +
+    "and git status. Do not attempt writes; denied tools mean the action is " +
+    "out of contract, not that you should retry it another way.",
   codex:
     "You run in a read-only sandbox. Inspect the change with git and the " +
     "worktree files; do not attempt writes.",

@@ -319,7 +319,7 @@ export function runFinishEligibility(state: RunView): FinishEligibility {
     if (lane.sessionIdentity === null) {
       return {
         ready: false,
-        reason: `agent lane "${laneId}" has no session outcome`,
+        reason: `agent lane "${laneId}" has no session identity`,
       };
     }
     // A lane that never started has no worktree to verify and nothing to

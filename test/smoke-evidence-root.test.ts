@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
+  implementationWorktreeRefusal,
   resolveEvidenceRoot,
   runEvidencePath,
   volatileEvidenceRootRefusal,
@@ -129,5 +130,47 @@ describe("volatileEvidenceRootRefusal", () => {
     expect(
       volatileEvidenceRootRefusal("/tmpfoo/evidence", "/var/folders/xx/T"),
     ).toBeNull();
+  });
+});
+
+describe("implementationWorktreeRefusal", () => {
+  const repo = "/Users/someone/projects/agent-flow-issue7";
+
+  // D2: a review worktree may never live inside an implementation worktree, and
+  // the evidence root is that worktree's parent.
+  test.each([
+    "/Users/someone/projects/agent-flow-issue7",
+    "/Users/someone/projects/agent-flow-issue7/evidence",
+    "/Users/someone/projects/agent-flow-issue7/.local/evidence",
+  ])("refuses %s", (root) => {
+    const refusal = implementationWorktreeRefusal(root, repo);
+    expect(refusal).not.toBeNull();
+    expect(refusal).toContain("inside the repository under review");
+  });
+
+  test("accepts a root outside the repository", () => {
+    expect(
+      implementationWorktreeRefusal(
+        "/Users/someone/.local/state/agent-flow/evidence",
+        repo,
+      ),
+    ).toBeNull();
+    // A sibling whose name merely shares the prefix is not inside it.
+    expect(
+      implementationWorktreeRefusal(
+        "/Users/someone/projects/agent-flow-issue7-evidence",
+        repo,
+      ),
+    ).toBeNull();
+  });
+
+  test("refuses a relative evidence root", () => {
+    expect(implementationWorktreeRefusal("evidence", repo)).toContain(
+      "not an absolute path",
+    );
+  });
+
+  test("cannot judge a relative repository root, so it does not pretend to", () => {
+    expect(implementationWorktreeRefusal("/opt/evidence", "relative")).toBeNull();
   });
 });

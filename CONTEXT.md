@@ -30,9 +30,11 @@ and design records.
 - **Checkpoint origin** — who authored a lane's checkpoint: the Agent itself,
   or the runtime deriving one from the lane's captured bytes. The two are
   recorded distinctly and never rendered as the same claim.
-- **Terminal record** — the runtime-derived checkpoint every lane that ran
-  receives when it reaches a terminal state, whatever that state was. It states
-  its mechanical origin, claims no verification, and invents no verdict.
+- **Terminal record** — the runtime-derived checkpoint every **agent lane**
+  that ran receives when it reaches a terminal state, whatever that state was.
+  It states its mechanical origin, claims no verification, and invents no
+  verdict. A simulated lane writes its own checkpoint and keeps the `agent`
+  checkpoint origin.
 - **Checkpoint semantic signature** — the comparison key over semantic state
   and blocker, next, and gap lines, used to suppress unchanged checkpoint facts.
 - **Label transition** — the recorded outcome of the allowed issue-label step:
@@ -79,6 +81,11 @@ and design records.
   the lane's review worktree.
 - **Worktree disposition** — whether a lane's review worktree was `removed` or
   `retained`, and the reason it was kept. Retention is recorded, never silent.
+- **Evidence root** — the persistent directory a run's artifacts live under,
+  resolved through the same state-root rules as the ledger so that artifacts and
+  the ledger pointing at them share one lifetime. A formal run refuses an
+  evidence root the operating system may clear, and one inside the repository
+  under review.
 - **Report contract** — the required `VERDICT` / `CONFIDENCE` / `FINDINGS`
   form of a reviewer's report; validated for form only, never for truth.
 - **Session identity** — a lane's CLI session id, recorded only from evidence
