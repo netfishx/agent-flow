@@ -609,6 +609,13 @@ async function rehearsalParent(): Promise<void> {
         evidenceFailure: interruptEvidence.ok ? null : interruptEvidence.reason,
       },
       controllerLoss: { aliveAtKill, resumedExit: resumed.exitCode },
+      // Interrupting exactly one lane is the demonstration, so it is asserted
+      // rather than merely implied by a non-invalid finish.
+      interruptIsolation: {
+        interruptedLanes: run.breakdown?.exitedNonZero ?? null,
+        completedLanes: run.breakdown?.exitedZero ?? null,
+        expectedCompleted: lanes.length - 1,
+      },
       finishStatus: run.finishStatus,
       lanes: laneSummary(run),
       observations,
@@ -618,6 +625,9 @@ async function rehearsalParent(): Promise<void> {
         // The interrupt is only demonstrated when its objective evidence
         // survives: a lost or malformed evidence file fails the rehearsal.
         interruptEvidence.ok &&
+        // Exactly one lane sacrificed, every other lane completed.
+        run.breakdown?.exitedNonZero === 1 &&
+        run.breakdown?.exitedZero === lanes.length - 1 &&
         aliveAtKill > 0 &&
         run.finishStatus !== "invalid",
     };

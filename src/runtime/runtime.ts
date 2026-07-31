@@ -1547,11 +1547,23 @@ export class WorkflowRuntime {
     // An Agent-written checkpoint is the Agent's own claim and is recorded as
     // such; a record the runtime derived is committed under the runtime actor,
     // so the ledger never presents a derivation as the reviewer's voice.
-    const checkpointOrigin: "agent" | "runtime" =
-      derivation === null ? "agent" : "runtime";
-    let status: "complete" | "partial" | "blocked" | null = null;
     if (derivation !== null) {
-      status = derivation.checkpointStatus;
+      // A derived record is always committed, whatever the lane's terminal
+      // state, and always under the runtime actor. Its semantic state may be
+      // `unknown`: a crashed or lost lane left no evidence of progress, and
+      // claiming otherwise would assert progress nobody observed.
+      const semanticState = derivation.checkpointStatus;
+      await this.commitEventConditionally(runId, (current) => {
+        if (!current) throw new Error(`unknown runId "${runId}"`);
+        const currentLane = this.getLane(current, laneId);
+        if (currentLane.checkpointOrigin === "runtime") return null;
+        return {
+          type: "lane_checkpoint",
+          actor: "runtime",
+          laneId,
+          data: { semanticState, checkpointFile },
+        };
+      });
     } else {
       let checkpoint: string | null = null;
       try {
@@ -1559,26 +1571,27 @@ export class WorkflowRuntime {
       } catch {
         // An absent/unreadable Agent record leaves the semantic state unknown.
       }
-      status = checkpoint === null ? null : parseCheckpoint(checkpoint).status;
-    }
-    if (status === "complete" || status === "partial") {
-      const semanticState = status;
-      await this.commitEventConditionally(runId, (current) => {
-        if (!current) throw new Error(`unknown runId "${runId}"`);
-        const currentLane = this.getLane(current, laneId);
-        if (
-          currentLane.semanticState === "complete" ||
-          currentLane.semanticState === "partial"
-        ) {
-          return null;
-        }
-        return {
-          type: "lane_checkpoint",
-          actor: checkpointOrigin,
-          laneId,
-          data: { semanticState, checkpointFile },
-        };
-      });
+      const status =
+        checkpoint === null ? null : parseCheckpoint(checkpoint).status;
+      if (status === "complete" || status === "partial") {
+        const semanticState = status;
+        await this.commitEventConditionally(runId, (current) => {
+          if (!current) throw new Error(`unknown runId "${runId}"`);
+          const currentLane = this.getLane(current, laneId);
+          if (
+            currentLane.semanticState === "complete" ||
+            currentLane.semanticState === "partial"
+          ) {
+            return null;
+          }
+          return {
+            type: "lane_checkpoint",
+            actor: "agent",
+            laneId,
+            data: { semanticState, checkpointFile },
+          };
+        });
+      }
     }
 
     const contractErrors: string[] = [];

@@ -49,8 +49,9 @@ function embedArtifacts(artifacts: readonly BundleArtifact[]): string {
 const AGENT_NOTES: Readonly<Record<ReviewAgentKind, string>> = {
   claude:
     "Your tool surface is read-only: Read, Glob, Grep, and Bash restricted to " +
-    "read-only git commands. Do not attempt writes; denied tools mean the " +
-    "action is out of contract, not that you should retry it another way.",
+    "git diff, git log, git show, and git status. Do not attempt writes; " +
+    "denied tools mean the action is out of contract, not that you should " +
+    "retry it another way.",
   codex:
     "You run in a read-only sandbox. Inspect the change with git and the " +
     "worktree files; do not attempt writes.",

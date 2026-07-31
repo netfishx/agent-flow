@@ -159,7 +159,10 @@ function renderComplete(
       // made, and the public heading must not blur the two.
       lane.checkpointOrigin === "runtime"
         ? "#### Runtime-derived checkpoint (no Agent claim)"
-        : "#### Agent checkpoint claim",
+        : lane.checkpointOrigin === "agent"
+          ? "#### Agent checkpoint claim"
+          : // No checkpoint was recorded, so nobody claimed anything.
+            "#### Checkpoint (none recorded)",
       "",
       `- **Semantic state:** ${code(lane.semanticState)}`,
       ...(lane.gaps.length === 0

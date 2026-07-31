@@ -174,7 +174,7 @@ function renderRun(run: RunView, stdout: TextSink): void {
         `  isolation pre=${isolation(lane.isolationPre)} post=${isolation(lane.isolationPost)} session=${session}\n`,
       );
       stdout.write(
-        `  artifacts rawReport=${value(lane.rawReportOutcome)} checkpointAuthor=${value(lane.checkpointOrigin)} worktree=${worktree}\n`,
+        `  artifacts rawReport=${value(lane.rawReportOutcome)} checkpointOrigin=${value(lane.checkpointOrigin)} worktree=${worktree}\n`,
       );
     }
   }

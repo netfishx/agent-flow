@@ -53,7 +53,12 @@ export interface AgentLaneDerivation {
    * its terminal state, and the text says plainly that the runtime wrote it.
    */
   readonly checkpointText: string;
-  readonly checkpointStatus: "complete" | "partial";
+  /**
+   * `unknown` where the runtime genuinely cannot tell how far the reviewer got:
+   * a crashed or lost lane left no evidence of progress, and claiming `partial`
+   * would assert progress nobody observed.
+   */
+  readonly checkpointStatus: "complete" | "partial" | "unknown";
   readonly session: SessionIdentity;
   readonly tokens: LaneTokens;
   /** The runner's objective fact about the raw artifact. */
@@ -204,7 +209,7 @@ function deriveSession(
  * recorded fact rather than an absence.
  */
 function terminalRecord(input: {
-  readonly status: "complete" | "partial";
+  readonly status: "complete" | "partial" | "unknown";
   readonly completed: string;
   readonly blockers: readonly string[];
   readonly gaps: readonly string[];
@@ -290,7 +295,9 @@ export function deriveAgentLaneFacts(
       ? exitedRecord(capture, contractErrors)
       : capture.termination === "crashed"
         ? {
-            status: "partial" as const,
+            // No evidence of progress survives, so the semantic state stays
+            // unknown; the record itself is still written and still honest.
+            status: "unknown" as const,
             completed: "the lane process is gone",
             blockers: [
               capture.terminationDetail ??
@@ -298,7 +305,7 @@ export function deriveAgentLaneFacts(
             ],
           }
         : {
-            status: "partial" as const,
+            status: "unknown" as const,
             completed: "the lane was lost before it could report",
             blockers: [
               `lane lost: ${capture.terminationDetail ?? "cause unrecorded"}`,

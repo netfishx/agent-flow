@@ -522,7 +522,9 @@ describe("terminal records and checkpoint authorship", () => {
 
     const lane = (await ledger.load(handle.runId))!.lanes["claude-spec"]!;
     expect(lane.runtimeState).toBe("crashed");
-    expect(lane.semanticState).toBe("partial");
+    // No evidence of progress survived, so the semantic state stays unknown
+    // while the record itself is still written.
+    expect(lane.semanticState).toBe("unknown");
     expect(lane.checkpointOrigin).toBe("runtime");
     const record = await recordOf(cwd, handle.runId, "claude-spec");
     expect(record).toContain("the lane process is gone");
@@ -544,7 +546,8 @@ describe("terminal records and checkpoint authorship", () => {
 
     const lane = (await ledger.load(handle.runId))!.lanes["grok-standards"]!;
     expect(lane.runtimeState).toBe("lost");
-    expect(lane.semanticState).toBe("partial");
+    expect(lane.semanticState).toBe("unknown");
+    expect(lane.checkpointOrigin).toBe("runtime");
     const record = await recordOf(cwd, handle.runId, "grok-standards");
     expect(record).toContain("the lane was lost before it could report");
     expect(record).toContain("dispatch-outcome-unknown");

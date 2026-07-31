@@ -21,9 +21,11 @@ export function reviewWorktreeCleanupEligibility(
     return { eligible: false, reason: "lane has no review worktree" };
   }
   if (lane.runtimeState === "failed_to_start") {
+    // Says only what is true: nothing was released. Whether a directory exists
+    // depends on how far pre-flight got, and this record must not imply one.
     return {
       eligible: false,
-      reason: "lane never started; its worktree is kept for forensics",
+      reason: "lane never started; nothing was released",
     };
   }
   if (lane.isolationPost === null) {

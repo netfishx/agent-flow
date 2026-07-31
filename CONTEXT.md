@@ -77,8 +77,8 @@ and design records.
 - **Raw report outcome** — the runner's objective fact about that artifact:
   `captured`, `missing`, or `underivable`. Only `captured` licenses releasing
   the lane's review worktree.
-- **Worktree disposition** — whether a lane's review worktree was released or
-  retained, and the reason it was kept. Retention is recorded, never silent.
+- **Worktree disposition** — whether a lane's review worktree was `removed` or
+  `retained`, and the reason it was kept. Retention is recorded, never silent.
 - **Report contract** — the required `VERDICT` / `CONFIDENCE` / `FINDINGS`
   form of a reviewer's report; validated for form only, never for truth.
 - **Session identity** — a lane's CLI session id, recorded only from evidence
