@@ -63,10 +63,12 @@ lane writes neither: the runtime derives its terminal record
 from the lane's own captured raw report and records it under the `runtime`
 actor, so a derivation is never published as an Agent's claim.
 
-The record's shape is the same either way:
+The record's shape is the same either way. `unknown` is reserved for a
+runtime-derived record whose lane left no evidence of progress — a crash, a
+loss, or a non-zero exit the runtime did not interrupt:
 
 ```text
-STATUS: working | complete | partial | blocked
+STATUS: working | complete | partial | blocked | unknown
 PHASE: <current phase>
 COMPLETED:
 - <completed work>
@@ -82,7 +84,7 @@ GAPS:
 - <unfinished or uncertain work>
 ```
 
-The Agent owns semantic progress because it knows what it attempted and what remains. Its claims do not replace objective verification.
+The Agent owns semantic progress because it knows what it attempted and what remains. Its claims do not replace objective verification. For an agent lane the runtime owns the record instead, derived from that lane's captured output and committed under the `runtime` actor; the two authorships are recorded distinctly and never rendered as the same claim.
 
 ### Runner records verification evidence
 

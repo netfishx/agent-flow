@@ -143,6 +143,16 @@ export interface FormalAcceptanceInput {
    * operator responsibility, recorded rather than claimed.
    */
   readonly bundleRoles: readonly string[];
+  /**
+   * Every milestone delivery the run recorded, by kind and state. Acceptance
+   * evidence includes real milestones on the bound issue (design section 10),
+   * so a start or complete delivery that failed to land must fail acceptance:
+   * a run whose evidence never reached the issue is not the evidence claimed.
+   */
+  readonly deliveries: readonly {
+    readonly kind: string;
+    readonly state: string;
+  }[];
 }
 
 export function formalAcceptance(input: FormalAcceptanceInput): {
@@ -156,6 +166,16 @@ export function formalAcceptance(input: FormalAcceptanceInput): {
     failures.push(
       `the run finished ${input.finishStatus}, and only a clean finish is acceptance evidence`,
     );
+  }
+  for (const kind of ["start", "complete"] as const) {
+    const delivery = input.deliveries.find((entry) => entry.kind === kind);
+    if (delivery === undefined) {
+      failures.push(`the ${kind} milestone was never delivered`);
+    } else if (delivery.state !== "delivered") {
+      failures.push(
+        `the ${kind} milestone delivery is ${delivery.state}, not delivered`,
+      );
+    }
   }
   for (const role of ["issue", "spec", "standards"] as const) {
     if (!input.bundleRoles.includes(role)) {

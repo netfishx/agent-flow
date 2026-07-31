@@ -33,8 +33,9 @@ and design records.
 - **Terminal record** — the runtime-derived checkpoint every **agent lane**
   that ran receives when it reaches a terminal state, whatever that state was.
   It states its mechanical origin, claims no verification, and invents no
-  verdict. A simulated lane writes its own checkpoint and keeps the `agent`
-  checkpoint origin.
+  verdict. Its status is `unknown` when the lane left no evidence of progress —
+  a crash, a loss, or a non-zero exit nobody interrupted. A simulated lane writes
+  its own checkpoint and keeps the `agent` checkpoint origin.
 - **Checkpoint semantic signature** — the comparison key over semantic state
   and blocker, next, and gap lines, used to suppress unchanged checkpoint facts.
 - **Label transition** — the recorded outcome of the allowed issue-label step:

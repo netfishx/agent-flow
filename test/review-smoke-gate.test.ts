@@ -246,6 +246,10 @@ describe("formalAcceptance", () => {
     expectedLaneCount: 2,
     lanes: [lane({ laneId: "claude-spec" }), lane()],
     bundleRoles: ["issue", "spec", "standards", "standards"],
+    deliveries: [
+      { kind: "start", state: "delivered" },
+      { kind: "complete", state: "delivered" },
+    ],
   };
 
   test("accepts a clean run whose every lane produced a verified report", () => {
@@ -298,6 +302,33 @@ describe("formalAcceptance", () => {
       "a bundle with no standards material",
       { bundleRoles: ["issue", "spec"] },
       "carries no standards material",
+    ],
+    // Acceptance evidence includes real milestones on the bound issue, so a
+    // delivery that never landed must not pass.
+    [
+      "a complete milestone that never delivered",
+      { deliveries: [{ kind: "start", state: "delivered" }] },
+      "the complete milestone was never delivered",
+    ],
+    [
+      "a start milestone left pending",
+      {
+        deliveries: [
+          { kind: "start", state: "pending" },
+          { kind: "complete", state: "delivered" },
+        ],
+      },
+      "the start milestone delivery is pending, not delivered",
+    ],
+    [
+      "a failed complete delivery",
+      {
+        deliveries: [
+          { kind: "start", state: "delivered" },
+          { kind: "complete", state: "failed" },
+        ],
+      },
+      "the complete milestone delivery is failed, not delivered",
     ],
   ])("refuses %s", (_name, overrides, fragment) => {
     const verdict = formalAcceptance({

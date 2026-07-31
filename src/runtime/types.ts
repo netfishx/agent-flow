@@ -99,7 +99,7 @@ export interface SimulatedLaneSpec {
 }
 
 /**
- * A agent lane. External input declares only axis, agent family,
+ * An agent lane. External input declares only axis, agentKind,
  * model, and effort — the runtime owns the brief, the session pre-assignment,
  * and the review worktree.
  */

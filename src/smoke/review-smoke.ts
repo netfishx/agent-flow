@@ -784,6 +784,10 @@ async function formalRun(): Promise<void> {
     finishStatus: run.finishStatus,
     expectedLaneCount: lanes.length,
     bundleRoles: (run.inputBundle?.files ?? []).map((file) => file.role),
+    deliveries: deliveries.map((delivery) => ({
+      kind: delivery.kind,
+      state: delivery.state,
+    })),
     lanes: run.laneOrder.map((laneId) => {
       const lane = run.lanes[laneId]!;
       return {
