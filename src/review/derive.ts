@@ -244,7 +244,11 @@ ${list(input.gaps)}
 function exitedRecord(
   capture: AgentLaneCapture,
   contractErrors: readonly string[],
-): { status: "complete" | "partial"; completed: string; blockers: string[] } {
+): {
+  status: "complete" | "partial" | "unknown";
+  completed: string;
+  blockers: string[];
+} {
   if (capture.exitCode === 0) {
     return contractErrors.length === 0
       ? {
@@ -269,7 +273,10 @@ function exitedRecord(
         blockers: [`interrupted by SIGINT; the CLI exited ${code}`],
       }
     : {
-        status: "partial",
+        // D7: terminations other than exit 0 and an interrupt leave the
+        // semantic dimension unknown. A CLI that exited non-zero on its own
+        // gave no evidence of how far it got, and `partial` would claim some.
+        status: "unknown" as const,
         completed: `the lane exited ${code}`,
         blockers: [`the CLI exited ${code}`],
       };

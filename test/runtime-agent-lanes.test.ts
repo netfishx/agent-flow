@@ -505,6 +505,32 @@ describe("terminal records and checkpoint authorship", () => {
     expect(run.finishStatus).toBe("degraded");
   });
 
+  test("an uninterrupted non-zero exit leaves the semantic state unknown", async () => {
+    // D7 leaves terminations other than exit 0 and an interrupt at `unknown`:
+    // a CLI that failed on its own gave no evidence of how far it got.
+    const { runtime, ledger, cwd } = await setup({
+      lanes: [
+        { laneId: "grok-spec", exitCode: 3, rawReport: VALID_REPORT },
+      ],
+    });
+    const handle = await start(runtime, cwd, [
+      agentLane("grok-spec", "grok", "spec"),
+    ]);
+    await runtime.awaitLane(handle.runId, "grok-spec", 60_000);
+
+    const run = (await ledger.load(handle.runId))!;
+    const lane = run.lanes["grok-spec"]!;
+    expect(lane.exitCode).toBe(3);
+    expect(lane.semanticState).toBe("unknown");
+    expect(lane.checkpointOrigin).toBe("runtime");
+    const record = await recordOf(cwd, handle.runId, "grok-spec");
+    expect(record).toContain("STATUS: unknown");
+    expect(record).toContain("the lane exited 3");
+    // Not interrupted, so the record must not say it was.
+    expect(record).not.toContain("interrupted by SIGINT");
+    expect(run.finishStatus).toBe("degraded");
+  });
+
   test("a crashed lane records a terminal record naming the missing sentinel", async () => {
     const { runtime, ledger, cwd } = await setup({
       lanes: [

@@ -245,6 +245,7 @@ describe("formalAcceptance", () => {
     finishStatus: "clean",
     expectedLaneCount: 2,
     lanes: [lane({ laneId: "claude-spec" }), lane()],
+    bundleRoles: ["issue", "spec", "standards", "standards"],
   };
 
   test("accepts a clean run whose every lane produced a verified report", () => {
@@ -281,6 +282,22 @@ describe("formalAcceptance", () => {
       "a missing lane",
       { expectedLaneCount: 6 },
       "expected 6 lanes, saw 2",
+    ],
+    // Both axes need materials; a bundle missing a role is not a review basis.
+    [
+      "a bundle with no issue material",
+      { bundleRoles: ["spec", "standards"] },
+      "carries no issue material",
+    ],
+    [
+      "a bundle with no spec material",
+      { bundleRoles: ["issue", "standards"] },
+      "carries no spec material",
+    ],
+    [
+      "a bundle with no standards material",
+      { bundleRoles: ["issue", "spec"] },
+      "carries no standards material",
     ],
   ])("refuses %s", (_name, overrides, fragment) => {
     const verdict = formalAcceptance({

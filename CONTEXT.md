@@ -81,6 +81,12 @@ and design records.
   the lane's review worktree.
 - **Worktree disposition** — whether a lane's review worktree was `removed` or
   `retained`, and the reason it was kept. Retention is recorded, never silent.
+- **Rehearsal** — an unbound run against a historical merged-PR diff whose job
+  is to prove per-CLI-family pre-completion visibility, single-lane interrupt,
+  and controller-exit survival. It is never acceptance evidence.
+- **Formal run** — the bound acceptance run: the branch under review reviews
+  itself at its own head with `dirtyStatePolicy: reject`, and its milestones
+  reach the bound issue. Acceptance requires a `clean` finish.
 - **Evidence root** — the persistent directory a run's artifacts live under,
   resolved through the same state-root rules as the ledger so that artifacts and
   the ledger pointing at them share one lifetime. A formal run refuses an

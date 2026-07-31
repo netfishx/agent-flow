@@ -1,4 +1,4 @@
-// Real-stack cross-review smoke: six visible reviewer lanes (claude, codex,
+// Real-stack cross-review smoke: six visible agent lanes (claude, codex,
 // grok x standards, spec) in one Herdr tab.
 //
 // Rehearsal mode (unbound, historical diff, NOT acceptance evidence):
@@ -783,6 +783,7 @@ async function formalRun(): Promise<void> {
   const acceptance = formalAcceptance({
     finishStatus: run.finishStatus,
     expectedLaneCount: lanes.length,
+    bundleRoles: (run.inputBundle?.files ?? []).map((file) => file.role),
     lanes: run.laneOrder.map((laneId) => {
       const lane = run.lanes[laneId]!;
       return {

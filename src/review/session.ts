@@ -1,4 +1,4 @@
-// Session identity for reviewer lanes. Only causally-tied evidence is
+// Session identity for agent lanes. Only causally-tied evidence is
 // admissible: a pre-assigned UUID in the lane's own dispatched command, or an
 // id parsed from that lane's own captured output. Scanning session directories
 // for the newest file is forbidden — concurrent lanes would cross-attribute.

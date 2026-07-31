@@ -2,7 +2,7 @@ import { join } from "node:path";
 import type { SemanticState } from "./events.ts";
 
 export interface ParsedCheckpoint {
-  readonly status: "complete" | "partial" | "blocked" | null;
+  readonly status: "complete" | "partial" | "blocked" | "unknown" | null;
   readonly blockers: readonly string[];
   readonly next: readonly string[];
   readonly gaps: readonly string[];
@@ -53,7 +53,10 @@ function normalizedItems(items: readonly string[]): readonly string[] {
 
 export function parseCheckpoint(text: string): ParsedCheckpoint {
   const statusMatch = text.match(
-    /^STATUS:\s*(complete|partial|blocked)\s*$/m,
+    // `unknown` is the runtime-derived terminal record's honest status for a
+    // crashed or lost lane. The runtime writes it, so the parser must read it:
+    // a record our own parser cannot classify is not a durable record.
+    /^STATUS:\s*(complete|partial|blocked|unknown)\s*$/m,
   );
   const collected: Record<CheckpointSection, string[]> = {
     BLOCKERS: [],
@@ -84,7 +87,8 @@ export function parseCheckpoint(text: string): ParsedCheckpoint {
     status:
       parsedStatus === "complete" ||
       parsedStatus === "partial" ||
-      parsedStatus === "blocked"
+      parsedStatus === "blocked" ||
+      parsedStatus === "unknown"
         ? parsedStatus
         : null,
     blockers: normalizedItems(collected.BLOCKERS),

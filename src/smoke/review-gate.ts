@@ -134,6 +134,15 @@ export interface FormalAcceptanceInput {
   readonly finishStatus: string | null;
   readonly expectedLaneCount: number;
   readonly lanes: readonly FormalAcceptanceLane[];
+  /**
+   * The captured bundle's roles. A formal run's materials are entirely
+   * operator-supplied, and nothing can mechanically prove the captured issue
+   * text is the bound issue's. What IS checkable is that the bundle is a review
+   * basis at all: both axes need materials, so an issue, a spec, and standards
+   * must each be present. Whether the text matches the bound issue stays an
+   * operator responsibility, recorded rather than claimed.
+   */
+  readonly bundleRoles: readonly string[];
 }
 
 export function formalAcceptance(input: FormalAcceptanceInput): {
@@ -147,6 +156,11 @@ export function formalAcceptance(input: FormalAcceptanceInput): {
     failures.push(
       `the run finished ${input.finishStatus}, and only a clean finish is acceptance evidence`,
     );
+  }
+  for (const role of ["issue", "spec", "standards"] as const) {
+    if (!input.bundleRoles.includes(role)) {
+      failures.push(`the captured bundle carries no ${role} material`);
+    }
   }
   if (input.lanes.length !== input.expectedLaneCount) {
     failures.push(

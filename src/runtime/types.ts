@@ -99,7 +99,7 @@ export interface SimulatedLaneSpec {
 }
 
 /**
- * A real reviewer lane. External input declares only axis, agent family,
+ * A agent lane. External input declares only axis, agent family,
  * model, and effort — the runtime owns the brief, the session pre-assignment,
  * and the review worktree.
  */
