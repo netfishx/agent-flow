@@ -271,12 +271,21 @@ function deliveryFor(state: RunView, deliveryId: string): DeliveryView {
 
 /**
  * Whether every per-lane terminal fact a finish status depends on has been
- * committed. A run may only finish once the ledger already carries each lane's
- * process outcome, terminal checkpoint, session outcome, post-flight isolation,
- * contract evaluation, and runner evidence — otherwise the finish status would
- * be computed over facts that do not exist yet. Shared by the reducer's
- * run_finished guard and the runtime's finish committer, so a replayed ledger
- * enforces exactly the order the live controller had to follow.
+ * committed: each lane's process outcome, terminal checkpoint, session outcome,
+ * post-flight isolation, contract evaluation, and runner evidence. A finish
+ * status computed before those exist would be computed over facts that do not
+ * exist yet.
+ *
+ * The ordering this expresses is enforced on the LIVE SUBMISSION PATH only —
+ * the runtime's finish committer refuses to commit `run_finished` until this
+ * returns ready. Replay does NOT enforce it: a reducer that rejected a
+ * `run_finished` arriving ahead of its facts would make every pre-#7 ledger
+ * unloadable, including the retained first formal run. `expectedFinishStatus`
+ * therefore uses this only to choose which status rule applies, and falls back
+ * to legacy outcome-only validation for a ledger whose facts are absent at
+ * finish time. That is a deliberate compatibility strategy, not an oversight;
+ * tightening it would need an event `schemaVersion` bump, a version-dispatching
+ * reducer, and a migration story for the retained ledgers.
  */
 export type FinishEligibility =
   | { readonly ready: true }
@@ -340,9 +349,14 @@ export function runFinishEligibility(state: RunView): FinishEligibility {
  * ran, so they degrade the run without invalidating it.)
  *
  * `clean` additionally requires every lane's own record to be clean: a lost or
- * underivable raw report, a violated contract, incomplete runner evidence, or
- * a missing result artifact all degrade the run. A run whose evidence is
- * incomplete must never be recorded as the status that means "nothing to see".
+ * underivable raw report, a violated contract, or a missing result artifact all
+ * degrade the run. A run whose evidence is incomplete must never be recorded as
+ * the status that means "nothing to see".
+ *
+ * Two status rules therefore exist, selected by whether the terminal facts are
+ * present — NOT by a replay-time ordering check. See `runFinishEligibility`:
+ * this function never rejects an out-of-order `run_finished`, because rejecting
+ * one would make pre-#7 ledgers unloadable.
  */
 export function expectedFinishStatus(state: RunView): RunFinishStatus {
   const lanes = state.laneOrder.map((laneId) => state.lanes[laneId]!);
@@ -356,12 +370,13 @@ export function expectedFinishStatus(state: RunView): RunFinishStatus {
   if (isolationBroken) return "invalid";
   const breakdown = projectRunOutcomeBreakdown(state);
   if (breakdown.exitedZero !== lanes.length) return "degraded";
-  // Ledgers written before the terminal-facts ordering existed finished the run
-  // ahead of their per-lane facts, so the evidence below is legitimately absent
-  // for them and they keep the outcome-only rule — they stay replayable. Every
-  // run this runtime writes commits its facts first, because
-  // `runFinishEligibility` gates the finish committer, so a live run always
-  // reaches the strict test below.
+  // Legacy status validation. Ledgers written before the terminal-facts
+  // ordering existed finished the run ahead of their per-lane facts, so the
+  // evidence below is legitimately absent for them; they keep the outcome-only
+  // rule and stay replayable. This branch is a compatibility path, not a check:
+  // reaching it is not treated as an error. Every run this runtime writes
+  // commits its facts first, because the live finish committer is gated on
+  // `runFinishEligibility`, so a live run always reaches the strict test below.
   if (!runFinishEligibility(state).ready) return "clean";
   // Exactly three conditions cost a run its `clean`: a violated contract, a
   // raw report that was not captured, and a missing result artifact. Runner

@@ -1823,8 +1823,11 @@ export class WorkflowRuntime {
     await this.commitEventConditionally(runId, (run) => {
       if (!run) throw new Error(`unknown runId "${runId}"`);
       if (run.finishStatus !== null) return null;
-      // The same eligibility rule the reducer enforces on replay: a run may
-      // only finish once every lane's terminal facts are already committed.
+      // This is the live submission guard, and the only place the ordering is
+      // enforced: a run may only finish once every lane's terminal facts are
+      // already committed. Replay deliberately does not enforce it — a reducer
+      // that rejected an out-of-order `run_finished` would make every pre-#7
+      // ledger unloadable, so those keep legacy status validation instead.
       if (!runFinishEligibility(run).ready) return null;
       const breakdown = projectRunOutcomeBreakdown(run);
       return {
