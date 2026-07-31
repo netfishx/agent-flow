@@ -4,7 +4,7 @@
 // the approved seam — never runtime internals.
 
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -531,6 +531,27 @@ describe("terminal records and checkpoint authorship", () => {
     expect(run.finishStatus).toBe("degraded");
   });
 
+  test("exit 130 reads as an interrupt in derivation and projection alike", async () => {
+    // D7 names exit 130 an interrupt. The projection already read it that way,
+    // so a derivation that called it `unknown` would have the two disagreeing
+    // about the same lane.
+    const { runtime, ledger, cwd } = await setup({
+      lanes: [
+        { laneId: "grok-standards", exitCode: 130, rawReport: VALID_REPORT },
+      ],
+    });
+    const handle = await start(runtime, cwd, [
+      agentLane("grok-standards", "grok", "standards"),
+    ]);
+    const awaited = await runtime.awaitLane(handle.runId, "grok-standards", 60_000);
+    expect(awaited.state).toBe("interrupted");
+    const lane = (await ledger.load(handle.runId))!.lanes["grok-standards"]!;
+    expect(lane.semanticState).toBe("partial");
+    const record = await recordOf(cwd, handle.runId, "grok-standards");
+    expect(record).toContain("STATUS: partial");
+    expect(record).toContain("interrupted by SIGINT; the CLI exited 130");
+  });
+
   test("a crashed lane records a terminal record naming the missing sentinel", async () => {
     const { runtime, ledger, cwd } = await setup({
       lanes: [
@@ -582,6 +603,56 @@ describe("terminal records and checkpoint authorship", () => {
     const record = await recordOf(cwd, handle.runId, "grok-standards");
     expect(record).toContain("the lane was lost before it could report");
     expect(record).toContain("dispatch-outcome-unknown");
+  });
+});
+
+describe("checkpoint authorship for a lane that never started", () => {
+  // An agent lane never writes its own checkpoint. If a file happens to sit at
+  // its checkpoint path, publishing it as the Agent's claim would be exactly
+  // the misattribution the runtime actor exists to prevent.
+  test("a stray file is never published as an agent lane's own claim", async () => {
+    const cwdSeed = await mkdtemp(join(tmpdir(), "flow-agent-"));
+    const clock = createClock(0);
+    const fake = new FakeHerdrAdapter({ clock, lanes: [] });
+    const ledger = new RecordingLedger();
+    const worktree = join(cwdSeed, "run-agent", "worktrees", "codex-spec");
+    const isolation = new FakeReviewIsolation({ failCreateFor: [worktree] });
+    const runtime = new WorkflowRuntime({
+      adapter: fake,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run-agent",
+      readResultFile: fake.readResultFile,
+      sleep: async () => {},
+      reviewIsolation: isolation,
+      sessionIdgen: () => "00000000-0000-4000-8000-000000000001",
+    });
+    // Plant a parseable checkpoint where the lane's would go.
+    const checkpointFile = join(
+      cwdSeed,
+      "run-agent",
+      "checkpoints",
+      "codex-spec.md",
+    );
+    await mkdir(join(cwdSeed, "run-agent", "checkpoints"), { recursive: true });
+    await writeFile(
+      checkpointFile,
+      "STATUS: complete\nPHASE: planted\nCOMPLETED:\n- none\nNEXT:\n- none\nBLOCKERS:\n- none\nARTIFACTS:\n- none\nVERIFICATION_CLAIMS:\n- none\nGAPS:\n- none\n",
+      "utf8",
+    );
+
+    const handle = await start(runtime, cwdSeed, [
+      agentLane("codex-spec", "codex", "spec"),
+    ]);
+    await runtime.inspectWorkflow(handle.runId);
+
+    const run = (await ledger.load(handle.runId))!;
+    expect(run.lanes["codex-spec"]!.runtimeState).toBe("failed_to_start");
+    // No checkpoint at all, and above all none attributed to the Agent.
+    expect(
+      ledger.events.filter((event) => event.type === "lane_checkpoint"),
+    ).toEqual([]);
+    expect(run.lanes["codex-spec"]!.checkpointOrigin).toBeNull();
   });
 });
 

@@ -1594,7 +1594,13 @@ export class WorkflowRuntime {
       }
       const status =
         checkpoint === null ? null : parseCheckpoint(checkpoint).status;
-      if (status === "complete" || status === "partial") {
+      // Only a lane that writes its own checkpoint may be credited with one. An
+      // agent lane never does, so reaching here for one (a lane that never
+      // started, say) must not publish a file on disk as the Agent's claim.
+      if (
+        lane.kind !== "agent" &&
+        (status === "complete" || status === "partial")
+      ) {
         const semanticState = status;
         await this.commitEventConditionally(runId, (current) => {
           if (!current) throw new Error(`unknown runId "${runId}"`);

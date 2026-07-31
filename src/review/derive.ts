@@ -265,8 +265,10 @@ function exitedRecord(
   }
   const code = capture.exitCode === null ? "an unknown code" : `${capture.exitCode}`;
   // A CLI may catch SIGINT and exit with its own status, so the interrupt fact
-  // comes from the ledger, never from guessing at the exit code.
-  return capture.interrupted
+  // comes from the ledger. Exit 130 still counts: D7 names it an interrupt, and
+  // the lane-state projection reads it the same way, so derivation and
+  // projection must not disagree about the same lane.
+  return capture.interrupted || capture.exitCode === 130
     ? {
         status: "partial",
         completed: `the lane was interrupted and exited ${code}`,

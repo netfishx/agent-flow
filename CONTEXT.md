@@ -64,6 +64,8 @@ and design records.
   review worktree; a **simulated lane** runs the scripted stand-in.
 - **Review axis** — the reviewer charter dimension of an agent lane:
   `standards` or `spec`.
+- **Agent kind** — the CLI family behind an agent lane: `claude`, `codex`, or
+  `grok`. It is the unit the visibility gate is proven per.
 - **Input bundle** — the immutable review materials captured once at run
   start, persisted as line-numbered artifacts with per-file content hashes.
 - **Bundle hash** — the SHA-256 over the input bundle's canonical manifest;

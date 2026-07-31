@@ -4,7 +4,7 @@
 
 import type { FixedPoint } from "../runtime/events.ts";
 import type { ReviewIsolationPort } from "./isolation.ts";
-import type { WorktreeVerification } from "./types.ts";
+import type { CaptureFixedPointInput, WorktreeVerification } from "./types.ts";
 
 const PASS: WorktreeVerification = {
   headOk: true,
@@ -23,6 +23,7 @@ export interface FakeReviewIsolationOptions {
 }
 
 export class FakeReviewIsolation implements ReviewIsolationPort {
+  readonly captured: CaptureFixedPointInput[] = [];
   readonly created: { repoRoot: string; headCommit: string; path: string }[] =
     [];
   readonly verified: { path: string; fixedPoint: FixedPoint }[] = [];
@@ -39,6 +40,26 @@ export class FakeReviewIsolation implements ReviewIsolationPort {
     }
     this.failCreateFor = new Set(options.failCreateFor ?? []);
     this.throwVerifyFor = new Set(options.throwVerifyFor ?? []);
+  }
+
+  /**
+   * Deterministic capture: the base and head refs are echoed as commits and the
+   * diff hash is derived from them, so a runtime test can drive the whole
+   * fixed-point seam — the spec's Testing Decision 3 — without git.
+   */
+  async captureFixedPoint(input: CaptureFixedPointInput): Promise<FixedPoint> {
+    this.captured.push(input);
+    if (input.baseRef === input.headRef) {
+      throw new Error("fixed-point capture rejected: the diff is empty");
+    }
+    return {
+      repoRoot: input.repoRoot,
+      baseCommit: input.baseRef,
+      headCommit: input.headRef,
+      diffHash: `sha256:fake-${input.baseRef}-${input.headRef}`,
+      dirtyStatePolicy: input.dirtyStatePolicy,
+      capturedAt: 0,
+    };
   }
 
   async createWorktree(input: {

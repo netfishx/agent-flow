@@ -48,9 +48,8 @@ import {
 
 const REHEARSAL_HEAD = "d932c71fe8899d7fc589c96918813b16f57b5692";
 
-// One name for the CLI family, shared with the runtime and the ledger.
-type Family = ReviewAgentKind;
-const FAMILIES: readonly Family[] = ["claude", "codex", "grok"];
+// The established name, not a local alias for it.
+const FAMILIES: readonly ReviewAgentKind[] = ["claude", "codex", "grok"];
 
 const line = (message: string): void => {
   process.stdout.write(`${message}\n`);
@@ -81,15 +80,15 @@ interface ModelChoice {
 
 // The D6 model/effort batteries. Formal runs use these EXACTLY — no
 // environment override can weaken a formal run's lanes, models, or efforts.
-const FORMAL_MODELS: Record<Family, ModelChoice> = {
+const FORMAL_MODELS: Record<ReviewAgentKind, ModelChoice> = {
   claude: { model: "claude-opus-5", effort: "high" },
   codex: { model: "gpt-5.6-sol", effort: "high" },
   grok: { model: "grok-4.5", effort: "high" },
 };
 
-function modelFor(mode: ReviewSmokeMode, family: Family): ModelChoice {
+function modelFor(mode: ReviewSmokeMode, family: ReviewAgentKind): ModelChoice {
   if (mode === "formal") return FORMAL_MODELS[family];
-  const rehearsalDefaults: Record<Family, ModelChoice> = {
+  const rehearsalDefaults: Record<ReviewAgentKind, ModelChoice> = {
     claude: { model: "claude-haiku-4-5-20251001", effort: "low" },
     codex: { model: "gpt-5.6-sol", effort: "low" },
     grok: { model: "grok-4.5", effort: "low" },
@@ -110,7 +109,7 @@ function laneSpecs(mode: ReviewSmokeMode): AgentLaneSpec[] {
       : env("FLOW_REVIEW_FAMILIES", FAMILIES.join(","))
           .split(",")
           .map((family) => family.trim())
-          .filter((family): family is Family =>
+          .filter((family): family is ReviewAgentKind =>
             (FAMILIES as readonly string[]).includes(family),
           );
   return families.flatMap((family) => {
@@ -354,7 +353,7 @@ async function dispatchPhase(): Promise<void> {
 
 interface LaneObservation {
   laneId: string;
-  family: Family;
+  family: ReviewAgentKind;
   firstProgressAt: number | null;
   completedAt: number | null;
   progressBeforeCompletion: boolean;
@@ -402,7 +401,7 @@ async function observeLanes(
   const runDir = runEvidencePath(c.evidenceDir, c.runId);
   const observations: LaneObservation[] = laneIds.map((laneId) => ({
     laneId,
-    family: laneId.split("-")[0] as Family,
+    family: laneId.split("-")[0] as ReviewAgentKind,
     firstProgressAt: null,
     completedAt: null,
     progressBeforeCompletion: false,

@@ -7,6 +7,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GitReviewIsolation, verificationPassed } from "../src/index.ts";
+import { FakeReviewIsolation } from "../src/testing.ts";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   const proc = Bun.spawn(["git", "-C", cwd, ...args], {
@@ -190,5 +191,38 @@ describe("GitReviewIsolation", () => {
       diffHashOk: false,
     });
     expect(verification.detail).not.toBeNull();
+  });
+});
+
+describe("the review-isolation port seam", () => {
+  // Testing Decision 3 names fixed-point capture as part of the one port, so a
+  // runtime test must be able to drive capture through the fake.
+  test("the fake implements capture, so the seam is complete", async () => {
+    const fake = new FakeReviewIsolation();
+    const captured = await fake.captureFixedPoint({
+      repoRoot: "/repo",
+      baseRef: "base",
+      headRef: "head",
+      dirtyStatePolicy: "reject",
+    });
+    expect(captured).toMatchObject({
+      repoRoot: "/repo",
+      baseCommit: "base",
+      headCommit: "head",
+      dirtyStatePolicy: "reject",
+    });
+    expect(fake.captured).toHaveLength(1);
+  });
+
+  test("the fake refuses an empty diff, like the real port", async () => {
+    const fake = new FakeReviewIsolation();
+    await expect(
+      fake.captureFixedPoint({
+        repoRoot: "/repo",
+        baseRef: "same",
+        headRef: "same",
+        dirtyStatePolicy: "reject",
+      }),
+    ).rejects.toThrow(/diff is empty/);
   });
 });

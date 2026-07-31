@@ -12,6 +12,9 @@ import type {
 import { failedVerification } from "./verification.ts";
 
 export interface ReviewIsolationPort {
+  /** Resolve and freeze the fixed point under review. */
+  captureFixedPoint(input: CaptureFixedPointInput): Promise<FixedPoint>;
+
   /** Create a detached, disposable worktree at the captured head. */
   createWorktree(input: {
     readonly repoRoot: string;
