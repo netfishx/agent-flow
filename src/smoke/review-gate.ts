@@ -53,6 +53,63 @@ export function issueTargetMatchesOrigin(
 }
 
 /**
+ * What a rehearsal must demonstrate before a formal run may start. Kept as a
+ * pure function so the acceptance rule itself is unit-testable: an inline
+ * boolean inside the smoke could only be checked by spending real model calls,
+ * which is exactly how a weakened rule would go unnoticed.
+ */
+export interface RehearsalAcceptanceInput {
+  readonly visibility: readonly { readonly family: string; readonly proven: boolean }[];
+  readonly interruptSentinelNonZero: boolean;
+  readonly interruptEvidenceOk: boolean;
+  readonly laneCount: number;
+  readonly exitedZero: number | null;
+  readonly exitedNonZero: number | null;
+  readonly aliveAtKill: number;
+  readonly finishStatus: string | null;
+}
+
+export function rehearsalAcceptance(input: RehearsalAcceptanceInput): {
+  readonly ok: boolean;
+  readonly failures: readonly string[];
+} {
+  const failures: string[] = [];
+  for (const entry of input.visibility) {
+    if (!entry.proven) {
+      failures.push(`${entry.family} showed no pre-completion progress`);
+    }
+  }
+  if (input.visibility.length === 0) {
+    failures.push("no CLI family was measured for visibility");
+  }
+  if (!input.interruptSentinelNonZero) {
+    failures.push("the interrupted lane did not report a non-zero exit");
+  }
+  if (!input.interruptEvidenceOk) {
+    failures.push("the interrupt evidence is missing or malformed");
+  }
+  if (input.exitedNonZero !== 1) {
+    failures.push(
+      `expected exactly one sacrificed lane, saw ${input.exitedNonZero}`,
+    );
+  }
+  if (input.exitedZero !== input.laneCount - 1) {
+    failures.push(
+      `expected ${input.laneCount - 1} lanes to complete, saw ${input.exitedZero}`,
+    );
+  }
+  if (input.aliveAtKill <= 0) {
+    failures.push("the controller was killed with no lane still live");
+  }
+  if (input.finishStatus === null) {
+    failures.push("the run never finished");
+  } else if (input.finishStatus === "invalid") {
+    failures.push("the run finished invalid");
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+/**
  * The rehearsal's interrupt evidence is objective runner output, so a missing,
  * unreadable, or malformed file is a rehearsal failure with a stated reason —
  * never a silent null that leaves the verdict looking clean.

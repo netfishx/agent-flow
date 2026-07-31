@@ -34,6 +34,7 @@ import {
   formalOverrideRefusal,
   issueTargetMatchesOrigin,
   readInterruptEvidence,
+  rehearsalAcceptance,
   reviewSmokeGate,
   type ReviewSmokeMode,
 } from "./review-gate.ts";
@@ -594,6 +595,16 @@ async function rehearsalParent(): Promise<void> {
     if (!run || run.finishStatus === null) {
       throw new Error("run did not reach run_finished");
     }
+    const acceptance = rehearsalAcceptance({
+      visibility,
+      interruptSentinelNonZero: interrupted,
+      interruptEvidenceOk: interruptEvidence.ok,
+      laneCount: lanes.length,
+      exitedZero: run.breakdown?.exitedZero ?? null,
+      exitedNonZero: run.breakdown?.exitedNonZero ?? null,
+      aliveAtKill,
+      finishStatus: run.finishStatus,
+    });
     const report = {
       mode: c.mode,
       runId: c.runId,
@@ -619,17 +630,8 @@ async function rehearsalParent(): Promise<void> {
       finishStatus: run.finishStatus,
       lanes: laneSummary(run),
       observations,
-      ok:
-        visibility.every((entry) => entry.proven) &&
-        interrupted &&
-        // The interrupt is only demonstrated when its objective evidence
-        // survives: a lost or malformed evidence file fails the rehearsal.
-        interruptEvidence.ok &&
-        // Exactly one lane sacrificed, every other lane completed.
-        run.breakdown?.exitedNonZero === 1 &&
-        run.breakdown?.exitedZero === lanes.length - 1 &&
-        aliveAtKill > 0 &&
-        run.finishStatus !== "invalid",
+      failures: acceptance.failures,
+      ok: acceptance.ok,
     };
     await Bun.write(
       join(c.evidenceDir, "rehearsal-result.json"),

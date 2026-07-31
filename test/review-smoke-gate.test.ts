@@ -3,7 +3,9 @@ import {
   formalOverrideRefusal,
   issueTargetMatchesOrigin,
   readInterruptEvidence,
+  rehearsalAcceptance,
   reviewSmokeGate,
+  type RehearsalAcceptanceInput,
 } from "../src/smoke/review-gate.ts";
 
 const AUTHORIZED = {
@@ -147,5 +149,80 @@ describe("readInterruptEvidence", () => {
     const read = readInterruptEvidence(raw as string | null, "codex-spec");
     expect(read.ok).toBeFalse();
     expect(read.ok === false ? read.reason : "").toContain(fragment as string);
+  });
+});
+
+describe("rehearsalAcceptance", () => {
+  const passing: RehearsalAcceptanceInput = {
+    visibility: [
+      { family: "claude", proven: true },
+      { family: "codex", proven: true },
+      { family: "grok", proven: true },
+    ],
+    interruptSentinelNonZero: true,
+    interruptEvidenceOk: true,
+    laneCount: 6,
+    exitedZero: 5,
+    exitedNonZero: 1,
+    aliveAtKill: 5,
+    finishStatus: "degraded",
+  };
+
+  test("accepts a rehearsal that demonstrated everything it must", () => {
+    expect(rehearsalAcceptance(passing)).toEqual({ ok: true, failures: [] });
+  });
+
+  // Each demonstration is load-bearing on its own: a rehearsal that skipped
+  // any one of them must not license a formal run.
+  test.each([
+    [
+      "a silent CLI family",
+      {
+        visibility: [
+          { family: "claude", proven: true },
+          { family: "grok", proven: false },
+        ],
+      },
+      "grok showed no pre-completion progress",
+    ],
+    [
+      "no family measured at all",
+      { visibility: [] },
+      "no CLI family was measured",
+    ],
+    [
+      "an interrupt that reported exit 0",
+      { interruptSentinelNonZero: false },
+      "did not report a non-zero exit",
+    ],
+    [
+      "lost interrupt evidence",
+      { interruptEvidenceOk: false },
+      "interrupt evidence is missing or malformed",
+    ],
+    [
+      "two sacrificed lanes",
+      { exitedZero: 4, exitedNonZero: 2 },
+      "expected exactly one sacrificed lane, saw 2",
+    ],
+    [
+      "a sibling lane that did not complete",
+      { exitedZero: 4, exitedNonZero: 1 },
+      "expected 5 lanes to complete, saw 4",
+    ],
+    [
+      "a controller killed with nothing live",
+      { aliveAtKill: 0 },
+      "no lane still live",
+    ],
+    ["a run that never finished", { finishStatus: null }, "never finished"],
+    ["an invalid run", { finishStatus: "invalid" }, "finished invalid"],
+  ])("refuses %s", (_name, overrides, fragment) => {
+    const verdict = rehearsalAcceptance({
+      ...passing,
+      ...(overrides as Partial<RehearsalAcceptanceInput>),
+    });
+    expect(verdict.ok).toBeFalse();
+    expect(verdict.failures.join(" | ")).toContain(fragment as string);
   });
 });
