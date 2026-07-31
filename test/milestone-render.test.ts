@@ -72,6 +72,7 @@ const complete: DueMilestone = {
         resultPointer: "results/codex-result.txt",
         evidencePointer: "evidence/codex-evidence.json",
         checkpointPointer: "checkpoints/codex.md",
+        checkpointOrigin: "agent",
       },
     ],
   },
@@ -249,6 +250,38 @@ describe("renderMilestone", () => {
 - **Result:** \`results/codex-result.txt\`
 - **Evidence:** \`evidence/codex-evidence.json\`
 `);
+  });
+
+  test("never publishes a runtime derivation as an Agent claim", () => {
+    const derived: DueMilestone = {
+      ...complete,
+      payload: {
+        ...complete.payload,
+        lanes: complete.payload.lanes.map((lane) => ({
+          ...lane,
+          checkpointOrigin: "runtime" as const,
+        })),
+      },
+    };
+    const body = renderMilestone(derived, notApplicable);
+    expect(body).toContain("#### Runtime-derived checkpoint (no Agent claim)");
+    expect(body).not.toContain("#### Agent checkpoint claim");
+  });
+
+  test("says a lost result was not produced instead of pointing at nothing", () => {
+    const lost: DueMilestone = {
+      ...complete,
+      payload: {
+        ...complete.payload,
+        lanes: complete.payload.lanes.map((lane) => ({
+          ...lane,
+          resultPointer: null,
+        })),
+      },
+    };
+    const body = renderMilestone(lost, notApplicable);
+    expect(body).toContain("- **Result:** not produced");
+    expect(body).not.toContain("results/codex-result.txt");
   });
 
   test("renders the owner decision exactly without implying enactment", () => {

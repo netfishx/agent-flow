@@ -8,8 +8,7 @@
 //   - the sentinel carries the CLI's real exit code (SIGINT included).
 
 import { shellSingleQuote } from "../herdr/argv.ts";
-
-export type ReviewAgentKind = "claude" | "codex" | "grok";
+import type { ReviewAgentKind } from "./types.ts";
 
 export interface AgentLaneCommandInput {
   readonly runId: string;

@@ -49,9 +49,15 @@ export interface CompleteLanePayload {
   readonly contractErrors: readonly string[];
   readonly verificationState: VerificationState;
   readonly gaps: readonly string[];
-  readonly resultPointer: string;
+  /** Null when no result artifact was ever produced for this lane. */
+  readonly resultPointer: string | null;
   readonly evidencePointer: string;
   readonly checkpointPointer: string | null;
+  /**
+   * Who authored the checkpoint this payload reports. A record the runtime
+   * derived must never be published as the Agent's own claim.
+   */
+  readonly checkpointOrigin: "agent" | "runtime" | null;
 }
 
 export interface CompletePayload {
@@ -281,9 +287,6 @@ function completeMilestone(run: RunView): DueMilestone | null {
       },
       lanes: run.laneOrder.map((laneId) => {
         const lane = run.lanes[laneId]!;
-        if (lane.resultFile === null) {
-          throw new Error(`resultPointer for lane "${laneId}" is missing`);
-        }
         if (lane.evidenceFile === null) {
           throw new Error(`evidencePointer for lane "${laneId}" is missing`);
         }
@@ -298,12 +301,12 @@ function completeMilestone(run: RunView): DueMilestone | null {
           contractErrors: [...lane.contractErrors],
           verificationState: lane.verificationState,
           gaps: [],
-          resultPointer: pointerFor(
-            run,
-            laneId,
-            "resultPointer",
-            lane.resultFile,
-          ),
+          checkpointOrigin: lane.checkpointOrigin,
+          // A path is published only when the artifact behind it exists.
+          resultPointer:
+            lane.resultFile === null
+              ? null
+              : pointerFor(run, laneId, "resultPointer", lane.resultFile),
           evidencePointer: pointerFor(
             run,
             laneId,

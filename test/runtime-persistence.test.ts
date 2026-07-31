@@ -744,7 +744,7 @@ describe("persisted terminal lane facts", () => {
     ]);
   });
 
-  test("a failed fact append does not block run_finished and holds the lease until retry", async () => {
+  test("a failed fact append blocks run_finished and holds the lease until retry", async () => {
     const { ledgerRoot, cwd } = await directories();
     const clock = createClock(6_000);
     const adapter = new FakeHerdrAdapter({
@@ -771,9 +771,11 @@ describe("persisted terminal lane facts", () => {
     await expect(runtime.awaitLane(handle.runId, "lane-1", 1_000)).rejects.toThrow(
       /contract append failure/,
     );
-    const finishedWithoutFacts = await durable.load(handle.runId);
-    expect(finishedWithoutFacts!.finishStatus).toBe("clean");
-    expect(finishedWithoutFacts!.lanes["lane-1"]).toMatchObject({
+    // The run may NOT finish while a lane's terminal facts are missing: a
+    // finish status computed ahead of the facts cannot reflect them.
+    const beforeFacts = await durable.load(handle.runId);
+    expect(beforeFacts!.finishStatus).toBeNull();
+    expect(beforeFacts!.lanes["lane-1"]).toMatchObject({
       contractState: "unknown",
       verificationState: "unverified",
     });
@@ -799,8 +801,12 @@ describe("persisted terminal lane facts", () => {
       .trim()
       .split("\n")
       .map((line) => (JSON.parse(line) as RunEvent).type);
-    expect(types.indexOf("run_finished")).toBeLessThan(
-      types.indexOf("lane_contract_evaluated"),
+    // Facts first, then the finish: the ordering the ledger must always show.
+    expect(types.indexOf("lane_contract_evaluated")).toBeLessThan(
+      types.indexOf("run_finished"),
+    );
+    expect(types.indexOf("lane_verification_recorded")).toBeLessThan(
+      types.indexOf("run_finished"),
     );
     const reacquired = await new FsLedger(ledgerRoot).acquireLease(handle.runId, {
       controllerId: "after-facts",
@@ -809,7 +815,7 @@ describe("persisted terminal lane facts", () => {
     await reacquired.release();
   });
 
-  test("runtime-terminal siblings finish even while one lane lacks durable facts", async () => {
+  test("one lane's missing durable facts hold the whole run back from finishing", async () => {
     const { ledgerRoot, cwd } = await directories();
     const clock = createClock(7_000);
     const adapter = new FakeHerdrAdapter({
@@ -851,10 +857,13 @@ describe("persisted terminal lane facts", () => {
       .trim()
       .split("\n")
       .map((line) => (JSON.parse(line) as RunEvent).type);
-    expect(committedTypes).toContain("run_finished");
-    expect((await durable.load(handle.runId))!.finishStatus).toBe("clean");
-    expect(runtime.currentView(handle.runId).finishStatus).toBe("clean");
+    // Both lanes are runtime-terminal, yet one lacks its durable facts, so the
+    // run stays open rather than publishing a status it cannot support.
+    expect(committedTypes).not.toContain("run_finished");
+    expect((await durable.load(handle.runId))!.finishStatus).toBeNull();
+    expect(runtime.currentView(handle.runId).finishStatus).toBeNull();
 
+    // The retry lands the missing facts, and only then does the run finish.
     await runtime.awaitLane(handle.runId, "missing-fact", 1_000);
 
     const completedTypes = (await readFile(eventFile, "utf8"))
@@ -863,7 +872,7 @@ describe("persisted terminal lane facts", () => {
       .map((line) => (JSON.parse(line) as RunEvent).type);
     expect(completedTypes.filter((type) => type === "run_finished")).toHaveLength(1);
     expect((await durable.load(handle.runId))!.finishStatus).toBe("clean");
-    expect(completedTypes.lastIndexOf("lane_verification_recorded")).toBeGreaterThan(
+    expect(completedTypes.lastIndexOf("lane_verification_recorded")).toBeLessThan(
       completedTypes.indexOf("run_finished"),
     );
   });
@@ -966,13 +975,14 @@ describe("persisted terminal lane facts", () => {
       (event) => event.type === "run_finished",
     );
     expect(runFinishedIndex).toBeGreaterThan(-1);
+    // The rejected lane's facts precede the finish, like every other lane's.
     expect(
       events.findIndex(
         (event) =>
           event.type === "lane_contract_evaluated" &&
           event.laneId === "rejected",
       ),
-    ).toBeGreaterThan(runFinishedIndex);
+    ).toBeLessThan(runFinishedIndex);
   });
 
   test("run and lane path segments prevent hyphen-boundary artifact collisions", async () => {

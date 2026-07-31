@@ -8,12 +8,9 @@ import type { Ledger } from "./ledger.ts";
 import type { FixedPoint, IssueRef } from "./events.ts";
 import type { RunState as ProjectedRunState } from "./reducer.ts";
 import type { BundleSourceFile } from "../review/bundle.ts";
-import type { ReviewAxis } from "../review/brief.ts";
-import type {
-  AgentLaneCommandInput,
-  ReviewAgentKind,
-} from "../review/commands.ts";
+import type { AgentLaneCommandInput } from "../review/commands.ts";
 import type { ReviewIsolationPort } from "../review/isolation.ts";
+import type { ReviewAgentKind, ReviewAxis } from "../review/types.ts";
 
 export type LaneState =
   | "starting"

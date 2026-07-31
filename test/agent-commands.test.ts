@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
+// Command builders emit sentinels and shell quoting, so they stay out of the
+// package entry (see src/index.ts). Their tests import them by internal path,
+// exactly as test/argv.test.ts does for the simulated lane's builder.
 import {
   buildAgentCliArgv,
   buildAgentLaneCommand,
   type AgentLaneCommandInput,
-} from "../src/index.ts";
+} from "../src/review/commands.ts";
 import { scanSingleQuoted } from "../src/testing.ts";
 
 function input(

@@ -3,10 +3,8 @@
 // git.
 
 import type { FixedPoint } from "../runtime/events.ts";
-import type {
-  ReviewIsolationPort,
-  WorktreeVerification,
-} from "./isolation.ts";
+import type { ReviewIsolationPort } from "./isolation.ts";
+import type { WorktreeVerification } from "./types.ts";
 
 const PASS: WorktreeVerification = {
   headOk: true,

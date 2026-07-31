@@ -364,8 +364,9 @@ describe("agent lane completion", () => {
     expect(lane.semanticState).toBe("partial");
     // Contract quality never re-dispatches: exactly one dispatch happened.
     expect(fake.dispatched).toHaveLength(1);
-    // Exit codes stay runtime truth: the run itself finished clean.
-    expect(run.finishStatus).toBe("clean");
+    // Exit codes stay runtime truth, but a violated contract costs the run its
+    // `clean`: the status a reader trusts must never overstate the evidence.
+    expect(run.finishStatus).toBe("degraded");
   });
 
   test("a lost raw report keeps the failure pointed at the raw artifact", async () => {
@@ -382,7 +383,8 @@ describe("agent lane completion", () => {
       agentLane("claude-spec", "claude", "spec"),
     ]);
     await runtime.awaitLane(handle.runId, "claude-spec", 60_000);
-    const lane = (await ledger.load(handle.runId))!.lanes["claude-spec"]!;
+    const run = (await ledger.load(handle.runId))!;
+    const lane = run.lanes["claude-spec"]!;
     expect(lane.contractState).toBe("violated");
     expect(lane.contractErrors[0]).toContain("raw report unavailable");
     expect(lane.contractErrors[0]).toContain("claude-spec.raw");
@@ -391,6 +393,228 @@ describe("agent lane completion", () => {
       kind: "measured",
       id: "00000000-0000-4000-8000-000000000001",
     });
+    // The loss is an objective runner fact, not only a contract complaint.
+    expect(lane.rawReportOutcome).toBe("missing");
+    // A run that lost a reviewer's report is never recorded as clean, and it
+    // never publishes a pointer to a result file that was never written.
+    expect(run.finishStatus).toBe("degraded");
+    expect(lane.resultFile).toBeNull();
+    // The forensic worktree is kept, and the ledger says why.
+    expect(lane.worktreeDisposition).toMatchObject({
+      disposition: "retained",
+    });
+    expect(lane.worktreeDisposition!.retainedReason).toContain(
+      "raw report was not captured",
+    );
+  });
+});
+
+describe("terminal records and checkpoint authorship", () => {
+  const recordOf = async (
+    cwd: string,
+    runId: string,
+    laneId: string,
+  ): Promise<string> =>
+    readFile(join(cwd, runId, "checkpoints", `${laneId}.md`), "utf8");
+
+  test("a derived record is committed by the runtime, never as the Agent", async () => {
+    const { runtime, ledger, cwd } = await setup({
+      lanes: [
+        {
+          laneId: "grok-spec",
+          exitCode: 0,
+          rawReport: VALID_REPORT,
+        },
+      ],
+    });
+    const handle = await start(runtime, cwd, [
+      agentLane("grok-spec", "grok", "spec"),
+    ]);
+    await runtime.awaitLane(handle.runId, "grok-spec", 60_000);
+
+    const checkpoints = ledger.events.filter(
+      (event) => event.type === "lane_checkpoint",
+    );
+    expect(checkpoints).toHaveLength(1);
+    // The ledger's actor is the machine-readable authorship record.
+    expect(checkpoints[0]!.actor).toBe("runtime");
+    const lane = (await ledger.load(handle.runId))!.lanes["grok-spec"]!;
+    expect(lane.checkpointOrigin).toBe("runtime");
+    // The file says so too, and claims no verification of its own.
+    const record = await recordOf(cwd, handle.runId, "grok-spec");
+    expect(record).toContain("PHASE: runtime-derived-terminal-record");
+    expect(record).toContain("VERIFICATION_CLAIMS:\n- none");
+    // It invents no reviewer judgement.
+    expect(record).not.toContain("VERDICT");
+    expect(record).not.toContain("FINDINGS:");
+  });
+
+  test("a simulated lane's own checkpoint stays attributed to the Agent", async () => {
+    const { runtime, ledger, cwd } = await setup({
+      lanes: [{ laneId: "sim", exitCode: 0 }],
+    });
+    const handle = await runtime.startWorkflow({
+      workflow: "review",
+      workspace: "w1",
+      cwd,
+      lanes: [{ laneId: "sim", steps: 1, stepDelaySeconds: 0.01 }],
+    });
+    await runtime.awaitLane(handle.runId, "sim", 60_000);
+    const checkpoints = ledger.events.filter(
+      (event) => event.type === "lane_checkpoint",
+    );
+    expect(checkpoints).toHaveLength(1);
+    expect(checkpoints[0]!.actor).toBe("agent");
+    expect(
+      (await ledger.load(handle.runId))!.lanes["sim"]!.checkpointOrigin,
+    ).toBe("agent");
+  });
+
+  test("an interrupted lane that exits 1 still records an honest terminal record", async () => {
+    // Exit 130 is NOT the trigger: real CLIs catch SIGINT and exit their own way.
+    const { runtime, ledger, cwd } = await setup({
+      lanes: [
+        {
+          laneId: "codex-spec",
+          exitCode: 0,
+          interruptExitCode: 1,
+          rawReport: VALID_REPORT,
+        },
+      ],
+    });
+    const handle = await start(runtime, cwd, [
+      agentLane("codex-spec", "codex", "spec"),
+    ]);
+    await runtime.confirmLaneStarted(handle.runId, "codex-spec");
+    await runtime.interruptLane(handle.runId, "codex-spec");
+    await runtime.awaitLane(handle.runId, "codex-spec", 60_000);
+
+    const run = (await ledger.load(handle.runId))!;
+    const lane = run.lanes["codex-spec"]!;
+    expect(lane.exitCode).toBe(1);
+    expect(lane.semanticState).toBe("partial");
+    expect(lane.checkpointOrigin).toBe("runtime");
+    const record = await recordOf(cwd, handle.runId, "codex-spec");
+    expect(record).toContain("STATUS: partial");
+    expect(record).toContain("interrupted by SIGINT; the CLI exited 1");
+    expect(run.finishStatus).toBe("degraded");
+  });
+
+  test("a crashed lane records a terminal record naming the missing sentinel", async () => {
+    const { runtime, ledger, cwd } = await setup({
+      lanes: [
+        {
+          laneId: "claude-spec",
+          exitCode: 0,
+          emitSentinel: false,
+          extraOutput: ["thinking out loud"],
+          rawReport: VALID_REPORT,
+        },
+      ],
+    });
+    const handle = await start(runtime, cwd, [
+      agentLane("claude-spec", "claude", "spec"),
+    ]);
+    await runtime.confirmLaneStarted(handle.runId, "claude-spec");
+    await expect(
+      runtime.awaitLane(handle.runId, "claude-spec", 1_000),
+    ).rejects.toThrow(/no sentinel/);
+
+    const lane = (await ledger.load(handle.runId))!.lanes["claude-spec"]!;
+    expect(lane.runtimeState).toBe("crashed");
+    expect(lane.semanticState).toBe("partial");
+    expect(lane.checkpointOrigin).toBe("runtime");
+    const record = await recordOf(cwd, handle.runId, "claude-spec");
+    expect(record).toContain("the lane process is gone");
+    expect(record).toContain("no completion sentinel");
+  });
+
+  test("a lost lane records a terminal record naming the loss", async () => {
+    const { runtime, ledger, cwd } = await setup({
+      lanes: [
+        { laneId: "grok-standards", exitCode: 0, emitSentinel: false },
+      ],
+    });
+    const handle = await start(runtime, cwd, [
+      agentLane("grok-standards", "grok", "standards"),
+    ]);
+    await expect(
+      runtime.awaitLane(handle.runId, "grok-standards", 1_000),
+    ).rejects.toThrow(/lost/i);
+
+    const lane = (await ledger.load(handle.runId))!.lanes["grok-standards"]!;
+    expect(lane.runtimeState).toBe("lost");
+    expect(lane.semanticState).toBe("partial");
+    const record = await recordOf(cwd, handle.runId, "grok-standards");
+    expect(record).toContain("the lane was lost before it could report");
+    expect(record).toContain("dispatch-outcome-unknown");
+  });
+});
+
+describe("review worktree disposition", () => {
+  test("a clean lane releases its worktree and records the release", async () => {
+    const { runtime, ledger, isolation, cwd } = await setup({
+      lanes: [
+        { laneId: "codex-standards", exitCode: 0, rawReport: VALID_REPORT },
+      ],
+    });
+    const handle = await start(runtime, cwd, [
+      agentLane("codex-standards", "codex", "standards"),
+    ]);
+    await runtime.awaitLane(handle.runId, "codex-standards", 60_000);
+
+    const lane = (await ledger.load(handle.runId))!.lanes["codex-standards"]!;
+    expect(lane.worktreePath).not.toBeNull();
+    expect(isolation.removed.map((entry) => entry.path)).toEqual([
+      lane.worktreePath!,
+    ]);
+    expect(lane.worktreeDisposition).toMatchObject({
+      disposition: "removed",
+      retainedReason: null,
+    });
+  });
+
+  // Retention on a failed post-flight is asserted where that scenario is
+  // already built, in "isolation outcomes" below.
+});
+
+describe("run finish ordering", () => {
+  test("every per-lane terminal fact precedes run_finished", async () => {
+    const { runtime, ledger, cwd } = await setup({
+      lanes: [
+        {
+          laneId: "claude-spec",
+          exitCode: 0,
+          rawReport: claudeRaw(
+            VALID_REPORT,
+            "00000000-0000-4000-8000-000000000001",
+          ),
+        },
+        { laneId: "grok-spec", exitCode: 0, rawReport: VALID_REPORT },
+      ],
+    });
+    const handle = await start(runtime, cwd, [
+      agentLane("claude-spec", "claude", "spec"),
+      agentLane("grok-spec", "grok", "spec"),
+    ]);
+    for (const laneId of handle.laneIds) {
+      await runtime.awaitLane(handle.runId, laneId, 60_000);
+    }
+    const types = ledger.events.map((event) => event.type);
+    const finish = types.indexOf("run_finished");
+    expect(finish).toBeGreaterThan(-1);
+    // Nothing a finish status depends on may appear after the finish.
+    for (const factType of [
+      "lane_exited",
+      "lane_isolation_verified",
+      "lane_checkpoint",
+      "lane_session_recorded",
+      "lane_contract_evaluated",
+      "lane_verification_recorded",
+    ] as const) {
+      expect(types.lastIndexOf(factType)).toBeLessThan(finish);
+    }
+    expect((await ledger.load(handle.runId))!.finishStatus).toBe("clean");
   });
 });
 
@@ -455,6 +679,16 @@ describe("isolation outcomes", () => {
     });
     expect(run.finishStatus).toBe("invalid");
     expect(isolation.removed).toEqual([]);
+    // Retention is a recorded fact with a stated reason, not a silent absence,
+    // so resume and inspect can both see the forensic worktree being held.
+    const lane = run.lanes["claude-standards"]!;
+    expect(lane.worktreeDisposition).toMatchObject({
+      disposition: "retained",
+      worktreePath: worktree,
+    });
+    expect(lane.worktreeDisposition!.retainedReason).toContain(
+      "post-flight isolation verification failed",
+    );
   });
 
   test("a failed pre-flight never dispatches that lane; others proceed", async () => {

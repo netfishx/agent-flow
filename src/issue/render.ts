@@ -154,7 +154,12 @@ function renderComplete(
       }`,
       `- **Signal:** ${lane.signal === null ? "none" : code(lane.signal)}`,
       "",
-      "#### Agent checkpoint claim",
+      // A checkpoint the runtime derived from a lane's own bytes is published
+      // as exactly that. Only an Agent-written checkpoint is a claim the Agent
+      // made, and the public heading must not blur the two.
+      lane.checkpointOrigin === "runtime"
+        ? "#### Runtime-derived checkpoint (no Agent claim)"
+        : "#### Agent checkpoint claim",
       "",
       `- **Semantic state:** ${code(lane.semanticState)}`,
       ...(lane.gaps.length === 0
@@ -176,7 +181,11 @@ function renderComplete(
             "- **Contract errors:**",
             ...lane.contractErrors.map((error) => `  - ${text(error)}`),
           ]),
-      `- **Result:** ${code(lane.resultPointer)}`,
+      `- **Result:** ${
+        lane.resultPointer === null
+          ? "not produced"
+          : code(lane.resultPointer)
+      }`,
       `- **Evidence:** ${code(lane.evidencePointer)}`,
     );
   }

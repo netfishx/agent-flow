@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { reviewSmokeGate } from "../src/smoke/review-gate.ts";
+import {
+  formalOverrideRefusal,
+  issueTargetMatchesOrigin,
+  readInterruptEvidence,
+  reviewSmokeGate,
+} from "../src/smoke/review-gate.ts";
 
 const AUTHORIZED = {
   FLOW_SMOKE_REVIEW: "1",
@@ -66,5 +71,81 @@ describe("reviewSmokeGate", () => {
       target: { owner: "netfishx", repo: "agent-flow", number: 7 },
       authorizationStatement: AUTHORIZED.FLOW_SMOKE_OWNER_AUTHORIZATION,
     });
+  });
+});
+
+describe("formal run target pinning", () => {
+  // A formal run reviews the branch tip against its merge-base, in the
+  // repository under review. Letting an environment variable redirect any of
+  // those would produce evidence that looked correct about the wrong tree.
+  test.each([
+    "FLOW_REVIEW_REPO_ROOT",
+    "FLOW_REVIEW_HEAD",
+    "FLOW_REVIEW_BASE",
+    "FLOW_REVIEW_FAMILIES",
+  ])("refuses a formal run that overrides %s", (key) => {
+    expect(formalOverrideRefusal({ [key]: "anything" })).toBe(
+      `${key} may not be set for a formal run`,
+    );
+  });
+
+  test("accepts an environment that overrides none of them", () => {
+    expect(formalOverrideRefusal({ FLOW_REVIEW_MODE: "formal" })).toBeNull();
+    // An empty value is not an override.
+    expect(formalOverrideRefusal({ FLOW_REVIEW_HEAD: "" })).toBeNull();
+  });
+
+  test("binds only to an issue in the repository under review", () => {
+    const target = { owner: "netfishx", repo: "agent-flow", number: 7 };
+    for (const origin of [
+      "https://github.com/netfishx/agent-flow.git\n",
+      "git@github.com:netfishx/agent-flow.git",
+      "https://github.com/netfishx/agent-flow",
+    ]) {
+      expect(issueTargetMatchesOrigin(target, origin)).toBeTrue();
+    }
+    for (const origin of [
+      "https://github.com/someone-else/agent-flow.git",
+      "https://github.com/netfishx/other-repo.git",
+      "not-a-remote",
+    ]) {
+      expect(issueTargetMatchesOrigin(target, origin)).toBeFalse();
+    }
+  });
+});
+
+describe("readInterruptEvidence", () => {
+  const valid = JSON.stringify({
+    laneId: "codex-spec",
+    signal: "SIGINT",
+    delivered: true,
+  });
+
+  test("accepts objective evidence for the interrupted lane", () => {
+    expect(readInterruptEvidence(valid, "codex-spec")).toEqual({
+      ok: true,
+      evidence: { laneId: "codex-spec", signal: "SIGINT", delivered: true },
+    });
+  });
+
+  // Losing the evidence must fail the rehearsal with a stated reason. Turning
+  // it into a silent null would leave the verdict looking clean.
+  test.each([
+    [null, "missing or unreadable"],
+    ["", "empty"],
+    ["  ", "empty"],
+    ["{not json", "not valid JSON"],
+    ["null", "not an object"],
+    ["[]", 'names lane undefined'],
+    [JSON.stringify({ laneId: "other", signal: "SIGINT", delivered: true }), "expected"],
+    [JSON.stringify({ laneId: "codex-spec", delivered: true }), "carries no signal"],
+    [
+      JSON.stringify({ laneId: "codex-spec", signal: "SIGINT", delivered: false }),
+      "does not record delivery",
+    ],
+  ])("refuses %p", (raw, fragment) => {
+    const read = readInterruptEvidence(raw as string | null, "codex-spec");
+    expect(read.ok).toBeFalse();
+    expect(read.ok === false ? read.reason : "").toContain(fragment as string);
   });
 });

@@ -3,15 +3,6 @@
 // id parsed from that lane's own captured output. Scanning session directories
 // for the newest file is forbidden — concurrent lanes would cross-attribute.
 
-export type SessionIdentity =
-  | {
-      readonly kind: "measured";
-      readonly id: string;
-      /** What ties this id to this specific lane process. */
-      readonly evidence: string;
-    }
-  | { readonly kind: "unavailable"; readonly reason: string };
-
 const CODEX_SESSION_LINE = /^session id: ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*$/m;
 const CODEX_TOKENS_LINE = /^tokens used\r?\n([\d,]+)\s*$/m;
 

@@ -4,14 +4,14 @@
 // identity, and token counts are derived copies — never rewrites. A
 // derivation failure loses nothing: errors point back at the raw artifact.
 
+import type { RawReportOutcome } from "../runtime/events.ts";
 import { extractClaudeReport } from "./claude-stream.ts";
-import type { ReviewAgentKind } from "./commands.ts";
 import { validateReportContract } from "./contract.ts";
-import {
-  parseCodexSessionId,
-  parseCodexTokensUsed,
-  type SessionIdentity,
-} from "./session.ts";
+import { parseCodexSessionId, parseCodexTokensUsed } from "./session.ts";
+import type { ReviewAgentKind, SessionIdentity } from "./types.ts";
+
+/** How a lane reached its terminal state, as the runtime observed it. */
+export type LaneTermination = "exited" | "crashed" | "lost";
 
 export interface AgentLaneCapture {
   readonly agentKind: ReviewAgentKind;
@@ -22,8 +22,13 @@ export interface AgentLaneCapture {
   /** The lane's durable stderr bytes, or null when unreadable. */
   readonly stderr: string | null;
   readonly preassignedSessionId: string | null;
-  /** The exit code parsed from the sentinel; null when the lane crashed. */
+  /** The exit code parsed from the sentinel; null when there was none. */
   readonly exitCode: number | null;
+  readonly termination: LaneTermination;
+  /** Whether a human interrupt was recorded against this lane. */
+  readonly interrupted: boolean;
+  /** Terminal context such as the lost cause; null when there is none. */
+  readonly terminationDetail: string | null;
 }
 
 export interface LaneTokenFacts {
@@ -43,10 +48,16 @@ export interface AgentLaneDerivation {
   readonly reportText: string | null;
   /** Contract and derivation errors; empty means the contract is satisfied. */
   readonly contractErrors: readonly string[];
-  /** Derived checkpoint markdown; null leaves the semantic dimension unknown. */
-  readonly checkpointText: string | null;
+  /**
+   * The runtime-derived terminal record. Every lane that ran gets one, whatever
+   * its terminal state, and the text says plainly that the runtime wrote it.
+   */
+  readonly checkpointText: string;
+  readonly checkpointStatus: "complete" | "partial";
   readonly session: SessionIdentity;
   readonly tokens: LaneTokens;
+  /** The runner's objective fact about the raw artifact. */
+  readonly rawOutcome: RawReportOutcome;
 }
 
 function deriveReport(capture: AgentLaneCapture): {
@@ -54,6 +65,7 @@ function deriveReport(capture: AgentLaneCapture): {
   errors: string[];
   sessionEcho: string | null;
   tokens: LaneTokens;
+  rawOutcome: RawReportOutcome;
 } {
   if (capture.raw === null) {
     return {
@@ -61,6 +73,7 @@ function deriveReport(capture: AgentLaneCapture): {
       errors: [`raw report unavailable: ${capture.rawPath}`],
       sessionEcho: null,
       tokens: { unavailable: "raw report unavailable" },
+      rawOutcome: "missing",
     };
   }
   if (capture.agentKind === "claude") {
@@ -71,12 +84,14 @@ function deriveReport(capture: AgentLaneCapture): {
         errors: [`${extraction.error} (raw artifact: ${capture.rawPath})`],
         sessionEcho: null,
         tokens: { unavailable: "raw stream not derivable" },
+        rawOutcome: "underivable",
       };
     }
     return {
       reportText: extraction.reportText,
       errors: [],
       sessionEcho: extraction.sessionId,
+      rawOutcome: "captured",
       tokens:
         extraction.tokens === null
           ? { unavailable: "result event carried no usage" }
@@ -96,6 +111,7 @@ function deriveReport(capture: AgentLaneCapture): {
       reportText: capture.raw,
       errors: [],
       sessionEcho: null,
+      rawOutcome: "captured",
       tokens:
         tokens === null
           ? {
@@ -116,6 +132,7 @@ function deriveReport(capture: AgentLaneCapture): {
     reportText: capture.raw,
     errors: [],
     sessionEcho: null,
+    rawOutcome: "captured",
     tokens: { unavailable: "grok plain output carries no token counts" },
   };
 }
@@ -179,33 +196,78 @@ function deriveSession(
   }
 }
 
-function checkpoint(
-  status: "complete" | "partial",
-  blockers: string,
-  gaps: readonly string[],
-  artifacts: readonly string[],
-): string {
-  const gapLines =
-    gaps.length === 0 ? "- none" : gaps.map((gap) => `- ${gap}`).join("\n");
-  const artifactLines = artifacts.map((path) => `- ${path}`).join("\n");
-  // This file is a mechanical projection of the lane's raw report, written by
-  // the runtime — it must never impersonate the Agent's own voice or claim
-  // verification (runner evidence and contract events own those dimensions).
-  return `STATUS: ${status}
-PHASE: derived-from-raw-report
+/**
+ * The runtime-derived terminal record. It is NOT the Agent's voice: the phase
+ * names its mechanical origin, it claims no verification, and it never invents
+ * a verdict, a finding, or a semantic claim the lane's own bytes do not carry.
+ * The raw artifact is listed whatever became of it, so a lost report stays a
+ * recorded fact rather than an absence.
+ */
+function terminalRecord(input: {
+  readonly status: "complete" | "partial";
+  readonly completed: string;
+  readonly blockers: readonly string[];
+  readonly gaps: readonly string[];
+  readonly rawPath: string;
+  readonly rawOutcome: RawReportOutcome;
+}): string {
+  const list = (items: readonly string[]): string =>
+    items.length === 0 ? "- none" : items.map((item) => `- ${item}`).join("\n");
+  const rawNote =
+    input.rawOutcome === "captured"
+      ? ""
+      : input.rawOutcome === "missing"
+        ? " (not produced)"
+        : " (present, but no report text could be derived from it)";
+  return `STATUS: ${input.status}
+PHASE: runtime-derived-terminal-record
 COMPLETED:
-- derived mechanically from the lane's raw report
+- ${input.completed}
 NEXT:
 - none
 BLOCKERS:
-${blockers}
+${list(input.blockers)}
 ARTIFACTS:
-${artifactLines}
+- ${input.rawPath}${rawNote}
 VERIFICATION_CLAIMS:
 - none
 GAPS:
-${gapLines}
+${list(input.gaps)}
 `;
+}
+
+function exitedRecord(
+  capture: AgentLaneCapture,
+  contractErrors: readonly string[],
+): { status: "complete" | "partial"; completed: string; blockers: string[] } {
+  if (capture.exitCode === 0) {
+    return contractErrors.length === 0
+      ? {
+          status: "complete",
+          completed: "the lane exited 0 and its report satisfied the contract",
+          blockers: [],
+        }
+      : {
+          status: "partial",
+          completed:
+            "the lane exited 0; its report did not satisfy the contract",
+          blockers: [],
+        };
+  }
+  const code = capture.exitCode === null ? "an unknown code" : `${capture.exitCode}`;
+  // A CLI may catch SIGINT and exit with its own status, so the interrupt fact
+  // comes from the ledger, never from guessing at the exit code.
+  return capture.interrupted
+    ? {
+        status: "partial",
+        completed: `the lane was interrupted and exited ${code}`,
+        blockers: [`interrupted by SIGINT; the CLI exited ${code}`],
+      }
+    : {
+        status: "partial",
+        completed: `the lane exited ${code}`,
+        blockers: [`the CLI exited ${code}`],
+      };
 }
 
 /** Derive every post-exit fact of an agent lane from its captured bytes. */
@@ -220,27 +282,43 @@ export function deriveAgentLaneFacts(
     );
   }
 
-  let checkpointText: string | null = null;
-  const artifacts = [capture.rawPath];
-  if (capture.exitCode === 0) {
-    checkpointText =
-      contractErrors.length === 0
-        ? checkpoint("complete", "- none", [], artifacts)
-        : checkpoint("partial", "- none", contractErrors, artifacts);
-  } else if (capture.exitCode === 130) {
-    checkpointText = checkpoint(
-      "partial",
-      "- interrupted by SIGINT",
-      contractErrors,
-      artifacts,
-    );
-  }
+  // Every terminal state gets an honest record. Exit code 130 is not a
+  // precondition: real CLIs catch SIGINT and exit with codes of their own,
+  // and a crashed or lost lane still owes the ledger a terminal record.
+  const outcome =
+    capture.termination === "exited"
+      ? exitedRecord(capture, contractErrors)
+      : capture.termination === "crashed"
+        ? {
+            status: "partial" as const,
+            completed: "the lane process is gone",
+            blockers: [
+              capture.terminationDetail ??
+                "no completion sentinel was found in the lane's durable log",
+            ],
+          }
+        : {
+            status: "partial" as const,
+            completed: "the lane was lost before it could report",
+            blockers: [
+              `lane lost: ${capture.terminationDetail ?? "cause unrecorded"}`,
+            ],
+          };
 
   return {
     reportText: report.reportText,
     contractErrors,
-    checkpointText,
+    checkpointStatus: outcome.status,
+    checkpointText: terminalRecord({
+      status: outcome.status,
+      completed: outcome.completed,
+      blockers: outcome.blockers,
+      gaps: contractErrors,
+      rawPath: capture.rawPath,
+      rawOutcome: report.rawOutcome,
+    }),
     session: deriveSession(capture, report.sessionEcho),
     tokens: report.tokens,
+    rawOutcome: report.rawOutcome,
   };
 }

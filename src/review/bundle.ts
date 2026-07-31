@@ -5,28 +5,17 @@
 
 import { createHash } from "node:crypto";
 import { canonicalJson } from "../issue/hash.ts";
-
-export type BundleFileRole = "issue" | "spec" | "standards";
+import type {
+  BundleFileRecord,
+  BundleFileRole,
+  InputBundleManifest,
+} from "./types.ts";
 
 export interface BundleSourceFile {
   /** Logical artifact path, e.g. "bundle/issue-7.md". */
   readonly path: string;
   readonly role: BundleFileRole;
   readonly content: string;
-}
-
-export interface BundleFileRecord {
-  readonly path: string;
-  readonly role: BundleFileRole;
-  /** SHA-256 hex of the ORIGINAL (un-numbered) content. */
-  readonly sha256: string;
-  readonly lines: number;
-}
-
-export interface InputBundleManifest {
-  readonly files: readonly BundleFileRecord[];
-  /** SHA-256 hex over the canonical JSON of `files`, sorted by path. */
-  readonly bundleHash: string;
 }
 
 export interface BundleArtifact {

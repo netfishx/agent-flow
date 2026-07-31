@@ -5,9 +5,7 @@
 
 import type { AssembledInputBundle, BundleArtifact } from "./bundle.ts";
 import { REPORT_CONTRACT_BLOCK } from "./contract.ts";
-import type { ReviewAgentKind } from "./commands.ts";
-
-export type ReviewAxis = "standards" | "spec";
+import type { ReviewAgentKind, ReviewAxis } from "./types.ts";
 
 export interface BriefInput {
   readonly axis: ReviewAxis;

@@ -118,6 +118,9 @@ function canonicalPayload(payload: MilestonePayload): unknown {
         resultPointer: lane.resultPointer,
         evidencePointer: lane.evidencePointer,
         checkpointPointer: lane.checkpointPointer,
+        // Who authored the checkpoint changes the rendered public claim, so it
+        // is part of the payload's identity: a changed attribution is drift.
+        checkpointOrigin: lane.checkpointOrigin,
       })),
     };
   }

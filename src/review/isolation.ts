@@ -5,21 +5,11 @@
 
 import { createHash } from "node:crypto";
 import type { FixedPoint } from "../runtime/events.ts";
-
-export interface WorktreeVerification {
-  readonly headOk: boolean;
-  readonly cleanOk: boolean;
-  readonly diffHashOk: boolean;
-  /** Failure context; null when every check passed. */
-  readonly detail: string | null;
-}
-
-export interface CaptureFixedPointInput {
-  readonly repoRoot: string;
-  readonly baseRef: string;
-  readonly headRef: string;
-  readonly dirtyStatePolicy: "reject" | "record-hash";
-}
+import type {
+  CaptureFixedPointInput,
+  WorktreeVerification,
+} from "./types.ts";
+import { failedVerification } from "./verification.ts";
 
 export interface ReviewIsolationPort {
   /** Create a detached, disposable worktree at the captured head. */
@@ -40,22 +30,6 @@ export interface ReviewIsolationPort {
     readonly repoRoot: string;
     readonly path: string;
   }): Promise<void>;
-}
-
-/** The one shared pass predicate for any isolation-verification shape. */
-export function verificationPassed(verification: {
-  readonly headOk: boolean;
-  readonly cleanOk: boolean;
-  readonly diffHashOk: boolean;
-}): boolean {
-  return (
-    verification.headOk && verification.cleanOk && verification.diffHashOk
-  );
-}
-
-/** A verification that proves nothing — the fail-closed outcome. */
-export function failedVerification(detail: string): WorktreeVerification {
-  return { headOk: false, cleanOk: false, diffHashOk: false, detail };
 }
 
 interface GitRunner {

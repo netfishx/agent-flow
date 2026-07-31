@@ -29,11 +29,19 @@ import type {
   AgentLaneSpec,
   RuntimeDeps,
 } from "../runtime/types.ts";
-import { reviewSmokeGate, type ReviewSmokeMode } from "./review-gate.ts";
+import type { ReviewAgentKind } from "../review/types.ts";
+import {
+  formalOverrideRefusal,
+  issueTargetMatchesOrigin,
+  readInterruptEvidence,
+  reviewSmokeGate,
+  type ReviewSmokeMode,
+} from "./review-gate.ts";
 
 const REHEARSAL_HEAD = "d932c71fe8899d7fc589c96918813b16f57b5692";
 
-type Family = "claude" | "codex" | "grok";
+// One name for the CLI family, shared with the runtime and the ledger.
+type Family = ReviewAgentKind;
 const FAMILIES: readonly Family[] = ["claude", "codex", "grok"];
 
 const line = (message: string): void => {
@@ -170,17 +178,26 @@ async function captureFixedPoint(
       dirtyStatePolicy: "record-hash",
     });
   }
-  const head = env("FLOW_REVIEW_HEAD", "HEAD");
-  const base = env(
-    "FLOW_REVIEW_BASE",
-    (await git(repoRoot, "merge-base", "HEAD", "origin/main")).trim(),
-  );
-  return isolation.captureFixedPoint({
+  // A formal run's fixed point is computed, never supplied: the branch tip and
+  // its merge-base with the main branch. `formalOverrideRefusal` has already
+  // refused any environment attempt to redirect it.
+  const headCommit = (await git(repoRoot, "rev-parse", "HEAD")).trim();
+  const mergeBase = (
+    await git(repoRoot, "merge-base", "HEAD", "origin/main")
+  ).trim();
+  const fixedPoint = await isolation.captureFixedPoint({
     repoRoot,
-    baseRef: base,
-    headRef: head,
+    baseRef: mergeBase,
+    headRef: headCommit,
     dirtyStatePolicy: "reject",
   });
+  if (fixedPoint.headCommit !== headCommit) {
+    throw new Error("formal fixed point head does not match the branch tip");
+  }
+  if (fixedPoint.baseCommit !== mergeBase) {
+    throw new Error("formal fixed point base does not match the merge-base");
+  }
+  return fixedPoint;
 }
 
 interface MaterialSpec {
@@ -327,6 +344,17 @@ async function readOrEmpty(path: string): Promise<string> {
   }
 }
 
+/** Null distinguishes "unreadable" from "readable but wrong", unlike "". */
+async function readInterruptEvidenceFile(
+  path: string,
+): Promise<string | null> {
+  try {
+    return await readFile(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
 function cliProgressBytes(log: string, stderr: string): number {
   // Wrapper banners are not CLI progress; count everything else.
   const logProgress = log
@@ -432,6 +460,10 @@ function laneSummary(run: RunView) {
       isolationPre: lane.isolationPre,
       isolationPost: lane.isolationPost,
       rawReportFile: lane.rawReportFile,
+      rawReportOutcome: lane.rawReportOutcome,
+      resultFile: lane.resultFile,
+      checkpointOrigin: lane.checkpointOrigin,
+      worktreeDisposition: lane.worktreeDisposition,
     };
   });
 }
@@ -520,8 +552,14 @@ async function rehearsalParent(): Promise<void> {
       await sleep(500);
     }
     const interrupted = interruptExit !== null && interruptExit !== 0;
+    const interruptEvidence = readInterruptEvidence(
+      await readInterruptEvidenceFile(interruptEvidenceFile),
+      c.interruptLane,
+    );
     line(
-      `interrupt observed: lane=${c.interruptLane} exit=${interruptExit} accepted=${interrupted}`,
+      `interrupt observed: lane=${c.interruptLane} exit=${interruptExit} accepted=${interrupted} evidence=${
+        interruptEvidence.ok ? "valid" : `INVALID (${interruptEvidence.reason})`
+      }`,
     );
 
     let aliveAtKill = 0;
@@ -567,9 +605,8 @@ async function rehearsalParent(): Promise<void> {
         laneId: c.interruptLane,
         exitCode: interruptExit,
         accepted: interrupted,
-        evidence: JSON.parse(
-          await readOrEmpty(interruptEvidenceFile) || "null",
-        ),
+        evidence: interruptEvidence.ok ? interruptEvidence.evidence : null,
+        evidenceFailure: interruptEvidence.ok ? null : interruptEvidence.reason,
       },
       controllerLoss: { aliveAtKill, resumedExit: resumed.exitCode },
       finishStatus: run.finishStatus,
@@ -578,6 +615,9 @@ async function rehearsalParent(): Promise<void> {
       ok:
         visibility.every((entry) => entry.proven) &&
         interrupted &&
+        // The interrupt is only demonstrated when its objective evidence
+        // survives: a lost or malformed evidence file fails the rehearsal.
+        interruptEvidence.ok &&
         aliveAtKill > 0 &&
         run.finishStatus !== "invalid",
     };
@@ -613,6 +653,19 @@ async function formalRun(): Promise<void> {
   if (materialsFile === undefined || materialsFile.length === 0) {
     throw new Error(
       "a formal run requires FLOW_REVIEW_MATERIALS pointing at the captured issue/spec/standards materials",
+    );
+  }
+  // Refuse before anything is written or dispatched: a formal run that reviewed
+  // the wrong tree, or reported onto the wrong issue, would still leave
+  // evidence that looked correct.
+  const overrideRefusal = formalOverrideRefusal(process.env);
+  if (overrideRefusal !== null) {
+    throw new Error(`formal run refused: ${overrideRefusal}`);
+  }
+  const originUrl = await git(c.repoRoot, "remote", "get-url", "origin");
+  if (!issueTargetMatchesOrigin(gate.target!, originUrl)) {
+    throw new Error(
+      `formal run refused: issue target ${gate.target!.owner}/${gate.target!.repo} is not the repository under review (${originUrl.trim()})`,
     );
   }
   await mkdir(c.evidenceDir, { recursive: true });

@@ -6,8 +6,8 @@ import { describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildAgentLaneCommand } from "../src/index.ts";
-import type { AgentLaneCommandInput } from "../src/index.ts";
+import { buildAgentLaneCommand } from "../src/review/commands.ts";
+import type { AgentLaneCommandInput } from "../src/review/commands.ts";
 
 const STUB = `#!/bin/bash
 # Echo stdin length, stream some progress on stderr, report on stdout.

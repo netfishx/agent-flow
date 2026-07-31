@@ -58,6 +58,12 @@ export interface FakeLaneProgram {
   readonly stderrContent?: string;
   /** Agent lanes: leave no raw-report file (derivation-failure path). */
   readonly omitRawReport?: boolean;
+  /**
+   * The exit status an interrupted lane reports. Real CLIs catch SIGINT and
+   * exit with a code of their own — codex exits 1 — so 130 is only one of the
+   * shapes an interrupted lane can take.
+   */
+  readonly interruptExitCode?: number;
 }
 
 export interface FakeAdvances {
@@ -367,7 +373,7 @@ export class FakeHerdrAdapter implements HerdrAdapter {
     if (!running || !state) {
       return { signal: "SIGINT", processGroupId: null, delivered: false };
     }
-    state.pendingExit = 130;
+    state.pendingExit = state.program?.interruptExitCode ?? 130;
     state.finished = true;
     if (state.kind !== "agent") {
       await this.writeRecords(state, "partial", "interrupted");

@@ -5,8 +5,103 @@
 
 import { resolveIssueTarget } from "../cli/flow.ts";
 import type { IssueRef } from "../runtime/events.ts";
+import type { InterruptOutcome } from "../runtime/types.ts";
 
 export type ReviewSmokeMode = "rehearsal" | "formal";
+
+/**
+ * A formal run's fixed point is defined by the spec, not by the operator: head
+ * is the branch tip and base is the merge-base with the main branch. Any
+ * environment override of the repository, head, or base would let a formal run
+ * review something other than the branch under review while its evidence still
+ * looked correct, so the override is refused rather than obeyed.
+ */
+const FORMAL_FORBIDDEN_OVERRIDES = [
+  "FLOW_REVIEW_REPO_ROOT",
+  "FLOW_REVIEW_HEAD",
+  "FLOW_REVIEW_BASE",
+  "FLOW_REVIEW_FAMILIES",
+] as const;
+
+export function formalOverrideRefusal(
+  environment: NodeJS.ProcessEnv,
+): string | null {
+  for (const key of FORMAL_FORBIDDEN_OVERRIDES) {
+    const value = environment[key];
+    if (value !== undefined && value.length > 0) {
+      return `${key} may not be set for a formal run`;
+    }
+  }
+  return null;
+}
+
+/**
+ * The bound issue must live in the repository under review. Comparing the
+ * target against the origin remote stops a formal run from posting its
+ * milestones onto an unrelated issue in an unrelated repository.
+ */
+export function issueTargetMatchesOrigin(
+  target: IssueRef,
+  originUrl: string,
+): boolean {
+  const match = originUrl
+    .trim()
+    .replace(/\.git$/, "")
+    .match(/[/:]([^/:]+)\/([^/]+)$/);
+  if (match?.[1] === undefined || match[2] === undefined) return false;
+  return match[1] === target.owner && match[2] === target.repo;
+}
+
+/**
+ * The rehearsal's interrupt evidence is objective runner output, so a missing,
+ * unreadable, or malformed file is a rehearsal failure with a stated reason —
+ * never a silent null that leaves the verdict looking clean.
+ */
+export type InterruptEvidenceRead =
+  | { readonly ok: true; readonly evidence: InterruptOutcome }
+  | { readonly ok: false; readonly reason: string };
+
+export function readInterruptEvidence(
+  raw: string | null,
+  expectedLaneId: string,
+): InterruptEvidenceRead {
+  if (raw === null) {
+    return { ok: false, reason: "interrupt evidence file is missing or unreadable" };
+  }
+  if (raw.trim().length === 0) {
+    return { ok: false, reason: "interrupt evidence file is empty" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { ok: false, reason: "interrupt evidence file is not valid JSON" };
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return { ok: false, reason: "interrupt evidence is not an object" };
+  }
+  const record = parsed as Record<string, unknown>;
+  if (record.laneId !== expectedLaneId) {
+    return {
+      ok: false,
+      reason: `interrupt evidence names lane ${JSON.stringify(record.laneId)}, expected "${expectedLaneId}"`,
+    };
+  }
+  if (typeof record.signal !== "string" || record.signal.length === 0) {
+    return { ok: false, reason: "interrupt evidence carries no signal" };
+  }
+  if (record.delivered !== true) {
+    return { ok: false, reason: "interrupt evidence does not record delivery" };
+  }
+  return {
+    ok: true,
+    evidence: {
+      laneId: record.laneId,
+      signal: record.signal,
+      delivered: true,
+    },
+  };
+}
 
 export type ReviewGateRefusalReason =
   | "review-smoke-not-enabled"

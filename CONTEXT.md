@@ -24,9 +24,15 @@ and design records.
   its stable delivery identity.
 - **Blocked anchor** — a lane's write-once snapshot of its first blocked
   checkpoint, used to keep the blocked delivery stable.
-- **Checkpoint collection** — reading an executing lane's Agent-written
-  checkpoint at a reconciliation boundary and recording a changed blocked fact
-  before delivery planning.
+- **Checkpoint collection** — reading an executing lane's checkpoint at a
+  reconciliation boundary and recording a changed blocked fact before delivery
+  planning.
+- **Checkpoint origin** — who authored a lane's checkpoint: the Agent itself,
+  or the runtime deriving one from the lane's captured bytes. The two are
+  recorded distinctly and never rendered as the same claim.
+- **Terminal record** — the runtime-derived checkpoint every lane that ran
+  receives when it reaches a terminal state, whatever that state was. It states
+  its mechanical origin, claims no verification, and invents no verdict.
 - **Checkpoint semantic signature** — the comparison key over semantic state
   and blocker, next, and gap lines, used to suppress unchanged checkpoint facts.
 - **Label transition** — the recorded outcome of the allowed issue-label step:
@@ -68,6 +74,11 @@ and design records.
 - **Raw report** — a lane's CLI output captured byte-for-byte; the
   first-class artifact from which the report text, checkpoint, and contract
   outcome are derived without rewriting.
+- **Raw report outcome** — the runner's objective fact about that artifact:
+  `captured`, `missing`, or `underivable`. Only `captured` licenses releasing
+  the lane's review worktree.
+- **Worktree disposition** — whether a lane's review worktree was released or
+  retained, and the reason it was kept. Retention is recorded, never silent.
 - **Report contract** — the required `VERDICT` / `CONFIDENCE` / `FINDINGS`
   form of a reviewer's report; validated for form only, never for truth.
 - **Session identity** — a lane's CLI session id, recorded only from evidence

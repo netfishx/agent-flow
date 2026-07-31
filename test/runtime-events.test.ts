@@ -459,10 +459,13 @@ describe("WorkflowRuntime event commits", () => {
       "run1#6",
       "run1#7",
       "run1#8",
-      "run1#9",
+      // The lane's three terminal facts take 9, 10 and 11. This view filters
+      // them out, but they still consume sequence numbers, because a run may
+      // only finish once they are committed.
+      "run1#12",
     ]);
     expect(ledger.events.map((event) => event.sequence)).toEqual([
-      1, 2, 3, 4, 5, 6, 7, 8, 9,
+      1, 2, 3, 4, 5, 6, 7, 8, 12,
     ]);
     expect(
       ledger.events.every(

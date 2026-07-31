@@ -1,7 +1,11 @@
-import type { BundleFileRecord } from "../review/bundle.ts";
-import type { ReviewAxis } from "../review/brief.ts";
-import type { ReviewAgentKind } from "../review/commands.ts";
-import type { SessionIdentity } from "../review/session.ts";
+// The ledger's schema depends on the review vocabulary only — never on the
+// brief assembler or the command builders that also speak it.
+import type {
+  BundleFileRecord,
+  ReviewAgentKind,
+  ReviewAxis,
+  SessionIdentity,
+} from "../review/types.ts";
 
 export type RunEventType =
   | "run_started"
@@ -19,6 +23,7 @@ export type RunEventType =
   | "lane_session_recorded"
   | "lane_contract_evaluated"
   | "lane_verification_recorded"
+  | "lane_worktree_disposition"
   | "checkpoint_announced"
   | "human_interrupt"
   | "lane_takeover"
@@ -55,6 +60,13 @@ export type SemanticState =
 
 export type ContractState = "unknown" | "satisfied" | "violated";
 export type VerificationState = "unverified" | "verified" | "failed";
+/**
+ * The runner's objective fact about a lane's first-class raw artifact:
+ * `captured` means the bytes are on disk and yielded report text, `missing`
+ * means no artifact exists, `underivable` means the bytes exist but no report
+ * text could be derived from them. Only `captured` licenses cleanup.
+ */
+export type RawReportOutcome = "captured" | "missing" | "underivable";
 export type ControlMode = "managed" | "human_owned";
 /**
  * `invalid` marks a run whose reviewer isolation cannot be trusted: an agent
@@ -222,13 +234,29 @@ export interface LaneFailedToStartData {
 
 export interface LaneContractEvaluatedData {
   readonly contractState: ContractState;
-  readonly resultFile: string;
+  /** The derived result artifact, or null when none was ever written. */
+  readonly resultFile: string | null;
   readonly errors: readonly string[];
 }
 
 export interface LaneVerificationRecordedData {
   readonly verificationState: VerificationState;
   readonly evidenceFile: string;
+  /**
+   * The raw artifact outcome for agent lanes; absent on replayed pre-#7
+   * events and null for simulated lanes, which own no raw report.
+   */
+  readonly rawReportOutcome?: RawReportOutcome | null;
+}
+
+/**
+ * Whether a lane's disposable review worktree was removed, and when it was
+ * kept, why. Retention is the forensic outcome: it is recorded, never silent.
+ */
+export interface LaneWorktreeDispositionData {
+  readonly disposition: "removed" | "retained";
+  readonly retainedReason: string | null;
+  readonly worktreePath: string;
 }
 
 export interface HumanInterruptData {
@@ -300,6 +328,7 @@ export interface RunEventDataByType {
   readonly lane_session_recorded: LaneSessionRecordedData;
   readonly lane_contract_evaluated: LaneContractEvaluatedData;
   readonly lane_verification_recorded: LaneVerificationRecordedData;
+  readonly lane_worktree_disposition: LaneWorktreeDispositionData;
   readonly checkpoint_announced: EmptyEventData;
   readonly human_interrupt: HumanInterruptData;
   readonly lane_takeover: EmptyEventData;
@@ -343,7 +372,10 @@ export type RunEvent =
   | EventFor<"lane_dispatch_intent", "runtime", string>
   | EventFor<"lane_dispatched", "runtime", string>
   | EventFor<"lane_live", "runtime", string>
-  | EventFor<"lane_checkpoint", "agent", string>
+  // An Agent that writes its own checkpoint is the `agent` actor; a checkpoint
+  // the runtime derives from a lane's captured bytes is the `runtime` actor.
+  // The ledger keeps the two apart so no derivation can pass as Agent text.
+  | EventFor<"lane_checkpoint", "agent" | "runtime", string>
   | EventFor<"lane_exited", "runtime", string>
   | EventFor<"lane_crashed", "runtime", string>
   | EventFor<"lane_lost", "runtime", string>
@@ -352,6 +384,7 @@ export type RunEvent =
   | EventFor<"lane_session_recorded", "runner", string>
   | EventFor<"lane_contract_evaluated", "validator", string>
   | EventFor<"lane_verification_recorded", "runner", string>
+  | EventFor<"lane_worktree_disposition", "runner", string>
   | EventFor<"checkpoint_announced", "runtime">
   | EventFor<"human_interrupt", "human", string>
   | EventFor<"lane_takeover", "human", string>

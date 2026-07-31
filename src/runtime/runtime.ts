@@ -19,12 +19,14 @@ import {
   deriveAgentLaneFacts,
   type AgentLaneDerivation,
 } from "../review/derive.ts";
+import type {
+  SessionIdentity,
+  WorktreeVerification,
+} from "../review/types.ts";
 import {
   failedVerification,
   verificationPassed,
-  type WorktreeVerification,
-} from "../review/isolation.ts";
-import type { SessionIdentity } from "../review/session.ts";
+} from "../review/verification.ts";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type {
@@ -45,12 +47,14 @@ import {
   laneCheckpointFile,
   parseCheckpoint,
 } from "./checkpoint.ts";
+import { reviewWorktreeCleanupEligibility } from "./lane-cleanup.ts";
 import { measured, REASONS, tokensUnavailable, unavailable } from "./metrics.ts";
 import {
   expectedFinishStatus,
   projectRunState,
   projectRunOutcomeBreakdown,
   reduce,
+  runFinishEligibility,
   type LaneView,
   type RunView,
 } from "./reducer.ts";
@@ -533,7 +537,15 @@ export class WorkflowRuntime {
               },
             });
           }
-          await this.finishIfTerminal(runId);
+          // The run may only finish once these lanes' terminal facts are in
+          // the ledger. A physical dispatch failure keeps the controller
+          // lease, so the release is deferred while the facts land.
+          this.deferredLeaseReleases.add(runId);
+          try {
+            await this.recordFactsForTerminalLanes(runId);
+          } finally {
+            this.deferredLeaseReleases.delete(runId);
+          }
         } catch (commitCause) {
           throw new PartialDispatchError(runId, [...started], commitCause);
         }
@@ -558,17 +570,15 @@ export class WorkflowRuntime {
     }
 
     // Every lane may already be terminal when isolation pre-flight refused
-    // them all; close the run instead of leaving it undrivable.
+    // them all; record their facts so the run closes instead of staying
+    // undrivable. Recording the last lane's facts is what finishes the run.
     const afterDispatch = this.getRun(runId);
     if (
       afterDispatch.laneOrder.every((laneId) =>
         TERMINAL_RUNTIME.has(this.getLane(afterDispatch, laneId).runtimeState),
       )
     ) {
-      await this.finishIfTerminal(runId);
-      for (const laneId of afterDispatch.laneOrder) {
-        await this.recordTerminalFacts(runId, laneId, null);
-      }
+      await this.recordFactsForTerminalLanes(runId);
     }
 
     await this.reconcileBoundIssue(runId);
@@ -1515,33 +1525,44 @@ export class WorkflowRuntime {
       laneId,
     );
 
-    // Agent lanes derive checkpoint, report, contract, and session facts from
-    // the lane's own captured bytes — copies, never rewrites of the raw
+    // Agent lanes derive report, terminal record, contract, and session facts
+    // from the lane's own captured bytes — copies, never rewrites of the raw
     // artifacts. A lane that never started has nothing to derive from.
     const derivation =
       lane.kind === "agent" && lane.runtimeState !== "failed_to_start"
         ? await this.deriveAgentLane(lane, parsedExitCode ?? lane.exitCode)
         : null;
+    let resultArtifact: string | null = lane.kind === "agent" ? null : resultFile;
     if (derivation !== null) {
       if (derivation.reportText !== null) {
         await mkdir(dirname(resultFile), { recursive: true });
         await writeFile(resultFile, derivation.reportText, "utf8");
+        resultArtifact = resultFile;
       }
-      if (derivation.checkpointText !== null) {
-        await mkdir(dirname(checkpointFile), { recursive: true });
-        await writeFile(checkpointFile, derivation.checkpointText, "utf8");
-      }
+      // Every terminal agent lane gets its record, whatever became of its bytes.
+      await mkdir(dirname(checkpointFile), { recursive: true });
+      await writeFile(checkpointFile, derivation.checkpointText, "utf8");
     }
 
-    let checkpoint: string | null = null;
-    try {
-      checkpoint = await readFile(checkpointFile, "utf8");
-    } catch {
-      // An absent/unreadable Agent record leaves the semantic dimension unknown.
+    // An Agent-written checkpoint is the Agent's own claim and is recorded as
+    // such; a record the runtime derived is committed under the runtime actor,
+    // so the ledger never presents a derivation as the reviewer's voice.
+    const checkpointOrigin: "agent" | "runtime" =
+      derivation === null ? "agent" : "runtime";
+    let status: "complete" | "partial" | "blocked" | null = null;
+    if (derivation !== null) {
+      status = derivation.checkpointStatus;
+    } else {
+      let checkpoint: string | null = null;
+      try {
+        checkpoint = await readFile(checkpointFile, "utf8");
+      } catch {
+        // An absent/unreadable Agent record leaves the semantic state unknown.
+      }
+      status = checkpoint === null ? null : parseCheckpoint(checkpoint).status;
     }
-    const status =
-      checkpoint === null ? null : parseCheckpoint(checkpoint).status;
     if (status === "complete" || status === "partial") {
+      const semanticState = status;
       await this.commitEventConditionally(runId, (current) => {
         if (!current) throw new Error(`unknown runId "${runId}"`);
         const currentLane = this.getLane(current, laneId);
@@ -1553,9 +1574,9 @@ export class WorkflowRuntime {
         }
         return {
           type: "lane_checkpoint",
-          actor: "agent",
+          actor: checkpointOrigin,
           laneId,
-          data: { semanticState: status, checkpointFile },
+          data: { semanticState, checkpointFile },
         };
       });
     }
@@ -1608,7 +1629,9 @@ export class WorkflowRuntime {
         laneId,
         data: {
           contractState: contractErrors.length === 0 ? "satisfied" : "violated",
-          resultFile,
+          // Never point at a result artifact that was never written; a lost
+          // report must project as absent, not as a path to nothing.
+          resultFile: resultArtifact,
           errors: contractErrors,
         },
       };
@@ -1665,36 +1688,69 @@ export class WorkflowRuntime {
         data: {
           verificationState: evidenceComplete ? "verified" : "failed",
           evidenceFile,
+          rawReportOutcome: derivation?.rawOutcome ?? null,
         },
       };
     });
-    // A review worktree is disposable only once its post-flight verification
-    // passed and every derived artifact has landed; any failure retains it
-    // for forensics.
-    const finalLane = this.getLane(this.getRun(runId), laneId);
-    if (
-      finalLane.kind === "agent" &&
-      finalLane.runtimeState !== "failed_to_start" &&
-      finalLane.isolationPost !== null &&
-      verificationPassed(finalLane.isolationPost) &&
-      this.deps.reviewIsolation !== undefined &&
-      finalLane.worktreePath !== null &&
-      this.getRun(runId).fixedPoint !== null
-    ) {
-      try {
-        await this.deps.reviewIsolation.removeWorktree({
-          repoRoot: this.getRun(runId).fixedPoint!.repoRoot,
-          path: finalLane.worktreePath,
-        });
-      } catch {
-        // Retention is the safe failure direction; the worktree stays.
-      }
-    }
-
+    await this.disposeReviewWorktree(runId, laneId);
+    // Only now that every per-lane terminal fact is committed may the run
+    // finish: the finish status is computed over the facts, never ahead of them.
+    await this.finishIfTerminal(runId);
     await this.synchronizeIssueAndReleaseControllerLeaseAfterTerminalFacts(
       runId,
       synchronizeIssue,
     );
+  }
+
+  /**
+   * Release a lane's review worktree, or keep it and say why. Destroying the
+   * worktree is the one irreversible step of finalization, so it happens only
+   * when the lane's recorded facts prove every artifact derived from it is
+   * safely on disk. The disposition itself is a ledger fact, so resume and
+   * inspect can see that a forensic worktree is being held.
+   */
+  private async disposeReviewWorktree(
+    runId: string,
+    laneId: string,
+  ): Promise<void> {
+    const lane = this.getLane(this.getRun(runId), laneId);
+    if (lane.kind !== "agent" || lane.worktreeDisposition !== null) return;
+    const worktreePath = lane.worktreePath;
+    if (worktreePath === null) return;
+    const eligibility = reviewWorktreeCleanupEligibility(lane);
+    const fixedPoint = this.getRun(runId).fixedPoint;
+    let disposition: "removed" | "retained" = "retained";
+    let retainedReason: string | null = eligibility.eligible
+      ? null
+      : eligibility.reason;
+    if (eligibility.eligible) {
+      if (this.deps.reviewIsolation === undefined || fixedPoint === null) {
+        retainedReason = "no review isolation port was available to release it";
+      } else {
+        try {
+          await this.deps.reviewIsolation.removeWorktree({
+            repoRoot: fixedPoint.repoRoot,
+            path: worktreePath,
+          });
+          disposition = "removed";
+          retainedReason = null;
+        } catch (cause) {
+          // Retention is the safe failure direction, and it is recorded.
+          retainedReason = `removal failed: ${rejectionMessage(cause)}`;
+        }
+      }
+    }
+    await this.commitEventConditionally(runId, (current) => {
+      if (!current) throw new Error(`unknown runId "${runId}"`);
+      const currentLane = this.getLane(current, laneId);
+      if (currentLane.worktreeDisposition !== null) return null;
+      return {
+        type: "lane_worktree_disposition",
+        actor: "runner",
+        laneId,
+        data: { disposition, retainedReason, worktreePath },
+      };
+    });
   }
 
   private async deriveAgentLane(
@@ -1721,6 +1777,12 @@ export class WorkflowRuntime {
       stderr: stderrText,
       preassignedSessionId: lane.preassignedSessionId,
       exitCode,
+      // The terminal state and the interrupt fact come from the ledger, so a
+      // CLI that catches SIGINT and exits with its own code is still recorded
+      // as interrupted instead of being guessed at from the exit code.
+      termination: lane.runtimeState === "crashed" ? "crashed" : lane.runtimeState === "lost" ? "lost" : "exited",
+      interrupted: lane.humanInterruptAt !== null,
+      terminationDetail: lane.lostCause,
     });
   }
 
@@ -1731,14 +1793,26 @@ export class WorkflowRuntime {
     await writeFile(path, `${JSON.stringify(evidence, null, 2)}\n`, "utf8");
   }
 
+  /**
+   * Record terminal facts for every lane that has already reached a terminal
+   * state. Recording the last such lane's facts is what lets the run finish,
+   * so this is the only way a run closes.
+   */
+  private async recordFactsForTerminalLanes(runId: string): Promise<void> {
+    for (const laneId of this.getRun(runId).laneOrder) {
+      const lane = this.getLane(this.getRun(runId), laneId);
+      if (!TERMINAL_RUNTIME.has(lane.runtimeState)) continue;
+      await this.recordTerminalFacts(runId, laneId, lane.exitCode);
+    }
+  }
+
   private async finishIfTerminal(runId: string): Promise<void> {
     await this.commitEventConditionally(runId, (run) => {
       if (!run) throw new Error(`unknown runId "${runId}"`);
-      if (run.finishStatus !== null || run.laneOrder.length === 0) return null;
-      const lanes = run.laneOrder.map((laneId) => this.getLane(run, laneId));
-      if (!lanes.every((lane) => TERMINAL_RUNTIME.has(lane.runtimeState))) {
-        return null;
-      }
+      if (run.finishStatus !== null) return null;
+      // The same eligibility rule the reducer enforces on replay: a run may
+      // only finish once every lane's terminal facts are already committed.
+      if (!runFinishEligibility(run).ready) return null;
       const breakdown = projectRunOutcomeBreakdown(run);
       return {
         type: "run_finished",
