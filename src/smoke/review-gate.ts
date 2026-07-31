@@ -110,6 +110,79 @@ export function rehearsalAcceptance(input: RehearsalAcceptanceInput): {
 }
 
 /**
+ * What a formal run must have produced to count as acceptance evidence. Kept as
+ * a pure function beside `rehearsalAcceptance` for the same reason: an inline
+ * boolean could only be checked by spending a real six-lane run, so a weakened
+ * rule would go unnoticed until the evidence was already published.
+ *
+ * The run's own finish status is load-bearing here. `degraded` means the run
+ * itself recorded that something did not hold — a non-zero exit, a violated
+ * contract, a lost raw report, a missing result — and a formal run must never
+ * report `ok` over a status the runtime already refused to call `clean`.
+ */
+export interface FormalAcceptanceLane {
+  readonly laneId: string;
+  readonly runtimeState: string;
+  readonly exitCode: number | null;
+  readonly verificationState: string;
+  readonly contractState: string;
+  readonly rawReportOutcome: string | null;
+  readonly resultFile: string | null;
+}
+
+export interface FormalAcceptanceInput {
+  readonly finishStatus: string | null;
+  readonly expectedLaneCount: number;
+  readonly lanes: readonly FormalAcceptanceLane[];
+}
+
+export function formalAcceptance(input: FormalAcceptanceInput): {
+  readonly ok: boolean;
+  readonly failures: readonly string[];
+} {
+  const failures: string[] = [];
+  if (input.finishStatus === null) {
+    failures.push("the run never finished");
+  } else if (input.finishStatus !== "clean") {
+    failures.push(
+      `the run finished ${input.finishStatus}, and only a clean finish is acceptance evidence`,
+    );
+  }
+  if (input.lanes.length !== input.expectedLaneCount) {
+    failures.push(
+      `expected ${input.expectedLaneCount} lanes, saw ${input.lanes.length}`,
+    );
+  }
+  for (const lane of input.lanes) {
+    if (lane.runtimeState !== "exited") {
+      failures.push(`lane ${lane.laneId} is ${lane.runtimeState}, not exited`);
+    }
+    if (lane.exitCode !== 0) {
+      failures.push(`lane ${lane.laneId} exited ${lane.exitCode}`);
+    }
+    if (lane.contractState !== "satisfied") {
+      failures.push(
+        `lane ${lane.laneId} contract is ${lane.contractState}`,
+      );
+    }
+    if (lane.verificationState !== "verified") {
+      failures.push(
+        `lane ${lane.laneId} runner evidence is ${lane.verificationState}`,
+      );
+    }
+    if (lane.rawReportOutcome !== "captured") {
+      failures.push(
+        `lane ${lane.laneId} raw report is ${lane.rawReportOutcome}`,
+      );
+    }
+    if (lane.resultFile === null) {
+      failures.push(`lane ${lane.laneId} produced no result artifact`);
+    }
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+/**
  * The rehearsal's interrupt evidence is objective runner output, so a missing,
  * unreadable, or malformed file is a rehearsal failure with a stated reason —
  * never a silent null that leaves the verdict looking clean.

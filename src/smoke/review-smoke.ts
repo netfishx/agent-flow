@@ -31,6 +31,12 @@ import type {
 } from "../runtime/types.ts";
 import type { ReviewAgentKind } from "../review/types.ts";
 import {
+  resolveEvidenceRoot,
+  runEvidencePath,
+  volatileEvidenceRootRefusal,
+} from "./evidence-root.ts";
+import {
+  formalAcceptance,
   formalOverrideRefusal,
   issueTargetMatchesOrigin,
   readInterruptEvidence,
@@ -125,20 +131,23 @@ function config() {
     "FLOW_REVIEW_REPO_ROOT",
     join(import.meta.dir, "../.."),
   );
-  const evidenceDir = env(
-    "FLOW_EVIDENCE_DIR",
-    `/private/tmp/agent-flow-review-${process.pid}`,
+  // The evidence root shares the ledger's state root, so a run's artifacts and
+  // the ledger that points at them cannot outlive each other.
+  const evidenceDir = resolveEvidenceRoot();
+  const runId = env(
+    "FLOW_RUN_ID",
+    `review-${Date.now().toString(36)}-${process.pid.toString(36)}`,
   );
   return {
     mode,
     repoRoot,
     evidenceDir,
     workspace: env("FLOW_WORKSPACE", "w1"),
-    runId: env(
-      "FLOW_RUN_ID",
-      `review-${Date.now().toString(36)}-${process.pid.toString(36)}`,
+    runId,
+    readyFile: env(
+      "FLOW_READY_FILE",
+      runEvidencePath(evidenceDir, runId, "controller-ready"),
     ),
-    readyFile: env("FLOW_READY_FILE", join(evidenceDir, "controller-ready")),
     readyTimeoutMs: num("FLOW_CONTROLLER_READY_TIMEOUT_MS", 120_000),
     laneTimeoutMs: num("FLOW_REVIEW_LANE_TIMEOUT_MS", 1_800_000),
     interruptLane: env("FLOW_REVIEW_INTERRUPT_LANE", "codex-spec"),
@@ -283,7 +292,7 @@ async function dispatchPhase(): Promise<void> {
   const gate = reviewSmokeGate(process.env);
   if (!gate.ok) throw new Error(`gate refused: ${gate.reason}`);
   const c = config();
-  await mkdir(c.evidenceDir, { recursive: true });
+  await mkdir(runEvidencePath(c.evidenceDir, c.runId), { recursive: true });
   const fixedPoint = await captureFixedPoint(c.mode, c.repoRoot);
   const materials = await captureMaterials(c.repoRoot, fixedPoint.headCommit);
   const runtime = new WorkflowRuntime(makeDeps(c.runId, gate));
@@ -318,7 +327,7 @@ async function dispatchPhase(): Promise<void> {
       `[dispatch] interrupt lane=${c.interruptLane} delivered=${outcome.delivered}`,
     );
     await Bun.write(
-      join(c.evidenceDir, "interrupt-evidence.json"),
+      runEvidencePath(c.evidenceDir, c.runId, "interrupt-evidence.json"),
       `${JSON.stringify(outcome, null, 2)}\n`,
     );
   }
@@ -376,7 +385,7 @@ async function observeLanes(
   until: (observations: readonly LaneObservation[]) => boolean,
   timeoutMs: number,
 ): Promise<LaneObservation[]> {
-  const runDir = join(c.evidenceDir, c.runId);
+  const runDir = runEvidencePath(c.evidenceDir, c.runId);
   const observations: LaneObservation[] = laneIds.map((laneId) => ({
     laneId,
     family: laneId.split("-")[0] as Family,
@@ -477,7 +486,7 @@ async function rehearsalParent(): Promise<void> {
     return;
   }
   const c = config();
-  await mkdir(c.evidenceDir, { recursive: true });
+  await mkdir(runEvidencePath(c.evidenceDir, c.runId), { recursive: true });
   const lanes = laneSpecs(c.mode).map((lane) => lane.laneId);
   line("== agent-flow cross-review rehearsal smoke ==");
   line(`runId=${c.runId} evidence=${c.evidenceDir} lanes=${lanes.join(",")}`);
@@ -502,7 +511,11 @@ async function rehearsalParent(): Promise<void> {
     // Visibility gate: per family, CLI-attributable bytes must appear in the
     // durable tee files (the same bytes the pane renders) strictly before
     // that lane's completion sentinel.
-    const interruptEvidenceFile = join(c.evidenceDir, "interrupt-evidence.json");
+    const interruptEvidenceFile = runEvidencePath(
+      c.evidenceDir,
+      c.runId,
+      "interrupt-evidence.json",
+    );
     const observations = await observeLanes(
       c,
       lanes,
@@ -543,7 +556,7 @@ async function rehearsalParent(): Promise<void> {
     );
     while (Date.now() < interruptDeadline) {
       const log = await readOrEmpty(
-        join(c.evidenceDir, c.runId, "logs", `${c.interruptLane}.log`),
+        runEvidencePath(c.evidenceDir, c.runId, "logs", `${c.interruptLane}.log`),
       );
       const match = log.match(sentinelPattern);
       if (match) {
@@ -566,7 +579,7 @@ async function rehearsalParent(): Promise<void> {
     let aliveAtKill = 0;
     for (const laneId of lanes) {
       const log = await readOrEmpty(
-        join(c.evidenceDir, c.runId, "logs", `${laneId}.log`),
+        runEvidencePath(c.evidenceDir, c.runId, "logs", `${laneId}.log`),
       );
       if (!log.includes(`${laneSentinelToken(c.runId, laneId)}=`)) {
         aliveAtKill += 1;
@@ -611,6 +624,8 @@ async function rehearsalParent(): Promise<void> {
       acceptanceEvidence: false,
       fixedPoint: run.fixedPoint,
       bundleHash: run.inputBundle?.bundleHash ?? null,
+      evidenceRoot: c.evidenceDir,
+      runEvidenceDir: runEvidencePath(c.evidenceDir, c.runId),
       visibility,
       interrupt: {
         laneId: c.interruptLane,
@@ -634,7 +649,7 @@ async function rehearsalParent(): Promise<void> {
       ok: acceptance.ok,
     };
     await Bun.write(
-      join(c.evidenceDir, "rehearsal-result.json"),
+      runEvidencePath(c.evidenceDir, c.runId, "rehearsal-result.json"),
       `${JSON.stringify(report, null, 2)}\n`,
     );
     line(`FLOW_REVIEW_SMOKE_DONE=${report.ok ? 0 : 1}`);
@@ -674,13 +689,20 @@ async function formalRun(): Promise<void> {
   if (overrideRefusal !== null) {
     throw new Error(`formal run refused: ${overrideRefusal}`);
   }
+  // Acceptance evidence written into a directory the operating system may clear
+  // is not evidence. This refusal is what makes "raw report retained" true of
+  // the default configuration rather than of one operator's careful choice.
+  const volatileRefusal = volatileEvidenceRootRefusal(c.evidenceDir);
+  if (volatileRefusal !== null) {
+    throw new Error(`formal run refused: ${volatileRefusal}`);
+  }
   const originUrl = await git(c.repoRoot, "remote", "get-url", "origin");
   if (!issueTargetMatchesOrigin(gate.target!, originUrl)) {
     throw new Error(
       `formal run refused: issue target ${gate.target!.owner}/${gate.target!.repo} is not the repository under review (${originUrl.trim()})`,
     );
   }
-  await mkdir(c.evidenceDir, { recursive: true });
+  await mkdir(runEvidencePath(c.evidenceDir, c.runId), { recursive: true });
   const fixedPoint = await captureFixedPoint(c.mode, c.repoRoot);
   const materials = await captureMaterials(c.repoRoot, fixedPoint.headCommit);
   const runtime = new WorkflowRuntime(makeDeps(c.runId, gate));
@@ -733,31 +755,42 @@ async function formalRun(): Promise<void> {
       labelTransition: delivery.labelTransition,
     };
   });
+  // A formal run is acceptance evidence only when the runtime itself called the
+  // finish `clean` and every lane produced a verified, contract-satisfying
+  // report from a captured raw artifact. A lost or malformed report is the stop
+  // line's "unrecoverable report loss", never a quiet pass.
+  const acceptance = formalAcceptance({
+    finishStatus: run.finishStatus,
+    expectedLaneCount: lanes.length,
+    lanes: run.laneOrder.map((laneId) => {
+      const lane = run.lanes[laneId]!;
+      return {
+        laneId,
+        runtimeState: lane.runtimeState,
+        exitCode: lane.exitCode,
+        verificationState: lane.verificationState,
+        contractState: lane.contractState,
+        rawReportOutcome: lane.rawReportOutcome,
+        resultFile: lane.resultFile,
+      };
+    }),
+  });
   const report = {
     mode: c.mode,
     runId: c.runId,
     issue: run.issue,
     fixedPoint: run.fixedPoint,
     bundleHash: run.inputBundle?.bundleHash ?? null,
+    evidenceRoot: c.evidenceDir,
+    runEvidenceDir: runEvidencePath(c.evidenceDir, c.runId),
     finishStatus: run.finishStatus,
     lanes: laneSummary(run),
     deliveries,
-    // A formal run is acceptable only when every lane produced a verified,
-    // contract-satisfying report — a lost or malformed report is the stop
-    // line's "unrecoverable report loss", never a quiet pass.
-    ok:
-      run.finishStatus !== "invalid" &&
-      run.laneOrder.every((laneId) => {
-        const lane = run.lanes[laneId]!;
-        return (
-          lane.runtimeState === "exited" &&
-          lane.verificationState === "verified" &&
-          lane.contractState === "satisfied"
-        );
-      }),
+    failures: acceptance.failures,
+    ok: acceptance.ok,
   };
   await Bun.write(
-    join(c.evidenceDir, "formal-result.json"),
+    runEvidencePath(c.evidenceDir, c.runId, "formal-result.json"),
     `${JSON.stringify(report, null, 2)}\n`,
   );
   line(`FLOW_REVIEW_SMOKE_DONE=${report.ok ? 0 : 1}`);

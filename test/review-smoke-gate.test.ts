@@ -1,10 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+  formalAcceptance,
   formalOverrideRefusal,
   issueTargetMatchesOrigin,
   readInterruptEvidence,
   rehearsalAcceptance,
   reviewSmokeGate,
+  type FormalAcceptanceInput,
+  type FormalAcceptanceLane,
   type RehearsalAcceptanceInput,
 } from "../src/smoke/review-gate.ts";
 
@@ -221,6 +224,85 @@ describe("rehearsalAcceptance", () => {
     const verdict = rehearsalAcceptance({
       ...passing,
       ...(overrides as Partial<RehearsalAcceptanceInput>),
+    });
+    expect(verdict.ok).toBeFalse();
+    expect(verdict.failures.join(" | ")).toContain(fragment as string);
+  });
+});
+
+describe("formalAcceptance", () => {
+  const lane = (overrides: Partial<FormalAcceptanceLane> = {}): FormalAcceptanceLane => ({
+    laneId: "codex-spec",
+    runtimeState: "exited",
+    exitCode: 0,
+    verificationState: "verified",
+    contractState: "satisfied",
+    rawReportOutcome: "captured",
+    resultFile: "results/codex-spec-result.txt",
+    ...overrides,
+  });
+  const passing: FormalAcceptanceInput = {
+    finishStatus: "clean",
+    expectedLaneCount: 2,
+    lanes: [lane({ laneId: "claude-spec" }), lane()],
+  };
+
+  test("accepts a clean run whose every lane produced a verified report", () => {
+    expect(formalAcceptance(passing)).toEqual({ ok: true, failures: [] });
+  });
+
+  // The rule that changed: `degraded` is the runtime's own statement that
+  // something did not hold. A formal run must not report ok over it, however
+  // well-formed the six reports happen to be.
+  test("refuses a degraded run even when every contract is satisfied", () => {
+    const verdict = formalAcceptance({ ...passing, finishStatus: "degraded" });
+    expect(verdict.ok).toBeFalse();
+    expect(verdict.failures.join(" | ")).toContain(
+      "the run finished degraded, and only a clean finish is acceptance evidence",
+    );
+  });
+
+  test("refuses a non-zero exit whose report still satisfied the contract", () => {
+    // Exactly the shape the old criterion let through: runtimeState is still
+    // `exited`, the contract is satisfied, and only the exit code dissents.
+    const verdict = formalAcceptance({
+      ...passing,
+      finishStatus: "degraded",
+      lanes: [lane({ laneId: "claude-spec" }), lane({ exitCode: 1 })],
+    });
+    expect(verdict.ok).toBeFalse();
+    expect(verdict.failures.join(" | ")).toContain("lane codex-spec exited 1");
+  });
+
+  test.each([
+    ["an unfinished run", { finishStatus: null }, "never finished"],
+    ["an invalid run", { finishStatus: "invalid" }, "the run finished invalid"],
+    [
+      "a missing lane",
+      { expectedLaneCount: 6 },
+      "expected 6 lanes, saw 2",
+    ],
+  ])("refuses %s", (_name, overrides, fragment) => {
+    const verdict = formalAcceptance({
+      ...passing,
+      ...(overrides as Partial<FormalAcceptanceInput>),
+    });
+    expect(verdict.ok).toBeFalse();
+    expect(verdict.failures.join(" | ")).toContain(fragment as string);
+  });
+
+  test.each([
+    [{ runtimeState: "crashed" }, "is crashed, not exited"],
+    [{ contractState: "violated" }, "contract is violated"],
+    [{ verificationState: "failed" }, "runner evidence is failed"],
+    [{ rawReportOutcome: "missing" }, "raw report is missing"],
+    [{ rawReportOutcome: "underivable" }, "raw report is underivable"],
+    [{ rawReportOutcome: null }, "raw report is null"],
+    [{ resultFile: null }, "produced no result artifact"],
+  ])("refuses a lane with %p", (overrides, fragment) => {
+    const verdict = formalAcceptance({
+      ...passing,
+      lanes: [lane({ laneId: "claude-spec" }), lane(overrides)],
     });
     expect(verdict.ok).toBeFalse();
     expect(verdict.failures.join(" | ")).toContain(fragment as string);
