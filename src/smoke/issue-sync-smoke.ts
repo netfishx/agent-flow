@@ -30,6 +30,7 @@ import type {
 } from "../runtime/events.ts";
 import { FsLedger } from "../runtime/fs-ledger.ts";
 import type { RunView } from "../runtime/reducer.ts";
+import { resolveEvidenceRoot } from "./evidence-root.ts";
 import { issueSyncGate } from "./issue-sync-gate.ts";
 
 interface CommandResult {
@@ -805,10 +806,13 @@ async function runIssueSyncSmoke(): Promise<number> {
     return 2;
   }
 
+  // Persistent by default, for the same reason as every other smoke: the
+  // evidence must still be readable after a restart. Process-scoped, so two
+  // concurrent invocations cannot overwrite each other's report.
   const evidenceDir =
     environment.FLOW_EVIDENCE_DIR === undefined ||
     environment.FLOW_EVIDENCE_DIR.length === 0
-      ? `/private/tmp/agent-flow-issue-sync-smoke-${process.pid}`
+      ? join(resolveEvidenceRoot(environment), `issue-sync-${process.pid}`)
       : environment.FLOW_EVIDENCE_DIR;
   const evidence: SmokeEvidence = {
     ok: false,

@@ -18,6 +18,7 @@ import {
 import type { LeaseHandle, Ledger } from "../runtime/ledger.ts";
 import { WorkflowRuntime } from "../runtime/runtime.ts";
 import type { LaneSpec, RuntimeDeps } from "../runtime/types.ts";
+import { resolveEvidenceRoot, runEvidencePath } from "./evidence-root.ts";
 import {
   summarizeControllerLossResume,
   summarizeInSliceAbort,
@@ -49,16 +50,16 @@ const line = (message: string): void => {
 };
 
 function config() {
-  const evidenceDir = env(
-    "FLOW_EVIDENCE_DIR",
-    `/private/tmp/agent-flow-takeover-${process.pid}`,
+  // Shares the ledger's state root: a run's artifacts and the ledger pointing
+  // at them must not be able to outlive each other.
+  const evidenceDir = resolveEvidenceRoot();
+  const runId = env(
+    "FLOW_RUN_ID",
+    `flow-takeover-${Date.now().toString(36)}-${process.pid.toString(36)}`,
   );
   return {
     workspace: env("FLOW_WORKSPACE", "w1"),
-    runId: env(
-      "FLOW_RUN_ID",
-      `flow-takeover-${Date.now().toString(36)}-${process.pid.toString(36)}`,
-    ),
+    runId,
     managedLaneCount: num("FLOW_MANAGED_LANES", 3),
     shortSteps: num("FLOW_SHORT_STEPS", 3),
     ownedLongSteps: num("FLOW_LONG_STEPS", 12),
@@ -68,19 +69,19 @@ function config() {
     evidenceDir,
     driveWaitMarker: env(
       "FLOW_DRIVE_WAIT_MARKER",
-      join(evidenceDir, "drive-wait-started.json"),
+      runEvidencePath(evidenceDir, runId, "drive-wait-started.json"),
     ),
     driveResultFile: env(
       "FLOW_DRIVE_RESULT",
-      join(evidenceDir, "drive-result.json"),
+      runEvidencePath(evidenceDir, runId, "drive-result.json"),
     ),
     releaseWaitMarker: env(
       "FLOW_RELEASE_WAIT_MARKER",
-      join(evidenceDir, "release-wait-started.json"),
+      runEvidencePath(evidenceDir, runId, "release-wait-started.json"),
     ),
     releaseResultFile: env(
       "FLOW_RELEASE_RESULT",
-      join(evidenceDir, "release-drive-result.json"),
+      runEvidencePath(evidenceDir, runId, "release-drive-result.json"),
     ),
     readyTimeoutMs: num("FLOW_CONTROLLER_READY_TIMEOUT_MS", 30_000),
     laneTimeoutMs: num("FLOW_LANE_TIMEOUT_MS", 90_000),
@@ -234,7 +235,7 @@ async function closeHerdrTab(tabId: string): Promise<void> {
 
 async function setupRun(): Promise<string> {
   const c = config();
-  await mkdir(c.evidenceDir, { recursive: true });
+  await mkdir(runEvidencePath(c.evidenceDir, c.runId), { recursive: true });
   const ledger = new FsLedger(c.ledgerRoot);
   const adapter = new RealHerdrAdapter();
   const runtime = new WorkflowRuntime(
@@ -371,7 +372,7 @@ async function parentPhase(): Promise<void> {
   // config() generates a fresh random runId when FLOW_RUN_ID is unset; pin it
   // so setupRun() and the drive children all resolve the SAME run.
   process.env.FLOW_RUN_ID = c.runId;
-  await mkdir(c.evidenceDir, { recursive: true });
+  await mkdir(runEvidencePath(c.evidenceDir, c.runId), { recursive: true });
   line("== agent-flow live ownership smoke ==");
   line(`runId=${c.runId} evidence=${c.evidenceDir}`);
 
@@ -632,7 +633,7 @@ async function parentPhase(): Promise<void> {
     }
     line("release restored a real managed wait and exit");
 
-    const reportPath = join(c.evidenceDir, "smoke-result.json");
+    const reportPath = runEvidencePath(c.evidenceDir, c.runId, "smoke-result.json");
     const report = {
       runId: c.runId,
       waitStarted: {
