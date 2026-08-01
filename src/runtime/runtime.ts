@@ -48,6 +48,7 @@ import {
   parseCheckpoint,
 } from "./checkpoint.ts";
 import { reviewWorktreeCleanupEligibility } from "./lane-cleanup.ts";
+import { planLanePanes } from "./pane-layout.ts";
 import { measured, REASONS, tokensUnavailable, unavailable } from "./metrics.ts";
 import {
   expectedFinishStatus,
@@ -326,14 +327,21 @@ export class WorkflowRuntime {
       item: (typeof topology)[number];
       command: string;
     }> = [];
-    let previous = controllerPane;
-    for (const spec of config.lanes) {
+    // An even grid, not a strip: seven stacked panes leave a lane five rows.
+    const placements = planLanePanes(config.lanes.length, direction);
+    const lanePanes: PaneRef[] = [];
+    for (const [index, spec] of config.lanes.entries()) {
+      const placement = placements[index]!;
       const pane = await this.deps.adapter.splitPane({
-        from: previous,
-        direction,
+        from:
+          placement.from.kind === "controller"
+            ? controllerPane
+            : lanePanes[placement.from.index]!,
+        direction: placement.direction,
         cwd: config.cwd,
+        ...(placement.ratio === undefined ? {} : { ratio: placement.ratio }),
       });
-      previous = pane;
+      lanePanes.push(pane);
       const artifacts = laneArtifactPaths(config.cwd, runId, spec.laneId);
       const agent: AgentLanePlan | null = isAgentSpec(spec)
         ? {
