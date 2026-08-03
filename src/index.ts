@@ -91,10 +91,12 @@ export type {
   VerificationState,
 } from "./runtime/events.ts";
 export type {
+  AgentLaneSpec,
   InterruptOutcome,
   LanePhaseTiming,
   LaneResult,
   LaneSpec,
+  SimulatedLaneSpec,
   LaneState,
   LaneStatus,
   RunHandle,
@@ -110,6 +112,48 @@ export type {
 export type { HerdrAdapter } from "./herdr/adapter.ts";
 export { RealHerdrAdapter } from "./herdr/real-adapter.ts";
 export type { RealHerdrAdapterOptions } from "./herdr/real-adapter.ts";
+
+export {
+  REPORT_CONTRACT_BLOCK,
+  validateReportContract,
+} from "./review/contract.ts";
+export type {
+  FindingSeverity,
+  ReportContractOutcome,
+  ReportFinding,
+  ReviewConfidence,
+  ReviewVerdict,
+} from "./review/contract.ts";
+export { assembleInputBundle } from "./review/bundle.ts";
+export type {
+  AssembledInputBundle,
+  BundleArtifact,
+  BundleSourceFile,
+} from "./review/bundle.ts";
+export { assembleBrief } from "./review/brief.ts";
+export type { BriefInput } from "./review/brief.ts";
+export { GitReviewIsolation } from "./review/isolation.ts";
+export type { ReviewIsolationPort } from "./review/isolation.ts";
+export { verificationPassed } from "./review/verification.ts";
+export type {
+  BundleFileRecord,
+  BundleFileRole,
+  CaptureFixedPointInput,
+  InputBundleManifest,
+  ReviewAgentKind,
+  ReviewAxis,
+  SessionIdentity,
+  WorktreeVerification,
+} from "./review/types.ts";
+
+// Deliberately NOT exported, each for the reason this entry already states:
+//   - the agent-lane command builders emit sentinels and shell quoting;
+//   - `extractClaudeReport`, `parseCodexSessionId`, and `parseCodexTokensUsed`
+//     parse one CLI family's own output, and the design keeps Agent-specific
+//     mechanics and session identifiers inside the implementation
+//     (docs/design/observable-multi-agent-runtime.md section 6).
+// `assembleBrief` stays: it is the runtime's own deterministic input builder,
+// not a parser of any Agent's output. Their tests use internal paths.
 
 // Test infrastructure (fake adapter, clock, quoting inverse) is intentionally
 // NOT re-exported here — it lives in `./testing.ts` so the production entry

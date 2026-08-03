@@ -11,7 +11,8 @@
     "smoke:takeover": "bun run src/smoke/takeover-smoke.ts",
     "flow": "bun run src/cli/flow.ts",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "smoke:review": "bun run src/smoke/review-smoke.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",

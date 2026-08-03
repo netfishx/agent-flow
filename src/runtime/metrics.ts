@@ -21,6 +21,10 @@ export const REASONS = {
   simulatedNoModel: "simulated lane runs no model",
   simulatedNoTokens:
     "simulated lanes run no model; headless agent CLIs expose no token counts",
+  headlessNoInferenceSplit:
+    "headless CLI reports no inference-phase split",
+  agentTokensInEvidence:
+    "per-lane token counts are recorded in runner evidence files",
   laneNotComplete: "lane has not completed",
   laneNotStarted: "lane process not yet observed live",
   noCheckpoint: "no human checkpoint touched this lane",

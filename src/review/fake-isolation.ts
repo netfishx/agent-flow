@@ -1,0 +1,99 @@
+// Deterministic in-memory review-isolation port for runtime tests. Records
+// every call and returns configured verification outcomes without touching
+// git.
+
+import type { FixedPoint } from "../runtime/events.ts";
+import type { ReviewIsolationPort } from "./isolation.ts";
+import type { CaptureFixedPointInput, WorktreeVerification } from "./types.ts";
+
+const PASS: WorktreeVerification = {
+  headOk: true,
+  cleanOk: true,
+  diffHashOk: true,
+  detail: null,
+};
+
+export interface FakeReviewIsolationOptions {
+  /** Per-worktree-path verification overrides, consumed in call order. */
+  readonly verifications?: Readonly<Record<string, readonly WorktreeVerification[]>>;
+  /** Make createWorktree throw for these paths. */
+  readonly failCreateFor?: readonly string[];
+  /** Make verifyWorktree throw for these paths (port-failure path). */
+  readonly throwVerifyFor?: readonly string[];
+}
+
+export class FakeReviewIsolation implements ReviewIsolationPort {
+  readonly captured: CaptureFixedPointInput[] = [];
+  readonly created: { repoRoot: string; headCommit: string; path: string }[] =
+    [];
+  readonly verified: { path: string; fixedPoint: FixedPoint }[] = [];
+  readonly removed: { repoRoot: string; path: string }[] = [];
+  private readonly queues = new Map<string, WorktreeVerification[]>();
+  private readonly failCreateFor: ReadonlySet<string>;
+  private readonly throwVerifyFor: ReadonlySet<string>;
+
+  constructor(options: FakeReviewIsolationOptions = {}) {
+    for (const [path, outcomes] of Object.entries(
+      options.verifications ?? {},
+    )) {
+      this.queues.set(path, [...outcomes]);
+    }
+    this.failCreateFor = new Set(options.failCreateFor ?? []);
+    this.throwVerifyFor = new Set(options.throwVerifyFor ?? []);
+  }
+
+  /**
+   * Deterministic capture: the base and head refs are echoed as commits and the
+   * diff hash is derived from them, so a runtime test can drive the whole
+   * fixed-point seam — the spec's Testing Decision 3 — without git.
+   */
+  async captureFixedPoint(input: CaptureFixedPointInput): Promise<FixedPoint> {
+    this.captured.push(input);
+    if (input.baseRef === input.headRef) {
+      throw new Error("fixed-point capture rejected: the diff is empty");
+    }
+    return {
+      repoRoot: input.repoRoot,
+      baseCommit: input.baseRef,
+      headCommit: input.headRef,
+      diffHash: `sha256:fake-${input.baseRef}-${input.headRef}`,
+      dirtyStatePolicy: input.dirtyStatePolicy,
+      capturedAt: 0,
+    };
+  }
+
+  async createWorktree(input: {
+    readonly repoRoot: string;
+    readonly headCommit: string;
+    readonly path: string;
+  }): Promise<void> {
+    if (this.failCreateFor.has(input.path)) {
+      throw new Error(`fake: createWorktree failed for ${input.path}`);
+    }
+    this.created.push({ ...input });
+  }
+
+  async verifyWorktree(input: {
+    readonly path: string;
+    readonly fixedPoint: FixedPoint;
+  }): Promise<WorktreeVerification> {
+    if (this.throwVerifyFor.has(input.path)) {
+      throw new Error(`fake: verifyWorktree failed for ${input.path}`);
+    }
+    this.verified.push({ path: input.path, fixedPoint: input.fixedPoint });
+    const queue = this.queues.get(input.path);
+    if (queue && queue.length > 0) return queue.shift()!;
+    return PASS;
+  }
+
+  async removeWorktree(input: {
+    readonly repoRoot: string;
+    readonly path: string;
+  }): Promise<void> {
+    // Mirror real git: removing an already-removed worktree fails.
+    if (this.removed.some((entry) => entry.path === input.path)) {
+      throw new Error(`fake: worktree already removed: ${input.path}`);
+    }
+    this.removed.push({ ...input });
+  }
+}

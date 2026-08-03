@@ -17,6 +17,7 @@ import {
 import type { Ledger } from "../runtime/ledger.ts";
 import { WorkflowRuntime } from "../runtime/runtime.ts";
 import type { LaneSpec, RuntimeDeps } from "../runtime/types.ts";
+import { resolveEvidenceRoot, runEvidencePath } from "./evidence-root.ts";
 
 const TERMINAL_RUNTIME: ReadonlySet<RuntimeState> = new Set([
   "exited",
@@ -48,22 +49,25 @@ const line = (message: string): void => {
 };
 
 function config() {
-  const evidenceDir = env(
-    "FLOW_EVIDENCE_DIR",
-    `/private/tmp/agent-flow-resume-${process.pid}`,
+  // Shares the ledger's state root: a run's artifacts and the ledger pointing
+  // at them must not be able to outlive each other.
+  const evidenceDir = resolveEvidenceRoot();
+  const runId = env(
+    "FLOW_RUN_ID",
+    `flow-${Date.now().toString(36)}-${process.pid.toString(36)}`,
   );
   return {
     workspace: env("FLOW_WORKSPACE", "w1"),
-    runId: env(
-      "FLOW_RUN_ID",
-      `flow-${Date.now().toString(36)}-${process.pid.toString(36)}`,
-    ),
+    runId,
     laneCount: num("FLOW_LANES", 4),
     steps: num("FLOW_STEPS", 4),
     stepSkew: num("FLOW_STEP_SKEW", 4),
     delay: num("FLOW_DELAY", 1),
     evidenceDir,
-    readyFile: env("FLOW_READY_FILE", join(evidenceDir, "controller-ready")),
+    readyFile: env(
+      "FLOW_READY_FILE",
+      runEvidencePath(evidenceDir, runId, "controller-ready"),
+    ),
     readyTimeoutMs: num("FLOW_CONTROLLER_READY_TIMEOUT_MS", 30_000),
     unobservedMs: num("FLOW_UNOBSERVED_MS", 6_000),
     laneTimeoutMs: num("FLOW_LANE_TIMEOUT_MS", 300_000),
@@ -84,7 +88,7 @@ function makeDeps(ledger: Ledger, runId: string): RuntimeDeps {
 
 async function dispatchPhase(): Promise<void> {
   const c = config();
-  await mkdir(c.evidenceDir, { recursive: true });
+  await mkdir(runEvidencePath(c.evidenceDir, c.runId), { recursive: true });
   const runtime = new WorkflowRuntime(
     makeDeps(new FsLedger(c.ledgerRoot), c.runId),
   );
@@ -158,7 +162,7 @@ async function waitForReady(path: string, timeoutMs: number): Promise<void> {
 
 async function parentPhase(): Promise<void> {
   const c = config();
-  await mkdir(c.evidenceDir, { recursive: true });
+  await mkdir(runEvidencePath(c.evidenceDir, c.runId), { recursive: true });
   line("== agent-flow resume-after-controller-loss smoke ==");
   line(`runId=${c.runId} evidence=${c.evidenceDir}`);
 
@@ -324,7 +328,7 @@ async function parentPhase(): Promise<void> {
       ok: true,
     };
     await Bun.write(
-      join(c.evidenceDir, "smoke-result.json"),
+      runEvidencePath(c.evidenceDir, c.runId, "smoke-result.json"),
       `${JSON.stringify(report, null, 2)}\n`,
     );
     line(`FLOW_SMOKE_DONE=0`);

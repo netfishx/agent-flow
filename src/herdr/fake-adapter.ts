@@ -52,6 +52,18 @@ export interface FakeLaneProgram {
    */
   readonly staysRunningAfterMatch?: boolean;
   readonly extraOutput?: readonly string[];
+  /** Agent lanes: bytes the fake CLI leaves in the raw-report artifact. */
+  readonly rawReport?: string;
+  /** Agent lanes: bytes the fake CLI leaves in the durable stderr artifact. */
+  readonly stderrContent?: string;
+  /** Agent lanes: leave no raw-report file (derivation-failure path). */
+  readonly omitRawReport?: boolean;
+  /**
+   * The exit status an interrupted lane reports. Real CLIs catch SIGINT and
+   * exit with a code of their own — codex exits 1 — so 130 is only one of the
+   * shapes an interrupted lane can take.
+   */
+  readonly interruptExitCode?: number;
 }
 
 export interface FakeAdvances {
@@ -78,12 +90,14 @@ export interface FakeHerdrAdapterOptions {
 interface FakePaneState {
   paneId: string;
   role: "controller" | "lane" | "idle";
+  kind?: "simulated" | "agent";
   laneId?: string;
   runId?: string;
   logFile?: string;
   stderrFile?: string;
   checkpointFile?: string;
   resultFile?: string;
+  rawFile?: string;
   program?: FakeLaneProgram;
   finished: boolean;
   pendingExit: number | null;
@@ -223,6 +237,41 @@ export class FakeHerdrAdapter implements HerdrAdapter {
     const state = this.panes.get(pane.id);
     if (!state) throw new Error(`fake: unknown pane ${pane.id}`);
     const tokens = scanSingleQuoted(shellCommand);
+    if (tokens[0]?.startsWith("# flow agent lane")) {
+      // tokens: [script, runId, laneId, cwd, logFile, stderrFile, rawFile,
+      // promptFile, stdinMode, rawMode, ...cli]
+      const [, runId, laneId, , logFile, stderrFile, rawFile] = tokens;
+      if (!runId || !laneId || !logFile || !stderrFile || !rawFile) {
+        throw new Error(
+          `fake: could not parse agent lane command: ${shellCommand}`,
+        );
+      }
+      state.role = "lane";
+      state.kind = "agent";
+      state.runId = runId;
+      state.laneId = laneId;
+      state.logFile = logFile;
+      state.stderrFile = stderrFile;
+      state.rawFile = rawFile;
+      state.program = this.programs.get(laneId);
+      state.finished = false;
+      state.pendingExit = null;
+      this.paneByLane.set(laneId, pane.id);
+      // The fake CLI leaves its captured bytes behind; checkpoints and
+      // results are the RUNTIME's derivation job, so the fake never writes
+      // them for agent lanes.
+      if (!(state.program?.omitRawReport ?? false)) {
+        await mkdir(dirname(rawFile), { recursive: true });
+        await writeFile(rawFile, state.program?.rawReport ?? "", "utf8");
+      }
+      await mkdir(dirname(stderrFile), { recursive: true });
+      await writeFile(
+        stderrFile,
+        state.program?.stderrContent ?? "",
+        "utf8",
+      );
+      return;
+    }
     // tokens: [script, runId, laneId, logFile, stderrFile, steps, delay,
     // checkpointFile, resultFile]
     const [
@@ -247,6 +296,7 @@ export class FakeHerdrAdapter implements HerdrAdapter {
       throw new Error(`fake: could not parse lane command: ${shellCommand}`);
     }
     state.role = "lane";
+    state.kind = "simulated";
     state.runId = runId;
     state.laneId = laneId;
     state.logFile = logFile;
@@ -323,9 +373,11 @@ export class FakeHerdrAdapter implements HerdrAdapter {
     if (!running || !state) {
       return { signal: "SIGINT", processGroupId: null, delivered: false };
     }
-    state.pendingExit = 130;
+    state.pendingExit = state.program?.interruptExitCode ?? 130;
     state.finished = true;
-    await this.writeRecords(state, "partial", "interrupted");
+    if (state.kind !== "agent") {
+      await this.writeRecords(state, "partial", "interrupted");
+    }
     return {
       signal: "SIGINT",
       processGroupId: 2000 + this.paneSeqIndex(pane.id),

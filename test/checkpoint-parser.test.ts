@@ -70,3 +70,32 @@ VERIFICATION_CLAIMS:
     expect(parseCheckpoint(text).status).toBeNull();
   });
 });
+
+describe("runtime-derived terminal records", () => {
+  // The runtime writes `STATUS: unknown` for a crashed or lost lane, because no
+  // evidence of progress survived. A record our own parser cannot classify is
+  // not a durable record, so the parser must read what the runtime writes.
+  test("parses the unknown status the runtime derives", () => {
+    const record = `STATUS: unknown
+PHASE: runtime-derived-terminal-record
+COMPLETED:
+- the lane process is gone
+NEXT:
+- none
+BLOCKERS:
+- no completion sentinel was found in the lane's durable log
+ARTIFACTS:
+- reports/codex-spec.raw (not produced)
+VERIFICATION_CLAIMS:
+- none
+GAPS:
+- none
+`;
+    const parsed = parseCheckpoint(record);
+    expect(parsed.status).toBe("unknown");
+    expect(parsed.blockers).toEqual([
+      "no completion sentinel was found in the lane's durable log",
+    ]);
+    expect(parsed.verificationClaims).toEqual([]);
+  });
+});

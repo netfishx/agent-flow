@@ -62,6 +62,7 @@ const completePayload: CompletePayload = {
       resultPointer: "results/codex-result.txt",
       evidencePointer: "evidence/codex-evidence.json",
       checkpointPointer: "checkpoints/codex.md",
+      checkpointOrigin: "agent",
     },
   ],
 };
@@ -98,8 +99,8 @@ const goldenCases: readonly {
     name: "complete",
     payload: completePayload,
     canonical:
-      '{"breakdown":{"crashed":0,"exitedNonZero":1,"exitedZero":0,"failedToStart":0,"lost":0},"finishStatus":"degraded","hashVersion":1,"lanes":[{"checkpointPointer":"checkpoints/codex.md","contractErrors":["missing VERDICT at /Users/alice/result.txt"],"contractState":"violated","evidencePointer":"evidence/codex-evidence.json","exitCode":1,"gaps":[],"laneId":"codex","resultPointer":"results/codex-result.txt","role":"standards","runtimeState":"exited","semanticState":"partial","signal":null,"verificationState":"failed"}],"runId":"run-25"}',
-    digest: "d89a90c3acc77d1961eb2020e835ded05369ef14fa87382eabd8d9047a8fd9ab",
+      '{"breakdown":{"crashed":0,"exitedNonZero":1,"exitedZero":0,"failedToStart":0,"lost":0},"finishStatus":"degraded","hashVersion":1,"lanes":[{"checkpointOrigin":"agent","checkpointPointer":"checkpoints/codex.md","contractErrors":["missing VERDICT at /Users/alice/result.txt"],"contractState":"violated","evidencePointer":"evidence/codex-evidence.json","exitCode":1,"gaps":[],"laneId":"codex","resultPointer":"results/codex-result.txt","role":"standards","runtimeState":"exited","semanticState":"partial","signal":null,"verificationState":"failed"}],"runId":"run-25"}',
+    digest: "a1a39f278e44f76713df5c7dc9698ea30e41e3a30582ee51d87c03ca40f6983c",
   },
   {
     name: "decision",

@@ -1,5 +1,15 @@
+// The ledger's schema depends on the review vocabulary only — never on the
+// brief assembler or the command builders that also speak it.
+import type {
+  BundleFileRecord,
+  ReviewAgentKind,
+  ReviewAxis,
+  SessionIdentity,
+} from "../review/types.ts";
+
 export type RunEventType =
   | "run_started"
+  | "input_bundle_captured"
   | "lane_registered"
   | "lane_dispatch_intent"
   | "lane_dispatched"
@@ -9,8 +19,11 @@ export type RunEventType =
   | "lane_crashed"
   | "lane_lost"
   | "lane_failed_to_start"
+  | "lane_isolation_verified"
+  | "lane_session_recorded"
   | "lane_contract_evaluated"
   | "lane_verification_recorded"
+  | "lane_worktree_disposition"
   | "checkpoint_announced"
   | "human_interrupt"
   | "lane_takeover"
@@ -47,8 +60,21 @@ export type SemanticState =
 
 export type ContractState = "unknown" | "satisfied" | "violated";
 export type VerificationState = "unverified" | "verified" | "failed";
+/**
+ * The runner's objective fact about a lane's first-class raw artifact:
+ * `captured` means the bytes are on disk and yielded report text, `missing`
+ * means no artifact exists, `underivable` means the bytes exist but no report
+ * text could be derived from them. Only `captured` licenses cleanup.
+ */
+export type RawReportOutcome = "captured" | "missing" | "underivable";
 export type ControlMode = "managed" | "human_owned";
-export type RunFinishStatus = "clean" | "degraded";
+/**
+ * `invalid` marks a run whose reviewer isolation cannot be trusted: an agent
+ * lane reached a terminal state through execution with a failed — or missing —
+ * post-flight verification. An invalid run is never carried forward; a rerun
+ * runs under a new runId.
+ */
+export type RunFinishStatus = "clean" | "degraded" | "invalid";
 
 export interface IssueRef {
   readonly owner: string;
@@ -92,6 +118,21 @@ export interface RunnerEvidence {
   readonly environmentFailure: string | null;
   /** No simulated-run execution deadline exists in #14. */
   readonly executionTimeout: string | null;
+  /** The immutable raw report artifact; null for simulated lanes. */
+  readonly rawReportArtifact?: string | null;
+  /**
+   * Best-effort token counts parsed only from the lane's own output, or an
+   * explicit unavailability reason; null for lanes that never ran a CLI.
+   */
+  readonly tokens?:
+    | {
+        readonly source: string;
+        readonly inputTokens: number | null;
+        readonly outputTokens: number | null;
+        readonly totalTokens: number | null;
+      }
+    | { readonly unavailable: string }
+    | null;
   readonly termination:
     | "sentinel-exit"
     | "crashed"
@@ -112,15 +153,56 @@ export interface RunStartedData {
   readonly issue: IssueRef | null;
 }
 
-export interface LaneRegisteredData {
+interface LaneRegisteredCommon {
   readonly laneId: string;
   readonly paneId: string;
   readonly logFile: string;
   readonly stderrFile: string;
   readonly sentinelToken: string;
+  readonly role?: string;
+}
+
+/** The pre-#7 shape; `kind` is absent on replayed historical events. */
+export interface SimulatedLaneRegisteredData extends LaneRegisteredCommon {
+  readonly kind?: "simulated";
   readonly steps: number;
   readonly stepDelaySeconds: number;
-  readonly role?: string;
+}
+
+export interface AgentLaneRegisteredData extends LaneRegisteredCommon {
+  readonly kind: "agent";
+  readonly axis: ReviewAxis;
+  readonly agentKind: ReviewAgentKind;
+  readonly model: string;
+  readonly effort: string;
+  /** Runtime-assembled brief; the caller never supplies it. */
+  readonly promptFile: string;
+  readonly bundleHash: string;
+  readonly rawReportFile: string;
+  readonly worktreePath: string;
+  /** Pre-assigned session UUID for CLI families that accept one. */
+  readonly preassignedSessionId: string | null;
+}
+
+export type LaneRegisteredData =
+  | SimulatedLaneRegisteredData
+  | AgentLaneRegisteredData;
+
+export interface InputBundleCapturedData {
+  readonly files: readonly BundleFileRecord[];
+  readonly bundleHash: string;
+}
+
+export interface LaneIsolationVerifiedData {
+  readonly phase: "pre" | "post";
+  readonly headOk: boolean;
+  readonly cleanOk: boolean;
+  readonly diffHashOk: boolean;
+  readonly detail: string | null;
+}
+
+export interface LaneSessionRecordedData {
+  readonly session: SessionIdentity;
 }
 
 export interface LaneDispatchedData {
@@ -152,13 +234,29 @@ export interface LaneFailedToStartData {
 
 export interface LaneContractEvaluatedData {
   readonly contractState: ContractState;
-  readonly resultFile: string;
+  /** The derived result artifact, or null when none was ever written. */
+  readonly resultFile: string | null;
   readonly errors: readonly string[];
 }
 
 export interface LaneVerificationRecordedData {
   readonly verificationState: VerificationState;
   readonly evidenceFile: string;
+  /**
+   * The raw artifact outcome for agent lanes; absent on replayed pre-#7
+   * events and null for simulated lanes, which own no raw report.
+   */
+  readonly rawReportOutcome?: RawReportOutcome | null;
+}
+
+/**
+ * Whether a lane's disposable review worktree was removed, and when it was
+ * kept, why. Retention is the forensic outcome: it is recorded, never silent.
+ */
+export interface LaneWorktreeDispositionData {
+  readonly disposition: "removed" | "retained";
+  readonly retainedReason: string | null;
+  readonly worktreePath: string;
 }
 
 export interface HumanInterruptData {
@@ -216,6 +314,7 @@ export interface OwnerDecisionRecordedData {
 
 export interface RunEventDataByType {
   readonly run_started: RunStartedData;
+  readonly input_bundle_captured: InputBundleCapturedData;
   readonly lane_registered: LaneRegisteredData;
   readonly lane_dispatch_intent: EmptyEventData;
   readonly lane_dispatched: LaneDispatchedData;
@@ -225,8 +324,11 @@ export interface RunEventDataByType {
   readonly lane_crashed: EmptyEventData;
   readonly lane_lost: LaneLostData;
   readonly lane_failed_to_start: LaneFailedToStartData;
+  readonly lane_isolation_verified: LaneIsolationVerifiedData;
+  readonly lane_session_recorded: LaneSessionRecordedData;
   readonly lane_contract_evaluated: LaneContractEvaluatedData;
   readonly lane_verification_recorded: LaneVerificationRecordedData;
+  readonly lane_worktree_disposition: LaneWorktreeDispositionData;
   readonly checkpoint_announced: EmptyEventData;
   readonly human_interrupt: HumanInterruptData;
   readonly lane_takeover: EmptyEventData;
@@ -265,17 +367,24 @@ type EventFor<
 
 export type RunEvent =
   | EventFor<"run_started", "runtime">
+  | EventFor<"input_bundle_captured", "runtime">
   | EventFor<"lane_registered", "runtime", string>
   | EventFor<"lane_dispatch_intent", "runtime", string>
   | EventFor<"lane_dispatched", "runtime", string>
   | EventFor<"lane_live", "runtime", string>
-  | EventFor<"lane_checkpoint", "agent", string>
+  // An Agent that writes its own checkpoint is the `agent` actor; a checkpoint
+  // the runtime derives from a lane's captured bytes is the `runtime` actor.
+  // The ledger keeps the two apart so no derivation can pass as Agent text.
+  | EventFor<"lane_checkpoint", "agent" | "runtime", string>
   | EventFor<"lane_exited", "runtime", string>
   | EventFor<"lane_crashed", "runtime", string>
   | EventFor<"lane_lost", "runtime", string>
   | EventFor<"lane_failed_to_start", "runtime", string>
+  | EventFor<"lane_isolation_verified", "runner", string>
+  | EventFor<"lane_session_recorded", "runner", string>
   | EventFor<"lane_contract_evaluated", "validator", string>
   | EventFor<"lane_verification_recorded", "runner", string>
+  | EventFor<"lane_worktree_disposition", "runner", string>
   | EventFor<"checkpoint_announced", "runtime">
   | EventFor<"human_interrupt", "human", string>
   | EventFor<"lane_takeover", "human", string>

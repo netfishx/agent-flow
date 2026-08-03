@@ -3,10 +3,12 @@ import type {
   ControlMode,
   DeliveryState,
   FixedPoint,
+  InputBundleCapturedData,
   IssueRef,
   LabelTransition,
   MilestoneKind,
   OwnerDecision,
+  RawReportOutcome,
   RunEvent,
   RunEventActor,
   RunFinishStatus,
@@ -15,6 +17,12 @@ import type {
   SemanticState,
   VerificationState,
 } from "./events.ts";
+import type {
+  ReviewAgentKind,
+  ReviewAxis,
+  SessionIdentity,
+} from "../review/types.ts";
+import { verificationPassed } from "../review/verification.ts";
 import { checkpointSemanticSignature } from "./checkpoint.ts";
 
 export interface DeliveryView {
@@ -53,17 +61,55 @@ export interface BlockedAnchor {
   readonly gaps: readonly string[];
 }
 
+export interface LaneIsolationView {
+  readonly headOk: boolean;
+  readonly cleanOk: boolean;
+  readonly diffHashOk: boolean;
+  readonly detail: string | null;
+  readonly at: number;
+}
+
+/** Whether a lane's review worktree was released, and why it was kept. */
+export interface LaneWorktreeDispositionView {
+  readonly disposition: "removed" | "retained";
+  readonly retainedReason: string | null;
+  readonly worktreePath: string;
+  readonly at: number;
+}
+
 export interface LaneView {
   readonly laneId: string;
   readonly paneId: string;
   readonly logFile: string;
   readonly stderrFile: string;
   readonly sentinelToken: string;
+  readonly kind: "simulated" | "agent";
   readonly steps: number;
   readonly stepDelaySeconds: number;
   readonly role?: string;
+  /** Agent-lane registration facts; null on simulated lanes. */
+  readonly axis: ReviewAxis | null;
+  readonly agentKind: ReviewAgentKind | null;
+  readonly model: string | null;
+  readonly effort: string | null;
+  readonly promptFile: string | null;
+  readonly bundleHash: string | null;
+  readonly rawReportFile: string | null;
+  readonly worktreePath: string | null;
+  readonly preassignedSessionId: string | null;
+  readonly isolationPre: LaneIsolationView | null;
+  readonly isolationPost: LaneIsolationView | null;
+  readonly sessionIdentity: SessionIdentity | null;
+  /** Whether the raw artifact landed; null until the runner records it. */
+  readonly rawReportOutcome: RawReportOutcome | null;
+  readonly worktreeDisposition: LaneWorktreeDispositionView | null;
   readonly runtimeState: RuntimeState;
   readonly semanticState: SemanticState;
+  /**
+   * Who authored the lane's latest checkpoint: the Agent itself, or the
+   * runtime deriving one from the lane's captured bytes. Never conflated.
+   */
+  readonly checkpointOrigin: "agent" | "runtime" | null;
   readonly contractState: ContractState;
   readonly verificationState: VerificationState;
   readonly controlMode: ControlMode;
@@ -103,6 +149,8 @@ export interface RunView {
   readonly fixedPoint: FixedPoint | null;
   readonly issue: IssueRef | null;
   readonly issueNodeId: string | null;
+  /** The captured immutable input bundle manifest; null when no agent lanes. */
+  readonly inputBundle: InputBundleCapturedData | null;
   readonly startedAt: number;
   readonly updatedAt: number;
   readonly checkpointAnnouncedAt: number | null;
@@ -221,6 +269,128 @@ function deliveryFor(state: RunView, deliveryId: string): DeliveryView {
   return delivery;
 }
 
+/**
+ * Whether every per-lane terminal fact a finish status depends on has been
+ * committed: each lane's process outcome, terminal checkpoint, session outcome,
+ * post-flight isolation, contract evaluation, and runner evidence. A finish
+ * status computed before those exist would be computed over facts that do not
+ * exist yet.
+ *
+ * The ordering this expresses is enforced on the LIVE SUBMISSION PATH only —
+ * the runtime's finish committer refuses to commit `run_finished` until this
+ * returns ready. Replay does NOT enforce it: a reducer that rejected a
+ * `run_finished` arriving ahead of its facts would make every pre-#7 ledger
+ * unloadable, including the retained first formal run. `expectedFinishStatus`
+ * therefore uses this only to choose which status rule applies, and falls back
+ * to legacy outcome-only validation for a ledger whose facts are absent at
+ * finish time. That is a deliberate compatibility strategy, not an oversight;
+ * tightening it would need an event `schemaVersion` bump, a version-dispatching
+ * reducer, and a migration story for the retained ledgers.
+ */
+export type FinishEligibility =
+  | { readonly ready: true }
+  | { readonly ready: false; readonly reason: string };
+
+export function runFinishEligibility(state: RunView): FinishEligibility {
+  if (state.laneOrder.length === 0) {
+    return { ready: false, reason: "the run has no lanes" };
+  }
+  for (const laneId of state.laneOrder) {
+    const lane = state.lanes[laneId]!;
+    if (!TERMINAL_RUNTIME.has(lane.runtimeState)) {
+      return {
+        ready: false,
+        reason: `lane "${laneId}" is not runtime-terminal`,
+      };
+    }
+    if (lane.contractEvaluatedAt === null) {
+      return {
+        ready: false,
+        reason: `lane "${laneId}" has no contract evaluation`,
+      };
+    }
+    if (lane.verificationRecordedAt === null) {
+      return {
+        ready: false,
+        reason: `lane "${laneId}" has no runner evidence`,
+      };
+    }
+    if (lane.kind !== "agent") continue;
+    if (lane.sessionIdentity === null) {
+      return {
+        ready: false,
+        reason: `agent lane "${laneId}" has no session identity`,
+      };
+    }
+    // A lane that never started has no worktree to verify and nothing to
+    // derive a terminal record from; every lane that ran must carry both.
+    if (lane.runtimeState === "failed_to_start") continue;
+    if (lane.isolationPost === null) {
+      return {
+        ready: false,
+        reason: `agent lane "${laneId}" has no post-flight isolation record`,
+      };
+    }
+    if (lane.checkpointAt === null) {
+      return {
+        ready: false,
+        reason: `agent lane "${laneId}" has no terminal checkpoint`,
+      };
+    }
+  }
+  return { ready: true };
+}
+
+/**
+ * The one finish-status rule, shared by the reducer's run_finished guard and
+ * the runtime's finish committer. Fail-closed on isolation: an agent lane that
+ * reached a terminal state through execution must carry a PASSING post-flight
+ * verification, or the whole run is `invalid`. (`failed_to_start` lanes never
+ * ran, so they degrade the run without invalidating it.)
+ *
+ * `clean` additionally requires every lane's own record to be clean: a lost or
+ * underivable raw report, a violated contract, or a missing result artifact all
+ * degrade the run. A run whose evidence is incomplete must never be recorded as
+ * the status that means "nothing to see".
+ *
+ * Two status rules therefore exist, selected by whether the terminal facts are
+ * present — NOT by a replay-time ordering check. See `runFinishEligibility`:
+ * this function never rejects an out-of-order `run_finished`, because rejecting
+ * one would make pre-#7 ledgers unloadable.
+ */
+export function expectedFinishStatus(state: RunView): RunFinishStatus {
+  const lanes = state.laneOrder.map((laneId) => state.lanes[laneId]!);
+  const isolationBroken = lanes.some(
+    (lane) =>
+      lane.kind === "agent" &&
+      TERMINAL_RUNTIME.has(lane.runtimeState) &&
+      lane.runtimeState !== "failed_to_start" &&
+      (lane.isolationPost === null || !verificationPassed(lane.isolationPost)),
+  );
+  if (isolationBroken) return "invalid";
+  const breakdown = projectRunOutcomeBreakdown(state);
+  if (breakdown.exitedZero !== lanes.length) return "degraded";
+  // Legacy status validation. Ledgers written before the terminal-facts
+  // ordering existed finished the run ahead of their per-lane facts, so the
+  // evidence below is legitimately absent for them; they keep the outcome-only
+  // rule and stay replayable. This branch is a compatibility path, not a check:
+  // reaching it is not treated as an error. Every run this runtime writes
+  // commits its facts first, because the live finish committer is gated on
+  // `runFinishEligibility`, so a live run always reaches the strict test below.
+  if (!runFinishEligibility(state).ready) return "clean";
+  // Exactly three conditions cost a run its `clean`: a violated contract, a
+  // raw report that was not captured, and a missing result artifact. Runner
+  // evidence completeness is deliberately NOT one of them — it reports how well
+  // the run was observed, not whether reviewer output survived.
+  const evidenceBroken = lanes.some(
+    (lane) =>
+      lane.contractState !== "satisfied" ||
+      lane.resultFile === null ||
+      (lane.kind === "agent" && lane.rawReportOutcome !== "captured"),
+  );
+  return evidenceBroken ? "degraded" : "clean";
+}
+
 export function projectRunOutcomeBreakdown(
   state: RunView,
 ): RunOutcomeBreakdown {
@@ -295,6 +465,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       fixedPoint: event.data.fixedPoint,
       issue: issue === null ? null : { ...issue },
       issueNodeId: null,
+      inputBundle: null,
       startedAt: event.at,
       updatedAt: event.at,
       checkpointAnnouncedAt: null,
@@ -319,6 +490,17 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
   }
 
   switch (event.type) {
+    case "input_bundle_captured": {
+      if (state.inputBundle !== null) {
+        throw new Error("duplicate input_bundle_captured");
+      }
+      return withRun(state, event, {
+        inputBundle: {
+          files: [...event.data.files],
+          bundleHash: event.data.bundleHash,
+        },
+      });
+    }
     case "lane_registered": {
       if (event.data.laneId !== event.laneId) {
         throw new Error("lane_registered laneId does not match its envelope");
@@ -326,10 +508,53 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       if (state.lanes[event.laneId]) {
         throw new Error(`lane "${event.laneId}" is already registered`);
       }
+      const registration =
+        event.data.kind === "agent"
+          ? {
+              kind: "agent" as const,
+              steps: 0,
+              stepDelaySeconds: 0,
+              axis: event.data.axis,
+              agentKind: event.data.agentKind,
+              model: event.data.model,
+              effort: event.data.effort,
+              promptFile: event.data.promptFile,
+              bundleHash: event.data.bundleHash,
+              rawReportFile: event.data.rawReportFile,
+              worktreePath: event.data.worktreePath,
+              preassignedSessionId: event.data.preassignedSessionId,
+            }
+          : {
+              // Replayed pre-#7 events carry no `kind`; they are simulated.
+              kind: "simulated" as const,
+              steps: event.data.steps,
+              stepDelaySeconds: event.data.stepDelaySeconds,
+              axis: null,
+              agentKind: null,
+              model: null,
+              effort: null,
+              promptFile: null,
+              bundleHash: null,
+              rawReportFile: null,
+              worktreePath: null,
+              preassignedSessionId: null,
+            };
       const lane: LaneView = {
-        ...event.data,
+        laneId: event.data.laneId,
+        paneId: event.data.paneId,
+        logFile: event.data.logFile,
+        stderrFile: event.data.stderrFile,
+        sentinelToken: event.data.sentinelToken,
+        ...(event.data.role === undefined ? {} : { role: event.data.role }),
+        ...registration,
+        isolationPre: null,
+        isolationPost: null,
+        sessionIdentity: null,
+        rawReportOutcome: null,
+        worktreeDisposition: null,
         runtimeState: "pending",
         semanticState: "unknown",
+        checkpointOrigin: null,
         contractState: "unknown",
         verificationState: "unverified",
         controlMode: "managed",
@@ -421,6 +646,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
           semanticState: event.data.semanticState,
           checkpointFile: event.data.checkpointFile,
           checkpointAt: event.at,
+          checkpointOrigin: event.actor === "runtime" ? "runtime" : "agent",
           checkpointSemanticSignature: checkpointSemanticSignature({
             status: event.data.semanticState,
             blockers: event.data.blockers,
@@ -473,6 +699,43 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
           dispatchedCommand: event.data.command,
         };
       });
+    case "lane_isolation_verified": {
+      const data = event.data;
+      return withLane(state, event, (lane) => {
+        if (lane.kind !== "agent") {
+          throw new Error(
+            "lane_isolation_verified applies to agent lanes only",
+          );
+        }
+        const view: LaneIsolationView = {
+          headOk: data.headOk,
+          cleanOk: data.cleanOk,
+          diffHashOk: data.diffHashOk,
+          detail: data.detail,
+          at: event.at,
+        };
+        if (data.phase === "pre") {
+          if (lane.isolationPre !== null) {
+            throw new Error("duplicate pre-flight lane_isolation_verified");
+          }
+          return { ...lane, isolationPre: view };
+        }
+        if (lane.isolationPost !== null) {
+          throw new Error("duplicate post-flight lane_isolation_verified");
+        }
+        return { ...lane, isolationPost: view };
+      });
+    }
+    case "lane_session_recorded":
+      return withLane(state, event, (lane) => {
+        if (lane.kind !== "agent") {
+          throw new Error("lane_session_recorded applies to agent lanes only");
+        }
+        if (lane.sessionIdentity !== null) {
+          throw new Error("duplicate lane_session_recorded");
+        }
+        return { ...lane, sessionIdentity: event.data.session };
+      });
     case "lane_contract_evaluated":
       return withLane(state, event, (lane) => ({
         ...lane,
@@ -486,8 +749,30 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         ...lane,
         verificationState: event.data.verificationState,
         evidenceFile: event.data.evidenceFile,
+        // Absent on replayed pre-#7 events; those runs had no raw artifact.
+        rawReportOutcome: event.data.rawReportOutcome ?? null,
         verificationRecordedAt: event.at,
       }));
+    case "lane_worktree_disposition":
+      return withLane(state, event, (lane) => {
+        if (lane.kind !== "agent") {
+          throw new Error(
+            "lane_worktree_disposition applies to agent lanes only",
+          );
+        }
+        if (lane.worktreeDisposition !== null) {
+          throw new Error("duplicate lane_worktree_disposition");
+        }
+        return {
+          ...lane,
+          worktreeDisposition: {
+            disposition: event.data.disposition,
+            retainedReason: event.data.retainedReason,
+            worktreePath: event.data.worktreePath,
+            at: event.at,
+          },
+        };
+      });
     case "checkpoint_announced":
       return withRun(state, event, { checkpointAnnouncedAt: event.at });
     case "human_interrupt": {
@@ -670,8 +955,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       if (!sameBreakdown(event.data.breakdown, breakdown)) {
         throw new Error("run_finished breakdown does not match current lane states");
       }
-      const expectedStatus =
-        breakdown.exitedZero === lanes.length ? "clean" : "degraded";
+      const expectedStatus = expectedFinishStatus(state);
       if (event.data.status !== expectedStatus) {
         throw new Error(
           `run_finished status must be "${expectedStatus}" for current lane states`,

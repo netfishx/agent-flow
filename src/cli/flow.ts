@@ -1,5 +1,8 @@
+import { randomUUID } from "node:crypto";
 import { RealHerdrAdapter } from "../herdr/real-adapter.ts";
 import { issueApiPath } from "../issue/gh-argv.ts";
+import { GitReviewIsolation } from "../review/isolation.ts";
+import { verificationPassed } from "../review/verification.ts";
 import { projectSynchronization } from "../issue/milestones.ts";
 import { RealIssueTracker } from "../issue/real-tracker.ts";
 import { sameIssueTarget } from "../issue/target.ts";
@@ -11,6 +14,7 @@ import type {
 import type { Ledger } from "../runtime/ledger.ts";
 import { projectRunState, type RunView } from "../runtime/reducer.ts";
 import { WorkflowRuntime } from "../runtime/runtime.ts";
+import type { RuntimeDeps } from "../runtime/types.ts";
 import { stat } from "node:fs/promises";
 
 const USAGE =
@@ -140,6 +144,39 @@ function renderRun(run: RunView, stdout: TextSink): void {
     stdout.write(
       `  artifacts stdout=${lane.logFile} stderr=${lane.stderrFile} checkpoint=${value(lane.checkpointFile)} result=${value(lane.resultFile)} evidence=${value(lane.evidenceFile)}\n`,
     );
+    if (lane.kind === "agent") {
+      const session =
+        lane.sessionIdentity === null
+          ? "unrecorded"
+          : lane.sessionIdentity.kind === "measured"
+            ? `measured:${lane.sessionIdentity.id}`
+            : `unavailable(${JSON.stringify(lane.sessionIdentity.reason)})`;
+      // The one shared pass predicate — never a third inline copy of it.
+      const isolation = (view: typeof lane.isolationPre): string =>
+        view === null
+          ? "unrecorded"
+          : verificationPassed(view)
+            ? "pass"
+            : `fail(${quotedValue(view.detail)})`;
+      const worktree =
+        lane.worktreeDisposition === null
+          ? "unrecorded"
+          : lane.worktreeDisposition.disposition === "removed"
+            ? "removed"
+            : `retained(${quotedValue(lane.worktreeDisposition.retainedReason)})`;
+      stdout.write(
+        `  agent axis=${value(lane.axis)} agentKind=${value(lane.agentKind)} model=${value(lane.model)} effort=${value(lane.effort)}\n`,
+      );
+      stdout.write(
+        `  review raw=${value(lane.rawReportFile)} brief=${value(lane.promptFile)} bundleHash=${value(lane.bundleHash)}\n`,
+      );
+      stdout.write(
+        `  isolation pre=${isolation(lane.isolationPre)} post=${isolation(lane.isolationPost)} session=${session}\n`,
+      );
+      stdout.write(
+        `  artifacts rawReport=${value(lane.rawReportOutcome)} checkpointOrigin=${value(lane.checkpointOrigin)} worktree=${worktree}\n`,
+      );
+    }
   }
 }
 
@@ -184,11 +221,17 @@ export function resolveIssueTarget(
   return target;
 }
 
-function createRealRuntime(
+/**
+ * The dependencies the real CLI hands the runtime. Exported so the wiring
+ * itself is testable: a resuming controller that lacks the review-isolation
+ * port fails post-flight closed and marks an otherwise good run invalid, and
+ * that regression is invisible to every test that injects its own deps.
+ */
+export function realRuntimeDeps(
   ledger: Ledger,
   authorizedTarget: IssueRef | null,
-): WorkflowRuntime {
-  return new WorkflowRuntime({
+): RuntimeDeps {
+  return {
     adapter: new RealHerdrAdapter(),
     ledger,
     clock: () => Date.now(),
@@ -196,12 +239,23 @@ function createRealRuntime(
       `flow-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,
     readResultFile: (path) => Bun.file(path).text(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    // A resuming controller must be able to vouch for reviewer isolation;
+    // without the port, post-flight fails closed and marks the run invalid.
+    reviewIsolation: new GitReviewIsolation(),
+    sessionIdgen: () => randomUUID(),
     ...(authorizedTarget === null
       ? {}
       : {
           issueTracker: new RealIssueTracker({ authorizedTarget }),
         }),
-  });
+  };
+}
+
+function createRealRuntime(
+  ledger: Ledger,
+  authorizedTarget: IssueRef | null,
+): WorkflowRuntime {
+  return new WorkflowRuntime(realRuntimeDeps(ledger, authorizedTarget));
 }
 
 async function deliveryTargetFor(

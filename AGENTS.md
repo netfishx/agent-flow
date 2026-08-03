@@ -18,7 +18,7 @@ Read [the runtime design](docs/design/observable-multi-agent-runtime.md) before 
 - Full child-Agent transcripts are not relayed through a parent model for summarization.
 - GitHub Issues track planned work, dependencies, ownership, and decisions.
 - The runtime ledger tracks actual runs, panes, sessions, events, exit codes, checkpoints, and artifacts.
-- The executing Agent records semantic progress and gaps; the runner records objective command evidence and exit codes.
+- The executing Agent records semantic progress and gaps; the runner records objective command evidence and exit codes. A read-only agent lane writes no checkpoint of its own: the runtime derives one from that lane's captured output and records it under the `runtime` actor, so a derivation is never published as the Agent's claim.
 - Reviewer verdicts are inputs. The owner is the only final decision-maker.
 
 ## Sources of truth

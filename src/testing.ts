@@ -26,3 +26,5 @@ export type {
   FakeMarkerHit,
 } from "./issue/fake-tracker.ts";
 export { classifyGhFailure } from "./issue/real-tracker.ts";
+export { FakeReviewIsolation } from "./review/fake-isolation.ts";
+export type { FakeReviewIsolationOptions } from "./review/fake-isolation.ts";
