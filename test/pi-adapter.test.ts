@@ -16,6 +16,7 @@ import type { RunEvent } from "../src/runtime/events.ts";
 import type { Ledger } from "../src/runtime/ledger.ts";
 import { WorkflowRuntime } from "../src/runtime/runtime.ts";
 import {
+  ArgumentSyntaxError,
   FLOW_COMMANDS,
   flowArgvFor,
   notificationFor,
@@ -316,6 +317,30 @@ describe("argument splitting keeps free text intact", () => {
     // a missing flag that changes which error the operator sees.
     expect(splitArguments('--note ""')).toEqual(["--note", ""]);
   });
+
+  test("an escaped quote stays inside the note", () => {
+    expect(splitArguments('--note "he said \\"go\\""')).toEqual([
+      "--note",
+      'he said "go"',
+    ]);
+  });
+
+  test("a single-quoted run is literal", () => {
+    expect(splitArguments("--note 'C:\\\\path'")).toEqual([
+      "--note",
+      "C:\\\\path",
+    ]);
+  });
+
+  test("an unterminated quote is refused, never silently truncated", () => {
+    // Truncating here would record a decision note the operator never typed.
+    expect(() => splitArguments('--note "half a')).toThrow(
+      ArgumentSyntaxError,
+    );
+    expect(() => splitArguments("--note trailing\\")).toThrow(
+      ArgumentSyntaxError,
+    );
+  });
 });
 
 describe("both entries are one path", () => {
@@ -413,11 +438,29 @@ describe("failures stay visible", () => {
     expect(notifications[0]!.message).toContain("usage: flow");
   });
 
-  test("a silent success still says something", () => {
+  test("a silent success says so without interpreting the silence", () => {
     const spec = FLOW_COMMANDS[0]!;
     expect(
       notificationFor(spec, { exitCode: 0, stdout: "", stderr: "" }),
-    ).toEqual({ message: "flow-status: no runs in the ledger", level: "info" });
+    ).toEqual({
+      message: "flow-status: completed with no output",
+      level: "info",
+    });
+  });
+
+  test("a malformed argument line is reported, not thrown at the host", async () => {
+    const root = await tempRoot();
+    await seedLiveRun(root);
+
+    const notifications = await invoke(
+      root,
+      "flow-decide",
+      'run-pi --decision accepted --note "half a',
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]!.level).toBe("error");
+    expect(notifications[0]!.message).toContain("unterminated");
   });
 
   test("a failure with no output still names the exit code", () => {

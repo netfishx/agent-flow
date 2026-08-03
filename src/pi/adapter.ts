@@ -36,6 +36,8 @@ export interface PiExtensionApi {
   registerCommand(name: string, options: PiCommandOptions): void;
 }
 
+export class ArgumentSyntaxError extends Error {}
+
 export interface FlowCommandSpec {
   /** Invoked as `/<name>`. */
   readonly name: string;
@@ -90,13 +92,31 @@ export const FLOW_COMMANDS: readonly FlowCommandSpec[] = [
  * this CLI actually needs. `--note "two words"` is the reason this is not a
  * whitespace split: a decision note is free text and losing its second word
  * would silently record a different decision.
+ *
+ * Backslash escapes are honoured for the same reason, and an unterminated
+ * quote throws instead of silently yielding a shorter note. Either failure
+ * would otherwise record an owner decision the operator did not type, which is
+ * worse than refusing the line.
  */
 export function splitArguments(text: string): string[] {
   const argv: string[] = [];
   let current = "";
   let started = false;
   let quote: '"' | "'" | null = null;
+  let escaped = false;
   for (const character of text) {
+    if (escaped) {
+      current += character;
+      escaped = false;
+      started = true;
+      continue;
+    }
+    // A single-quoted run is literal, as in a shell: a backslash inside it is
+    // just a backslash.
+    if (character === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
     if (quote !== null) {
       if (character === quote) quote = null;
       else current += character;
@@ -115,6 +135,12 @@ export function splitArguments(text: string): string[] {
     }
     current += character;
     started = true;
+  }
+  if (quote !== null) {
+    throw new ArgumentSyntaxError(`unterminated ${quote} quote in arguments`);
+  }
+  if (escaped) {
+    throw new ArgumentSyntaxError("arguments end with a dangling backslash");
   }
   if (started) argv.push(current);
   return argv;
@@ -174,7 +200,10 @@ export function notificationFor(
   }
   const detail = result.stdout.trim() || result.stderr.trim();
   return {
-    message: detail || `${spec.name}: no runs in the ledger`,
+    // Deliberately not "no runs in the ledger": that reading is only true for
+    // `status`, and a message that guesses what silence meant is the kind of
+    // interpretation an adapter must not add.
+    message: detail || `${spec.name}: completed with no output`,
     level: "info",
   };
 }
@@ -192,7 +221,18 @@ export function registerFlowCommands(
     pi.registerCommand(spec.name, {
       description: spec.description,
       handler: async (args, ctx) => {
-        const result = await runFlowCommand(flowArgvFor(spec, args), options);
+        let argv: readonly string[];
+        try {
+          argv = flowArgvFor(spec, args);
+        } catch (error) {
+          // A malformed argument line is the operator's typo, not a host
+          // crash. Report it where the operator is looking and stop, rather
+          // than throwing into Pi's command loop.
+          if (!(error instanceof ArgumentSyntaxError)) throw error;
+          ctx.ui.notify(`${spec.name}: ${error.message}`, "error");
+          return;
+        }
+        const result = await runFlowCommand(argv, options);
         const notification = notificationFor(spec, result);
         ctx.ui.notify(notification.message, notification.level);
       },
