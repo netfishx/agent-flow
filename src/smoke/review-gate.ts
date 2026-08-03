@@ -1,7 +1,10 @@
 // Deterministic refusal gate for the cross-review smokes. Both modes launch
 // REAL reviewer CLIs (real model spend), so both demand an explicit owner
 // authorization statement and refuse CI. The formal mode additionally
-// requires the #7 issue binding target.
+// requires an explicitly authorized issue binding whose repository matches the
+// reviewed origin. No issue number is pinned here: a reusable entry point must
+// not weld one ticket into itself, and the two checks together already close
+// the dangerous case of milestones posted onto an unrelated repository.
 
 import { resolveIssueTarget } from "../cli/flow.ts";
 import type { IssueRef } from "../runtime/events.ts";
