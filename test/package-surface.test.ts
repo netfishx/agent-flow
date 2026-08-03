@@ -8,6 +8,7 @@ import { describe, expect, test } from "bun:test";
 import * as entry from "../src/index.ts";
 import { realRuntimeDeps } from "../src/cli/flow.ts";
 import { InMemoryLedger } from "../src/runtime/ledger.ts";
+import { registerFlowCommands } from "../src/pi/adapter.ts";
 import { buildAgentLaneCommand } from "../src/review/commands.ts";
 
 describe("package entry surface", () => {
@@ -21,6 +22,13 @@ describe("package entry surface", () => {
     "extractClaudeReport",
     "parseCodexSessionId",
     "parseCodexTokensUsed",
+    // Host entry surfaces are not package surface. The Pi adapter is the same
+    // class of thing as `runFlowCli`: one host's way in, not runtime
+    // vocabulary a consumer composes with. Publishing it would invite a second
+    // entry to be built on top of it instead of on the runtime.
+    "registerFlowCommands",
+    "runFlowCommand",
+    "FLOW_COMMANDS",
   ])("does not publish %s", (name) => {
     expect(Object.keys(entry)).not.toContain(name);
   });
@@ -36,6 +44,12 @@ describe("package entry surface", () => {
   test("the withheld builder is reachable by internal path", () => {
     // Proves the export was withdrawn, not the capability.
     expect(typeof buildAgentLaneCommand).toBe("function");
+  });
+
+  test("the Pi adapter is reachable by internal path", () => {
+    // Same proof for the withheld entry adapter: the project's own
+    // `.pi/extensions` entry imports it this way.
+    expect(typeof registerFlowCommands).toBe("function");
   });
 });
 

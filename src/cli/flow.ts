@@ -21,7 +21,7 @@ const USAGE =
   "usage: flow status | flow inspect <runId> | flow resume <runId> | flow takeover <runId> <laneId> | flow release <runId> <laneId> | flow decide <runId> --decision <accepted|rejected|changes-requested> --note <text> [--issue-state <text>]";
 const DEFAULT_LANE_TIMEOUT_MS = 300_000;
 
-interface TextSink {
+export interface TextSink {
   write(text: string): unknown;
 }
 

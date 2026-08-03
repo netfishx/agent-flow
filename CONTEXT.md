@@ -103,3 +103,9 @@ and design records.
 - **`invalid`** — the run finish status when an agent lane that ran to a
   terminal state lacks a passing post-flight verification; an invalid run is
   never carried forward, and a rerun gets a new run id.
+- **Command adapter** — a host surface that exposes existing runtime commands
+  as that host's own commands, by calling the same entry function the shell
+  uses. It maps arguments and displays the runtime's bytes; it routes nothing,
+  decides nothing, spends no model call, and holds no run state. A host that
+  ran the work itself, or summarised a lane's output, would be a second
+  runtime rather than an adapter.
