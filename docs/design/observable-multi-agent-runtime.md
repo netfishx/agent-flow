@@ -1,6 +1,6 @@
 # Observable Multi-Agent Workflow Runtime
 
-> Status: design and tracer-bullet plan; not implemented.
+> This document is the design and tracer-bullet plan.
 > Progress source: [tracking issue #1](https://github.com/netfishx/agent-flow/issues/1) and its native blocking dependencies.
 > Do not maintain dynamic issue progress in this document.
 
@@ -9,9 +9,9 @@
 The owner's current development workflow already mixes several Agent tools and model families:
 
 - Codex for implementation and read-only decision consultation;
-- Grok for repository exploration and default external research;
-- Sonnet/Haiku for selected execution, research, and verification lanes;
-- Claude, Codex, and Grok for independent review perspectives;
+- Grok Build for repository exploration and default external research;
+- Claude Code (Sonnet/Haiku) for selected execution, research, and verification lanes;
+- Claude Code, Codex, and Grok Build for independent review perspectives;
 - Herdr for visible process hosting and human intervention.
 
 The current loss is not simply “too many models.” It comes from mechanical orchestration being distributed across skills and shell runbooks: constructing briefs, starting processes, carrying session and pane identifiers, polling, recovering sessions, checking output contracts, and moving artifacts between stages.
@@ -36,9 +36,11 @@ Provide one workflow entry point with multiple isolated, visible, directly contr
 
 The runtime unifies orchestration and state. It does not centralize execution into a hidden parent Agent.
 
+The v1 execution toolchain is Claude Code, Codex, and Grok Build, hosted as visible native processes under Herdr. The entry point itself is technology-neutral: the runtime is driven directly and depends on no Agent-host product.
+
 ## 3. Non-goals
 
-- Running every Agent silently inside Pi or another single process.
+- Running every Agent silently inside one host process.
 - Adding a parent-model turn to decide which deterministic lane to start.
 - Removing independent reviewer contexts to reduce token use.
 - Relaying complete child-Agent transcripts through a coordinator model.
@@ -215,20 +217,7 @@ Compare the prototype with the Phase 0 baseline on manual commands, startup time
 
 Stop if mechanical dispatch still needs an extra model call, any important Agent becomes hidden, review quality falls, or controller loss prevents recovery.
 
-### Phase 6: Evaluate a Pi command adapter
-
-Only after Phase 5 passes, expose deterministic commands such as:
-
-```text
-/xr <fixed-point> <spec-ref>
-/flow-status <run-id>
-/flow-focus <run-id> <lane>
-/flow-retry <run-id> <lane>
-```
-
-The commands call the runtime directly. Pi may be an entry/controller pane or one Agent adapter, but Herdr continues to host observable execution.
-
-### Phase 7: Migrate the implementation workflow
+### Phase 6: Migrate the implementation workflow
 
 Migrate worktree isolation, Codex implementation, checkpoints, objective verification, resume, two-round stop-loss, cross-review chaining, and owner judgement only after the read-only tracer succeeds.
 
@@ -257,5 +246,4 @@ The following remain explicit owner decisions after evidence is available:
 
 - whether Claude review axes move from internal sub-agents into Herdr panes;
 - whether deterministic verification replaces any Sonnet lane-runner work;
-- whether Pi becomes a command adapter, an Agent adapter, both, or neither;
 - whether implementation migration is worth the change in native CLI behavior.
