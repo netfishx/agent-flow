@@ -6,6 +6,14 @@ import type {
   ReviewAxis,
   SessionIdentity,
 } from "../review/types.ts";
+import type {
+  AdvisoryAgentStatus,
+  AdvisoryStateSource,
+  AttemptEndReason,
+  InteractiveAgentKind,
+  ReconciliationOutcome,
+  SteerObservationOutcome,
+} from "../interactive/types.ts";
 
 export type RunEventType =
   | "run_started"
@@ -28,6 +36,20 @@ export type RunEventType =
   | "human_interrupt"
   | "lane_takeover"
   | "lane_release"
+  | "interactive_attempt_started"
+  | "interactive_attempt_start_failed"
+  | "interactive_attempt_bound"
+  | "interactive_attempt_ended"
+  | "interactive_attempt_superseded"
+  | "interactive_attempt_reconciled"
+  | "interactive_retry_authorized"
+  | "interactive_runner_evidence"
+  | "lane_steer_submitted"
+  | "lane_steer_observed"
+  | "lane_cancel_turn"
+  | "lane_abort_session"
+  | "lane_blocked_observed"
+  | "lane_advisory_state_observed"
   | "controller_attached"
   | "issue_binding_resolved"
   | "issue_delivery_intended"
@@ -184,9 +206,165 @@ export interface AgentLaneRegisteredData extends LaneRegisteredCommon {
   readonly preassignedSessionId: string | null;
 }
 
+/**
+ * The interactive write lane. It carries no brief file, no raw-report file,
+ * and no pre-assigned session id at REGISTRATION, because all three belong to
+ * an attempt rather than to the lane: a retry allocates a new pane, a new
+ * session, and new declared paths, and the lane outlives every one of them.
+ */
+export interface InteractiveLaneRegisteredData extends LaneRegisteredCommon {
+  readonly kind: "interactive";
+  readonly agentKind: InteractiveAgentKind;
+  readonly model: string;
+  readonly effort: string;
+  readonly worktreePath: string;
+}
+
 export type LaneRegisteredData =
   | SimulatedLaneRegisteredData
-  | AgentLaneRegisteredData;
+  | AgentLaneRegisteredData
+  | InteractiveLaneRegisteredData;
+
+/** The human act that authorized an attempt to exist. Never runtime-issued. */
+export interface AttemptAuthorizationData {
+  readonly actor: "human";
+  readonly note: string;
+}
+
+export interface InteractiveAttemptStartedData {
+  readonly attemptId: string;
+  readonly ordinal: number;
+  readonly parentAttemptId: string | null;
+  readonly agentKind: InteractiveAgentKind;
+  readonly model: string;
+  readonly effort: string;
+  readonly paneId: string;
+  readonly worktreePath: string;
+  readonly briefFile: string;
+  /** Declared paths the Agent writes to. Nothing durable reads scrollback. */
+  readonly checkpointFile: string;
+  readonly resultPointer: string;
+  readonly authorization: AttemptAuthorizationData;
+}
+
+/**
+ * A start that never became a session. Recorded as a start failure with its
+ * cause — never as an implicit retry, which only a human may authorize.
+ */
+export interface InteractiveAttemptStartFailedData {
+  readonly attemptId: string;
+  readonly cause: string;
+}
+
+/** What Herdr reported once the agent was detected and ready for input. */
+export interface InteractiveAttemptBoundData {
+  readonly attemptId: string;
+  /** Observed name. Herdr clears it on exit, so it is not a durable handle. */
+  readonly agentName: string;
+  readonly agentSessionId: string | null;
+  /** The argv Herdr launched, recorded verbatim. */
+  readonly argv: readonly string[];
+  readonly readinessMs: number;
+}
+
+export interface InteractiveAttemptEndedData {
+  readonly attemptId: string;
+  readonly endReason: AttemptEndReason;
+  /**
+   * The session's own exit code when one was observed, null otherwise. It is a
+   * SESSION fact: an interactive agent does not exit when a turn finishes, so
+   * this never says the work completed, and it is never fabricated.
+   */
+  readonly exitCode: number | null;
+}
+
+export interface InteractiveAttemptSupersededData {
+  readonly attemptId: string;
+  readonly supersededBy: string;
+}
+
+export interface InteractiveAttemptReconciledData {
+  readonly attemptId: string;
+  readonly outcome: ReconciliationOutcome;
+  /** Re-read at reconciliation: a pane moved between workspaces gets a new id. */
+  readonly paneId: string;
+  readonly detail: string | null;
+}
+
+export interface InteractiveRetryAuthorizedData {
+  /** The attempt being retried past; the new attempt records it as parent. */
+  readonly parentAttemptId: string;
+  readonly note: string;
+}
+
+export interface InteractiveRunnerEvidenceData {
+  readonly evidenceId: string;
+  readonly attemptId: string;
+  /** Exact argv-derived command line, run in its OWN pane, not the session. */
+  readonly command: string;
+  readonly logFile: string;
+  readonly paneId: string;
+  /** Parsed from the durable log's sentinel; null when none was captured. */
+  readonly exitCode: number | null;
+  readonly startedAt: number;
+  readonly endedAt: number | null;
+}
+
+/** Recorded BEFORE submission, so a lost reply cannot erase the attempt to steer. */
+export interface LaneSteerSubmittedData {
+  readonly attemptId: string;
+  readonly text: string;
+  readonly paneId: string;
+  readonly target: string;
+}
+
+/**
+ * The transition observed after a submission — a separate fact from the
+ * submission. Nothing here may be read as "the steer was applied" or "the work
+ * is done": `--wait` tracks lifecycle state, not turns.
+ */
+export interface LaneSteerObservedData {
+  readonly attemptId: string;
+  readonly outcome: SteerObservationOutcome;
+  readonly observedStatus: AdvisoryAgentStatus | null;
+  readonly source: AdvisoryStateSource | null;
+}
+
+/** Cancel the current turn; the session survives and stays steerable. */
+export interface LaneCancelTurnData {
+  readonly attemptId: string;
+  readonly method: "send-keys";
+  readonly keys: readonly string[];
+  readonly observedStatus: AdvisoryAgentStatus | null;
+}
+
+/** End the session by signalling the pane's foreground process group. */
+export interface LaneAbortSessionData {
+  readonly attemptId: string;
+  readonly method: "signal-process-group";
+  readonly signal: string;
+  readonly delivered: boolean;
+  readonly observedStatus: AdvisoryAgentStatus | null;
+}
+
+/**
+ * Advisory Herdr state, recorded with its source. Consumed as a wait edge and
+ * a UI signal; no lane- or attempt-outcome projection may read it.
+ */
+export interface LaneAdvisoryStateObservedData {
+  readonly attemptId: string;
+  readonly status: AdvisoryAgentStatus;
+  readonly source: AdvisoryStateSource;
+  readonly paneId: string;
+  readonly message: string | null;
+}
+
+/**
+ * The `blocked` case of the advisory channel, named separately because it is
+ * the one the control plane consumes as a wait edge. Answering the approval is
+ * a human act; the runtime never auto-approves and writes no UI parser.
+ */
+export type LaneBlockedObservedData = LaneAdvisoryStateObservedData;
 
 export interface InputBundleCapturedData {
   readonly files: readonly BundleFileRecord[];
@@ -215,6 +393,8 @@ export interface LaneCheckpointData {
   readonly blockers?: readonly string[];
   readonly next?: readonly string[];
   readonly gaps?: readonly string[];
+  /** Set on interactive lanes, whose checkpoints belong to one attempt. */
+  readonly attemptId?: string;
 }
 
 export interface LaneExitedData {
@@ -333,6 +513,20 @@ export interface RunEventDataByType {
   readonly human_interrupt: HumanInterruptData;
   readonly lane_takeover: EmptyEventData;
   readonly lane_release: EmptyEventData;
+  readonly interactive_attempt_started: InteractiveAttemptStartedData;
+  readonly interactive_attempt_start_failed: InteractiveAttemptStartFailedData;
+  readonly interactive_attempt_bound: InteractiveAttemptBoundData;
+  readonly interactive_attempt_ended: InteractiveAttemptEndedData;
+  readonly interactive_attempt_superseded: InteractiveAttemptSupersededData;
+  readonly interactive_attempt_reconciled: InteractiveAttemptReconciledData;
+  readonly interactive_retry_authorized: InteractiveRetryAuthorizedData;
+  readonly interactive_runner_evidence: InteractiveRunnerEvidenceData;
+  readonly lane_steer_submitted: LaneSteerSubmittedData;
+  readonly lane_steer_observed: LaneSteerObservedData;
+  readonly lane_cancel_turn: LaneCancelTurnData;
+  readonly lane_abort_session: LaneAbortSessionData;
+  readonly lane_blocked_observed: LaneBlockedObservedData;
+  readonly lane_advisory_state_observed: LaneAdvisoryStateObservedData;
   readonly controller_attached: ControllerAttachedData;
   readonly issue_binding_resolved: IssueBindingResolvedData;
   readonly issue_delivery_intended: IssueDeliveryIntendedData;
@@ -389,6 +583,25 @@ export type RunEvent =
   | EventFor<"human_interrupt", "human", string>
   | EventFor<"lane_takeover", "human", string>
   | EventFor<"lane_release", "human", string>
+  // Attempt lifecycle is the runtime's process bookkeeping...
+  | EventFor<"interactive_attempt_started", "runtime", string>
+  | EventFor<"interactive_attempt_start_failed", "runtime", string>
+  | EventFor<"interactive_attempt_bound", "runtime", string>
+  | EventFor<"interactive_attempt_ended", "runtime", string>
+  | EventFor<"interactive_attempt_superseded", "runtime", string>
+  | EventFor<"interactive_attempt_reconciled", "runtime", string>
+  // ...while every CONTROL is a human act, and typed as one. No model and no
+  // runtime path may author a steer, a cancel, an abort, or a retry.
+  | EventFor<"interactive_retry_authorized", "human", string>
+  | EventFor<"lane_steer_submitted", "human", string>
+  | EventFor<"lane_cancel_turn", "human", string>
+  | EventFor<"lane_abort_session", "human", string>
+  // Observations of advisory state are the runtime's, and are never evidence.
+  | EventFor<"lane_steer_observed", "runtime", string>
+  | EventFor<"lane_blocked_observed", "runtime", string>
+  | EventFor<"lane_advisory_state_observed", "runtime", string>
+  // Runner evidence keeps the runner's authorship, as on the headless lane.
+  | EventFor<"interactive_runner_evidence", "runner", string>
   | EventFor<"controller_attached", "runtime">
   | EventFor<"issue_binding_resolved", "runtime">
   | EventFor<"issue_delivery_intended", "runtime">

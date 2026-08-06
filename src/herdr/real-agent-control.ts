@@ -1,0 +1,159 @@
+// Real implementation of the agent-control port. Deliberately does not reuse
+// `RealHerdrAdapter`'s private spawn helper: the read-only adapter is accepted
+// work this ticket does not modify, so the fifteen lines are duplicated rather
+// than refactored across that boundary.
+
+import {
+  agentGetArgv,
+  agentPromptArgv,
+  agentSendKeysArgv,
+  agentStartArgv,
+  agentWaitArgv,
+  paneReleaseAgentArgv,
+  paneReportAgentArgv,
+  type AgentPromptOptions,
+  type AgentStartOptions,
+  type PaneReportAgentOptions,
+} from "./agent-argv.ts";
+import {
+  parseAgentInfo,
+  parseAgentPrompted,
+  parseAgentStarted,
+  type AgentInfoView,
+  type AgentStartedView,
+} from "./agent-json.ts";
+import type { AgentPromptResult, HerdrAgentControl } from "./agent-control.ts";
+import { parseHerdrError } from "./json.ts";
+import type { AdvisoryAgentStatus } from "../interactive/types.ts";
+
+interface CommandResult {
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly exitCode: number;
+}
+
+export interface RealHerdrAgentControlOptions {
+  readonly binary?: string;
+}
+
+/**
+ * Herdr error codes this port interprets rather than raises. Everything else
+ * is a genuine failure and is thrown, so a broken CLI never masquerades as a
+ * benign observation.
+ */
+const STALLED = "agent_prompt_stalled";
+const TIMEOUT = "timeout";
+const NOT_FOUND = new Set(["not_found", "agent_not_found", "unknown_target"]);
+
+export class RealHerdrAgentControl implements HerdrAgentControl {
+  private readonly binary: string;
+
+  constructor(options: RealHerdrAgentControlOptions = {}) {
+    this.binary = options.binary ?? "herdr";
+  }
+
+  private async run(argv: readonly string[]): Promise<CommandResult> {
+    const proc = Bun.spawn([this.binary, ...argv], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    const exitCode = await proc.exited;
+    return { stdout, stderr, exitCode };
+  }
+
+  private async runOk(argv: readonly string[]): Promise<string> {
+    const { stdout, stderr, exitCode } = await this.run(argv);
+    if (exitCode !== 0) {
+      const error = parseHerdrError(stderr);
+      throw new Error(
+        `herdr ${argv.join(" ")} failed (exit ${exitCode}): ${
+          error
+            ? `${error.code}: ${error.message}`
+            : stderr.trim() || stdout.trim() || "no output"
+        }`,
+      );
+    }
+    return stdout;
+  }
+
+  async startAgent(options: AgentStartOptions): Promise<AgentStartedView> {
+    return parseAgentStarted(await this.runOk(agentStartArgv(options)));
+  }
+
+  async promptAgent(
+    target: string,
+    text: string,
+    options: AgentPromptOptions = {},
+  ): Promise<AgentPromptResult> {
+    const { stdout, stderr, exitCode } = await this.run(
+      agentPromptArgv(target, text, options),
+    );
+    if (exitCode === 0) {
+      // Without --wait there is nothing to observe: submission happened, and
+      // that is all this call may be read as.
+      if (options.waitMs === undefined) {
+        return { outcome: "not-observed", agent: null };
+      }
+      return { outcome: "state-observed", agent: parseAgentPrompted(stdout) };
+    }
+    const error = parseHerdrError(stderr);
+    if (error?.code === STALLED) return { outcome: "stalled", agent: null };
+    if (error?.code === TIMEOUT) return { outcome: "timeout", agent: null };
+    throw new Error(
+      `herdr agent prompt failed (exit ${exitCode}): ${
+        error ? `${error.code}: ${error.message}` : stderr.trim() || "no output"
+      }`,
+    );
+  }
+
+  async sendKeys(target: string, keys: readonly string[]): Promise<void> {
+    await this.runOk(agentSendKeysArgv(target, keys));
+  }
+
+  async waitForState(
+    target: string,
+    until: readonly AdvisoryAgentStatus[],
+    timeoutMs: number,
+  ): Promise<AgentInfoView | null> {
+    const { stdout, stderr, exitCode } = await this.run(
+      agentWaitArgv(target, until, timeoutMs),
+    );
+    if (exitCode === 0) return parseAgentInfo(stdout);
+    const error = parseHerdrError(stderr);
+    if (error?.code === TIMEOUT) return null;
+    throw new Error(
+      `herdr agent wait failed (exit ${exitCode}): ${
+        error ? `${error.code}: ${error.message}` : stderr.trim() || "no output"
+      }`,
+    );
+  }
+
+  async getAgent(target: string): Promise<AgentInfoView | null> {
+    const { stdout, stderr, exitCode } = await this.run(agentGetArgv(target));
+    if (exitCode === 0) return parseAgentInfo(stdout);
+    const error = parseHerdrError(stderr);
+    // A dead session simply has no record: agent state is live-only.
+    if (error !== null && NOT_FOUND.has(error.code)) return null;
+    throw new Error(
+      `herdr agent get failed (exit ${exitCode}): ${
+        error ? `${error.code}: ${error.message}` : stderr.trim() || "no output"
+      }`,
+    );
+  }
+
+  async reportAgentState(options: PaneReportAgentOptions): Promise<void> {
+    await this.runOk(paneReportAgentArgv(options));
+  }
+
+  async releaseAgentState(options: {
+    readonly paneId: string;
+    readonly source: string;
+    readonly agent: string;
+  }): Promise<void> {
+    await this.runOk(paneReleaseAgentArgv(options));
+  }
+}
