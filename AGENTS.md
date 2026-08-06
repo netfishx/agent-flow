@@ -4,7 +4,9 @@
 
 Build an observable multi-agent workflow runtime for the owner's existing mixed-agent development process.
 
-The goal is one workflow entry point with multiple isolated Agent processes that remain visible and directly controllable in separate Herdr panes. The goal is not to hide every Agent inside Pi, add a parent-model relay, or replace model diversity with a single harness.
+The goal is one workflow entry point with multiple isolated Agent processes that remain visible and directly controllable in separate Herdr panes. The goal is not to hide every Agent inside a single host process, add a parent-model relay, or replace model diversity with a single harness.
+
+The v1 execution toolchain is Claude Code, Codex, and Grok Build, each hosted as a visible native process under Herdr. The runtime's own entry point stays technology-neutral: it depends on no Agent-host product, and adopting one would be an explicit owner decision rather than a roadmap assumption.
 
 Read [the runtime design](docs/design/observable-multi-agent-runtime.md) before planning or implementing work.
 
@@ -27,15 +29,16 @@ Read [the runtime design](docs/design/observable-multi-agent-runtime.md) before 
 - Work status and blocking edges: GitHub Issues under tracking issue `#1`
 - Per-run execution state: the runtime ledger defined by the design
 - Repository tracker and domain conventions: `docs/agents/`
+- Scope exclusions and deferred options: `.out-of-scope/`
 
 Do not maintain dynamic project progress in this file or duplicate it in long-lived prompts. Query GitHub Issues and the run ledger.
 
 ## Current workflow being preserved
 
 - Codex: implementation and read-only decision consultation
-- Grok: repository exploration and default external research
-- Sonnet/Haiku: selected execution, research, and mechanical verification lanes
-- Claude, Codex, and Grok: independent review perspectives
+- Grok Build: repository exploration and default external research
+- Claude Code (Sonnet/Haiku): selected execution, research, and mechanical verification lanes
+- Claude Code, Codex, and Grok Build: independent review perspectives
 - Herdr: visible process hosting, lifecycle observation, and human intervention
 
 Role assignments may evolve through explicit owner decisions, but observable execution and independent contexts are architectural constraints.
@@ -46,7 +49,6 @@ Role assignments may evolve through explicit owner decisions, but observable exe
 - Reserve model calls for judgement: specification completeness, design choices, review findings, and owner-facing decisions.
 - Build tracer bullets that are independently observable and verifiable.
 - Start with a read-only cross-review prototype; migrate write-capable implementation workflows only after parity is demonstrated.
-- Keep Pi optional until measurement shows that it reduces loss without hiding execution.
 - Do not silently broaden a ticket beyond its declared acceptance criteria.
 
 ## Agent skills
