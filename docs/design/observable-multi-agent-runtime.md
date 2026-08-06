@@ -60,14 +60,29 @@ The v1 execution toolchain is Claude Code, Codex, and Grok Build, hosted as visi
 
 ### Executing Agent records semantic progress
 
-A simulated lane writes its own checkpoint/result before yielding. An agent
-lane writes neither: the runtime derives its terminal record
-from the lane's own captured raw report and records it under the `runtime`
-actor, so a derivation is never published as an Agent's claim.
+Who authors the checkpoint depends on whether the runtime can capture the
+lane's output, and it is recorded either way:
 
-The record's shape is the same either way. `unknown` is reserved for a
-runtime-derived record whose lane left no evidence of progress — a crash, a
-loss, or a non-zero exit the runtime did not interrupt:
+- A **simulated lane** writes its own checkpoint/result before yielding.
+- A **headless review lane** writes neither. Its stdout is captured by the
+  runtime, so the runtime derives the terminal record from that captured raw
+  report and commits it under the `runtime` actor. A derivation is never
+  published as the Agent's claim.
+- An **interactive write lane** authors its own semantic checkpoint and result,
+  at paths declared in its lane contract. There is no captured stdout to derive
+  from — an alternate-screen TUI's departed rows never enter host scrollback and
+  cannot be recovered by asking for more lines — so nothing durable may depend
+  on scrollback, and the Agent writes the record itself. This is what "the Agent
+  owns semantic progress" already meant; the derivation rule above exists only
+  because a headless lane's output is capturable.
+- When an **interactive lane leaves no record at all**, the runtime records
+  `unknown` under the `runtime` actor and generates no Agent claim. It does not
+  reconstruct, summarize, or infer what the session did.
+
+The record's shape is the same in every case. `unknown` is reserved for a
+runtime-authored record whose lane left no evidence of progress — a crash, a
+loss, a non-zero exit the runtime did not interrupt, or an interactive session
+that wrote nothing to its declared paths:
 
 ```text
 STATUS: working | complete | partial | blocked | unknown
@@ -86,7 +101,9 @@ GAPS:
 - <unfinished or uncertain work>
 ```
 
-The Agent owns semantic progress because it knows what it attempted and what remains. Its claims do not replace objective verification. For an agent lane the runtime owns the record instead, derived from that lane's captured output and committed under the `runtime` actor; the two authorships are recorded distinctly and never rendered as the same claim.
+The Agent owns semantic progress because it knows what it attempted and what remains. Its claims do not replace objective verification. For a headless review lane the runtime owns the record instead, derived from that lane's captured output and committed under the `runtime` actor. The two authorships are recorded distinctly and never rendered as the same claim, whichever lane kind produced them.
+
+Herdr's own `working`/`blocked`/`done`/`idle`/`unknown` agent state is a live UI classification. It serves the UI, wait edges, and human control; it never enters the evidence chain and no lane- or attempt-outcome projection may read it. Three properties fix this: `done` is the same underlying idle state as `idle` and differs only by whether the tab has been seen in the focused UI, `unknown` means Herdr could not classify confidently, and Herdr's `pane_exited` event carries no exit code at all.
 
 ### Runner records verification evidence
 

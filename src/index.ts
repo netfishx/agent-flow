@@ -113,6 +113,55 @@ export type { HerdrAdapter } from "./herdr/adapter.ts";
 export { RealHerdrAdapter } from "./herdr/real-adapter.ts";
 export type { RealHerdrAdapterOptions } from "./herdr/real-adapter.ts";
 
+// The interactive write lane. Its argv builders and JSON parsers are NOT
+// exported, for the same reason the agent-lane batteries are not: they emit
+// CLI-family mechanics and shell quoting, which the design keeps inside the
+// implementation (docs/design/observable-multi-agent-runtime.md section 6).
+export {
+  AttemptNotControllableError,
+  InteractiveLaneController,
+  LaneTakenOverError,
+  RetryNotAuthorizedError,
+  pendingRetries,
+} from "./interactive/control-plane.ts";
+export type {
+  InteractiveDeps,
+  OpenLaneConfig,
+  RunnerRequest,
+  StartAttemptInput,
+  StartAttemptOutcome,
+} from "./interactive/control-plane.ts";
+export {
+  attemptDisposition,
+  objectiveFactsOf,
+  projectAttemptDisposition,
+} from "./interactive/attempts.ts";
+export type { ObjectiveAttemptFacts } from "./interactive/attempts.ts";
+export type {
+  AdvisoryAgentStatus,
+  AdvisoryObservation,
+  AdvisoryStateSource,
+  AttemptAuthorization,
+  AttemptCheckpoint,
+  AttemptDisposition,
+  AttemptEndReason,
+  AttemptStartFailure,
+  InteractiveAgentKind,
+  InteractiveAttemptView,
+  InteractiveLaneView,
+  InteractiveRunnerEvidence,
+  ReconciliationOutcome,
+  ReconciliationRecord,
+  SteerObservation,
+  SteerObservationOutcome,
+} from "./interactive/types.ts";
+export type {
+  AgentPromptResult,
+  HerdrAgentControl,
+} from "./herdr/agent-control.ts";
+export { RealHerdrAgentControl } from "./herdr/real-agent-control.ts";
+export type { RealHerdrAgentControlOptions } from "./herdr/real-agent-control.ts";
+
 export {
   REPORT_CONTRACT_BLOCK,
   validateReportContract,
