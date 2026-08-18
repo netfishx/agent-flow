@@ -16,6 +16,10 @@ import { FsLedger } from "../src/runtime/fs-ledger.ts";
 import { attemptDisposition } from "../src/interactive/attempts.ts";
 import { InteractiveLaneController } from "../src/interactive/control-plane.ts";
 
+/** Accepts every worktree; isolation itself is proved against real git. */
+const permissiveIsolation = { verifyWriteWorktree: async () => ({ ok: true as const }) };
+
+
 const roots: string[] = [];
 
 afterEach(async () => {
@@ -46,6 +50,7 @@ const LANE = {
   model: "sonnet",
   effort: "high",
   worktreePath: "/tmp/repo-wt",
+  repoRoot: "/tmp/repo",
 } as const;
 
 /**
@@ -74,6 +79,7 @@ function controllerOver(ledger: FsLedger, shared: Seams, root: string) {
     adapter: shared.adapter,
     agentControl: shared.agentControl,
     ledger,
+    isolation: permissiveIsolation,
     artifactRoot: root,
     clock: () => 2_000,
     idgen: () => `id-${shared.next()}`,
@@ -350,6 +356,7 @@ describe("the production entry point is reachable", () => {
         "--kind", "claude",
         "--model", "sonnet",
         "--effort", "high",
+        "--repo", root,
         "--worktree", root,
       ],
       opened,
@@ -397,6 +404,18 @@ describe("the production entry point is reachable", () => {
     expect(attempt.authorization.note).toContain("owner authorized");
   });
 
+  test("open-lane requires the repository the worktree must belong to", () => {
+    // Without --repo there is nothing to verify the worktree against.
+    expect(
+      parseInteractiveArgs([
+        "open-lane",
+        "--workflow", "impl", "--workspace", "ws", "--cwd", "/tmp",
+        "--lane", "impl-1", "--kind", "claude", "--model", "m",
+        "--effort", "high", "--worktree", "/tmp/wt",
+      ]),
+    ).toBeNull();
+  });
+
   test("open-lane rejects an unsupported agent kind", async () => {
     expect(
       parseInteractiveArgs([
@@ -408,6 +427,7 @@ describe("the production entry point is reachable", () => {
         "--kind", "pi",
         "--model", "m",
         "--effort", "high",
+        "--repo", "/tmp",
         "--worktree", "/tmp",
       ]),
     ).toBeNull();

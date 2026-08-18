@@ -44,7 +44,7 @@ function attempt(
     steerObservations: 0,
     lastCancelTurnAt: null,
     lastAbortAt: null,
-    lastControlDelivery: null,
+    lastControl: null,
     ...patch,
   };
 }

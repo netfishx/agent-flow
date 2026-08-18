@@ -21,6 +21,10 @@ import type {
 } from "../src/herdr/fake-agent-control.ts";
 import type { FakeHerdrAdapterOptions } from "../src/herdr/fake-adapter.ts";
 
+/** Accepts every worktree; isolation itself is proved against real git. */
+const permissiveIsolation = { verifyWriteWorktree: async () => ({ ok: true as const }) };
+
+
 let root: string;
 
 beforeEach(async () => {
@@ -46,6 +50,7 @@ function harness(
     adapter,
     agentControl,
     ledger,
+    isolation: permissiveIsolation,
     artifactRoot: root,
     clock: () => clock.now(),
     idgen: () => `id-${++seq}`,
@@ -63,6 +68,7 @@ const LANE = {
   model: "sonnet",
   effort: "high",
   worktreePath: "/tmp/repo-wt",
+  repoRoot: "/tmp/repo",
 } as const;
 
 function attemptInput(dir: string, note = "owner authorized attempt") {
@@ -409,6 +415,7 @@ describe("controller recovery", () => {
       adapter: gone,
       agentControl: h.agentControl,
       ledger: h.ledger,
+      isolation: permissiveIsolation,
       artifactRoot: root,
       clock: () => 9_000,
       idgen: () => "id-recovered",
@@ -604,6 +611,7 @@ function freshController(
       adapter,
       agentControl,
       ledger,
+      isolation: permissiveIsolation,
       artifactRoot: root,
       clock: () => 5_000,
       idgen: () => "id-fresh",

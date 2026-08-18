@@ -118,13 +118,20 @@ export type { RealHerdrAdapterOptions } from "./herdr/real-adapter.ts";
 // CLI-family mechanics and shell quoting, which the design keeps inside the
 // implementation (docs/design/observable-multi-agent-runtime.md section 6).
 export {
+  AttemptNotBoundError,
   AttemptNotControllableError,
   InteractiveLaneController,
   LaneTakenOverError,
   RetryNotAuthorizedError,
-  attemptArtifactPaths,
+  WriteLaneIsolationError,
+  controlDeliveryState,
   pendingRetries,
 } from "./interactive/control-plane.ts";
+export { GitWriteLaneIsolation } from "./interactive/isolation.ts";
+export type {
+  WriteLaneIsolationOutcome,
+  WriteLaneIsolationPort,
+} from "./interactive/isolation.ts";
 export type {
   InteractiveDeps,
   OpenLaneConfig,
@@ -146,6 +153,8 @@ export type {
   AttemptDisposition,
   AttemptEndReason,
   ControlDelivery,
+  ControlDeliveryState,
+  ControlRecord,
   DeliveredControl,
   InteractiveAgentKind,
   InteractiveAttemptView,

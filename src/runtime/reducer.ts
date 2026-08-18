@@ -24,6 +24,7 @@ import type {
 } from "../review/types.ts";
 import type {
   AdvisoryObservation,
+  DeliveredControl,
   InteractiveAttemptView,
 } from "../interactive/types.ts";
 import { verificationPassed } from "../review/verification.ts";
@@ -95,6 +96,8 @@ export interface LaneView {
   readonly kind: "simulated" | "agent" | "interactive";
   /** Root the interactive lane derives each attempt's declared paths under. */
   readonly artifactRoot: string | null;
+  /** The repository an interactive lane's worktree was verified against. */
+  readonly repoRoot: string | null;
   readonly steps: number;
   readonly stepDelaySeconds: number;
   readonly role?: string;
@@ -601,6 +604,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
               worktreePath: data.worktreePath,
               preassignedSessionId: data.preassignedSessionId,
               artifactRoot: null,
+              repoRoot: null,
               logFile: data.logFile,
               stderrFile: data.stderrFile,
               sentinelToken: data.sentinelToken,
@@ -624,6 +628,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
                 worktreePath: data.worktreePath,
                 preassignedSessionId: null,
                 artifactRoot: data.artifactRoot,
+                repoRoot: data.repoRoot,
                 logFile: null,
                 stderrFile: null,
                 sentinelToken: null,
@@ -643,6 +648,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
                 worktreePath: null,
                 preassignedSessionId: null,
                 artifactRoot: null,
+                repoRoot: null,
                 logFile: data.logFile,
                 stderrFile: data.stderrFile,
                 sentinelToken: data.sentinelToken,
@@ -993,7 +999,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         steerObservations: 0,
         lastCancelTurnAt: null,
         lastAbortAt: null,
-        lastControlDelivery: null,
+        lastControl: null,
       };
       // `supersededBy` is DERIVED here from the child naming its parent. There
       // is no separate supersede event, so the two directions cannot disagree.
@@ -1134,27 +1140,66 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
               ],
       }));
     // Control INTENT, recorded before the Herdr call so a controller that dies
-    // mid-call still leaves the request behind. Delivery is a separate fact.
+    // mid-call still leaves the request behind. Delivery is a separate fact,
+    // paired to this intent by `controlId`.
     case "lane_cancel_turn":
-      return withAttempt(state, event, event.data.attemptId, (attempt) => ({
-        ...attempt,
-        lastCancelTurnAt: event.at,
-      }));
-    case "lane_abort_session":
-      return withAttempt(state, event, event.data.attemptId, (attempt) => ({
-        ...attempt,
-        lastAbortAt: event.at,
-      }));
+    case "lane_abort_session": {
+      const control: DeliveredControl =
+        event.type === "lane_cancel_turn" ? "cancel-turn" : "abort-session";
+      const method =
+        event.type === "lane_cancel_turn"
+          ? ("send-keys" as const)
+          : ("signal-process-group" as const);
+      const controlId = event.data.controlId;
+      return withAttempt(state, event, event.data.attemptId, (attempt) => {
+        if (attempt.lastControl?.controlId === controlId) {
+          throw new Error(`duplicate control intent "${controlId}"`);
+        }
+        return {
+          ...attempt,
+          ...(control === "cancel-turn"
+            ? { lastCancelTurnAt: event.at }
+            : { lastAbortAt: event.at }),
+          lastControl: {
+            controlId,
+            control,
+            method,
+            requestedAt: event.at,
+            delivery: null,
+          },
+        };
+      });
+    }
     case "lane_control_delivered":
-      return withAttempt(state, event, event.data.attemptId, (attempt) => ({
+      return withAttempt(state, event, event.data.attemptId, (attempt) => {
+        // A delivery is meaningless without the request it carried out, and a
+        // second one would overwrite the first record of what happened.
+        const pending = attempt.lastControl;
+        if (pending === null || pending.controlId !== event.data.controlId) {
+          throw new Error(
+            `lane_control_delivered "${event.data.controlId}" has no pending control intent`,
+          );
+        }
+        if (pending.delivery !== null) {
+          throw new Error(
+            `delivery for control "${event.data.controlId}" was already recorded`,
+          );
+        }
+        if (pending.control !== event.data.control) {
+          throw new Error(
+            `delivery control "${event.data.control}" does not match intent "${pending.control}"`,
+          );
+        }
+        return {
         ...attempt,
-        lastControlDelivery: {
-          control: event.data.control,
-          method: event.data.method,
-          delivered: event.data.delivered,
-          detail: event.data.detail,
-          observedStatus: event.data.observedStatus,
-          at: event.at,
+        lastControl: {
+          ...pending,
+          delivery: {
+            delivered: event.data.delivered,
+            detail: event.data.detail,
+            observedStatus: event.data.observedStatus,
+            at: event.at,
+          },
         },
         // A status seen after the effect is still ADVISORY, and joins that
         // channel rather than becoming a delivery confirmation of its own.
@@ -1173,7 +1218,8 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
                   event.at,
                 ),
               ],
-      }));
+      };
+      });
     case "lane_advisory_state_observed":
       return withAttempt(state, event, event.data.attemptId, (attempt) => ({
         ...attempt,

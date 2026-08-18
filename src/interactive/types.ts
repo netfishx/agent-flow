@@ -86,13 +86,37 @@ export type DeliveredControl = "cancel-turn" | "abort-session";
  * an absence of observation, never a confirmation.
  */
 export interface ControlDelivery {
-  readonly control: DeliveredControl;
-  readonly method: "send-keys" | "signal-process-group";
   readonly delivered: boolean;
   readonly detail: string | null;
   readonly observedStatus: AdvisoryAgentStatus | null;
   readonly at: number;
 }
+
+/**
+ * One control request and, once it exists, its delivery. Kept as a pair so
+ * "requested" and "carried out" can never collapse into one nullable field.
+ */
+export interface ControlRecord {
+  readonly controlId: string;
+  readonly control: DeliveredControl;
+  readonly method: "send-keys" | "signal-process-group";
+  readonly requestedAt: number;
+  /** Null until a delivery for THIS controlId is recorded. */
+  readonly delivery: ControlDelivery | null;
+}
+
+/**
+ * What is known about the latest control. Derived from the intent/delivery
+ * pair, never stored: `unconfirmed` is the honest answer when a controller
+ * recorded the request and then died, or when the delivery record itself was
+ * lost — the effect may or may not have reached the session, and nothing may
+ * replay it on that basis.
+ */
+export type ControlDeliveryState =
+  | "none"
+  | "unconfirmed"
+  | "delivered"
+  | "failed";
 
 /**
  * The attempt's outcome. `completed` is reachable only from objective evidence
@@ -217,5 +241,6 @@ export interface InteractiveAttemptView {
   readonly lastCancelTurnAt: number | null;
   /** When an abort was REQUESTED. Delivery is a separate fact. */
   readonly lastAbortAt: number | null;
-  readonly lastControlDelivery: ControlDelivery | null;
+  /** The latest control request paired with its delivery, if one landed. */
+  readonly lastControl: ControlRecord | null;
 }

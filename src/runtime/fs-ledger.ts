@@ -57,6 +57,21 @@ interface CommitLockRecord {
 type Sleep = (milliseconds: number) => Promise<void>;
 
 let snapshotSequence = 0;
+
+/**
+ * How many times a lease acquire re-races a lock file that disappeared while
+ * it was being read. Bounded so genuine contention still ends in a clean
+ * "already held" rather than spinning.
+ */
+const LEASE_ACQUIRE_ATTEMPTS = 8;
+
+/** The lock file was gone or unwritten when read: contention, not corruption. */
+class LeaseVanishedError extends Error {
+  constructor(runId: string) {
+    super(`controller lease for run "${runId}" vanished while being read`);
+    this.name = "LeaseVanishedError";
+  }
+}
 let commitStateSequence = 0;
 let leaseSequence = 0;
 let commitLockSequence = 0;
@@ -393,12 +408,34 @@ export class FsLedger implements Ledger {
       epoch,
       acquiredAt: Date.now(),
     });
+    // The create/read pair is not atomic together, so a holder releasing at
+    // exactly the wrong moment is retried rather than reported. The bound is
+    // finite: persistent contention still surfaces as "already held".
     let handle: FileHandle | undefined;
-    try {
-      handle = await open(lockFile, "wx");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const holder = await this.readControllerLease(lockFile, runId);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        handle = await open(lockFile, "wx");
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      let holder: ControllerLeaseRecord;
+      try {
+        holder = await this.readControllerLease(lockFile, runId);
+      } catch (error) {
+        if (
+          error instanceof LeaseVanishedError &&
+          attempt < LEASE_ACQUIRE_ATTEMPTS - 1
+        ) {
+          continue;
+        }
+        if (error instanceof LeaseVanishedError) {
+          throw new ControllerLeaseHeldError(
+            `controller lease for run "${runId}" is already held`,
+          );
+        }
+        throw error;
+      }
       if (this.isPidAlive(holder.pid)) {
         throw new ControllerLeaseHeldError(
           `controller lease for run "${runId}" is already held`,
@@ -411,6 +448,7 @@ export class FsLedger implements Ledger {
         holder,
         record(holder.epoch + 1),
       );
+      break;
     }
     if (handle) {
       try {
@@ -446,9 +484,24 @@ export class FsLedger implements Ledger {
     lockFile: string,
     runId: string,
   ): Promise<ControllerLeaseRecord> {
+    let raw: string;
+    try {
+      raw = await readFile(lockFile, "utf8");
+    } catch (error) {
+      // The holder released between our failed create and this read, or has
+      // not flushed yet. That is contention, not corruption — real permission
+      // and I/O errors keep propagating untouched.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new LeaseVanishedError(runId);
+      }
+      throw error;
+    }
+    // A create that has not written its record yet leaves an empty file. Same
+    // reasoning: a race, not a malformed lock.
+    if (raw.trim().length === 0) throw new LeaseVanishedError(runId);
     let parsed: unknown;
     try {
-      parsed = JSON.parse(await readFile(lockFile, "utf8"));
+      parsed = JSON.parse(raw);
     } catch (error) {
       throw new Error(`corrupt controller lease for run "${runId}"`, {
         cause: error,

@@ -20,6 +20,10 @@ import {
 import { agentNameFor } from "../src/herdr/agent-argv.ts";
 import { RealHerdrAgentControl } from "../src/herdr/real-agent-control.ts";
 
+/** Accepts every worktree; isolation itself is proved against real git. */
+const permissiveIsolation = { verifyWriteWorktree: async () => ({ ok: true as const }) };
+
+
 let root: string;
 
 beforeEach(async () => {
@@ -39,6 +43,7 @@ const LANE = {
   model: "sonnet",
   effort: "high",
   worktreePath: "/tmp/repo-wt",
+  repoRoot: "/tmp/repo",
 } as const;
 
 const START = {
@@ -63,6 +68,7 @@ function harness(options: {
     adapter,
     agentControl,
     ledger,
+    isolation: permissiveIsolation,
     artifactRoot: root,
     clock: () => clock.now() + ++tick,
     idgen: () => `id-${++seq}`,
@@ -155,10 +161,10 @@ describe("P1-2 a performed control never loses its intent", () => {
     expect(h.control.sendKeysCalls).toHaveLength(before + 1);
     const [after] = await h.controller.attempts(runId, laneId);
     expect(after!.lastCancelTurnAt).not.toBeNull();
-    expect(after!.lastControlDelivery?.control).toBe("cancel-turn");
-    expect(after!.lastControlDelivery?.delivered).toBe(true);
+    expect(after!.lastControl?.control).toBe("cancel-turn");
+    expect(after!.lastControl?.delivery?.delivered).toBe(true);
     // Unobserved, and recorded as unobserved rather than as a confirmation.
-    expect(after!.lastControlDelivery?.observedStatus).toBeNull();
+    expect(after!.lastControl?.delivery?.observedStatus).toBeNull();
   });
 
   test("abort keeps the intent and the terminal fact when observation throws", async () => {
@@ -190,7 +196,7 @@ describe("P1-2 a performed control never loses its intent", () => {
     const [after] = await h.controller.attempts(runId, laneId);
     // The intent survives; the delivery says it did NOT land.
     expect(after!.lastCancelTurnAt).not.toBeNull();
-    expect(after!.lastControlDelivery?.delivered).toBe(false);
+    expect(after!.lastControl?.delivery?.delivered).toBe(false);
   });
 });
 

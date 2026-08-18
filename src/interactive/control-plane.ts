@@ -35,10 +35,10 @@ import {
 } from "../runtime/ids.ts";
 import type { SessionIdentity } from "../review/types.ts";
 import { buildNativeArgs, buildRunnerCommand } from "./commands.ts";
-import { attemptDisposition } from "./attempts.ts";
+import type { WriteLaneIsolationPort } from "./isolation.ts";
 import type {
   AdvisoryAgentStatus,
-  AttemptDisposition,
+  ControlDeliveryState,
   DeliveredControl,
   InteractiveAgentKind,
   InteractiveAttemptView,
@@ -67,6 +67,28 @@ export class RetryNotAuthorizedError extends Error {
 }
 
 /**
+ * Raised when a control is attempted on an attempt that registered but has not
+ * bound an agent yet — the window a controller crash between `started` and
+ * `bound` leaves behind. Nothing is probed and nothing is reconciled: a pane
+ * whose agent has not started is not evidence that the agent is gone.
+ */
+export class WriteLaneIsolationError extends Error {
+  constructor(worktreePath: string, reason: string) {
+    super(`write lane worktree "${worktreePath}" is not isolated: ${reason}`);
+    this.name = "WriteLaneIsolationError";
+  }
+}
+
+export class AttemptNotBoundError extends Error {
+  constructor(attemptId: string) {
+    super(
+      `attempt "${attemptId}" has not bound an agent yet: it is starting, so it is neither controllable nor probeable`,
+    );
+    this.name = "AttemptNotBoundError";
+  }
+}
+
+/**
  * Raised when a control is attempted on an attempt that may not be controlled:
  * it has ended, or its pane is gone, occupied by a stranger, or unprobeable.
  * Thrown BEFORE any Herdr side effect, so nothing reaches a pane the runtime
@@ -84,6 +106,8 @@ export interface InteractiveDeps {
   readonly adapter: HerdrAdapter;
   readonly agentControl: HerdrAgentControl;
   readonly ledger: Ledger;
+  /** Write-lane preflight: proves the worktree is this repository's, and linked. */
+  readonly isolation: WriteLaneIsolationPort;
   /** Root each attempt's declared brief/checkpoint/result paths hang under. */
   readonly artifactRoot: string;
   readonly clock: () => number;
@@ -108,8 +132,10 @@ export interface OpenLaneConfig {
   readonly agentKind: InteractiveAgentKind;
   readonly model: string;
   readonly effort: string;
-  /** The lane's isolated implementation worktree. */
+  /** The lane's isolated implementation worktree. Verified before anything. */
   readonly worktreePath: string;
+  /** The repository the worktree must belong to. */
+  readonly repoRoot: string;
   readonly role?: string;
 }
 
@@ -179,6 +205,16 @@ export class InteractiveLaneController {
     readonly laneId: string;
   }> {
     assertHandleId("laneId", config.laneId);
+    // Preflight FIRST: no tab, no pane, no event, no agent until the worktree
+    // is proved to be a linked worktree of the declared repository. A write
+    // lane is handed permission to change that directory.
+    const isolation = await this.deps.isolation.verifyWriteWorktree({
+      repoRoot: config.repoRoot,
+      worktreePath: config.worktreePath,
+    });
+    if (!isolation.ok) {
+      throw new WriteLaneIsolationError(config.worktreePath, isolation.reason);
+    }
     const runId = this.deps.idgen();
     assertHandleId("runId", runId);
     const created = await this.deps.adapter.createTab({
@@ -213,6 +249,7 @@ export class InteractiveLaneController {
           model: config.model,
           effort: config.effort,
           worktreePath: config.worktreePath,
+          repoRoot: config.repoRoot,
           artifactRoot: join(this.deps.artifactRoot, runId, config.laneId),
           ...(config.role === undefined ? {} : { role: config.role }),
         },
@@ -236,7 +273,7 @@ export class InteractiveLaneController {
     input: StartAttemptInput,
   ): Promise<StartAttemptOutcome> {
     const parentAttemptId = input.parentAttemptId ?? null;
-    const opened = await this.mutate(runId, async (commit, run) => {
+    return this.mutate(runId, async (commit, run) => {
       const lane = this.lane(run, laneId);
       if (lane.kind !== "interactive") {
         throw new Error(`lane "${laneId}" is not an interactive write lane`);
@@ -277,69 +314,67 @@ export class InteractiveLaneController {
           authorization: { actor: "human", note: input.authorization.note },
         },
       });
-      return { attemptId, paneId: pane.id, lane };
-    });
 
-    // Starting the agent is slow and must not hold the lease; the attempt is
-    // already durable, so a crash here leaves a started, unbound attempt that
-    // reconciliation can resolve.
-    const { attemptId, paneId, lane } = opened;
-    const agentKind = lane.agentKind as InteractiveAgentKind;
-    const preassigned =
-      agentKind === "codex" ? null : (this.deps.sessionIdgen?.() ?? null);
-    const nativeArgs =
-      input.nativeArgs ??
-      buildNativeArgs({
-        agentKind,
-        model: lane.model ?? "",
-        effort: lane.effort ?? "",
-        sessionId: preassigned,
-      });
-    const name = agentNameFor(laneId, attemptId);
-    const startedAt = this.deps.clock();
-    let started;
-    try {
-      started = await this.deps.agentControl.startAgent({
-        name,
-        kind: agentKind,
-        paneId,
-        timeoutMs: this.deps.startTimeoutMs ?? AGENT_START_TIMEOUT_DEFAULT_MS,
-        nativeArgs,
-      });
-    } catch (error) {
-      const cause = error instanceof Error ? error.message : String(error);
-      // A start failure is an END, with its cause. It is never a retry: only a
-      // human authorization creates another attempt.
-      await this.mutate(runId, (commit) =>
-        commit({
+      const agentKind = lane.agentKind as InteractiveAgentKind;
+      const preassigned =
+        agentKind === "codex" ? null : (this.deps.sessionIdgen?.() ?? null);
+      const nativeArgs =
+        input.nativeArgs ??
+        buildNativeArgs({
+          agentKind,
+          model: lane.model ?? "",
+          effort: lane.effort ?? "",
+          sessionId: preassigned,
+        });
+      const name = agentNameFor(laneId, attemptId);
+      const startedAt = this.deps.clock();
+      let started;
+      try {
+        started = await this.deps.agentControl.startAgent({
+          name,
+          kind: agentKind,
+          paneId: pane.id,
+          timeoutMs: this.deps.startTimeoutMs ?? AGENT_START_TIMEOUT_DEFAULT_MS,
+          nativeArgs,
+        });
+      } catch (error) {
+        const cause = error instanceof Error ? error.message : String(error);
+        // A start failure is an END, with its cause. It is never a retry: only
+        // a human authorization creates another attempt.
+        await commit({
           type: "interactive_attempt_ended",
           actor: "runtime",
           laneId,
           data: { attemptId, endReason: "start-failed", cause, exitCode: null },
-        }),
-      );
-      return { attemptId, started: false, startFailure: cause };
-    }
+        });
+        return { attemptId, started: false, startFailure: cause };
+      }
 
-    await this.mutate(runId, (commit) =>
-      commit({
+      await commit({
         type: "interactive_attempt_bound",
         actor: "runtime",
         laneId,
         data: {
           attemptId,
           agentName: started.agent.name ?? name,
-          session: sessionIdentityOf(agentKind, started.agent.sessionId, preassigned),
+          session: sessionIdentityOf(
+            agentKind,
+            started.agent.sessionId,
+            preassigned,
+          ),
           argv: started.argv,
           readinessMs: this.deps.clock() - startedAt,
         },
-      }),
-    );
+      });
 
-    // The brief is the first prompt: an interactive session has no one-shot
-    // prompt-file equivalent that also leaves it steerable.
-    await this.steer(runId, laneId, input.brief, { attemptId });
-    return { attemptId, started: true, startFailure: null };
+      // The brief is the first prompt, submitted under the SAME lease: an
+      // interactive session has no one-shot prompt-file equivalent that also
+      // leaves it steerable, and releasing here would expose an attempt that
+      // is bound but has never been told what to do.
+      const bound = this.attempt(this.runs.get(runId)!, attemptId);
+      await this.submitSteer(commit, laneId, bound, input.brief);
+      return { attemptId, started: true, startFailure: null };
+    });
   }
 
   // ------------------------------------------------------------------ controls
@@ -363,43 +398,57 @@ export class InteractiveLaneController {
       const attempt = this.targetAttempt(run, laneId, options.attemptId);
       this.assertNotTakenOver(run, laneId);
       this.assertControllable(attempt);
-      const target = this.targetOf(attempt);
-
-      await commit({
-        type: "lane_steer_submitted",
-        actor: "human",
-        laneId,
-        data: { attemptId: attempt.attemptId, text, paneId: attempt.paneId, target },
-      });
-
-      const result = await this.deps.agentControl.promptAgent(target, text, {
-        waitMs: this.deps.steerWaitMs ?? DEFAULT_STEER_WAIT_MS,
-      });
-      const observedStatus = result.agent?.status ?? null;
-      await commit({
-        type: "lane_steer_observed",
-        actor: "runtime",
-        laneId,
-        data: {
-          attemptId: attempt.attemptId,
-          outcome: result.outcome,
-          observedStatus,
-          source: observedStatus === null ? null : "herdr-detection",
-        },
-      });
-      return {
-        outcome: result.outcome,
-        observed:
-          observedStatus === null
-            ? null
-            : {
-                status: observedStatus,
-                source: "herdr-detection" as const,
-                paneId: attempt.paneId,
-                at: this.deps.clock(),
-              },
-      };
+      return this.submitSteer(commit, laneId, attempt, text);
     });
+  }
+
+  /**
+   * The one steer path, shared by `steer` and the brief the attempt starts
+   * with. Submission is recorded BEFORE the call, so a controller that dies
+   * mid-call still leaves the intent in the ledger; the transition afterwards
+   * is a separate observation. Neither says the steer was applied and neither
+   * says the work finished — `--wait` tracks lifecycle state, not turns.
+   */
+  private async submitSteer(
+    commit: (input: NewRunEvent) => Promise<RunView>,
+    laneId: string,
+    attempt: InteractiveAttemptView,
+    text: string,
+  ): Promise<SteerObservation> {
+    const target = this.targetOf(attempt);
+    await commit({
+      type: "lane_steer_submitted",
+      actor: "human",
+      laneId,
+      data: { attemptId: attempt.attemptId, text, paneId: attempt.paneId, target },
+    });
+    const result = await this.deps.agentControl.promptAgent(target, text, {
+      waitMs: this.deps.steerWaitMs ?? DEFAULT_STEER_WAIT_MS,
+    });
+    const observedStatus = result.agent?.status ?? null;
+    await commit({
+      type: "lane_steer_observed",
+      actor: "runtime",
+      laneId,
+      data: {
+        attemptId: attempt.attemptId,
+        outcome: result.outcome,
+        observedStatus,
+        source: observedStatus === null ? null : "herdr-detection",
+      },
+    });
+    return {
+      outcome: result.outcome,
+      observed:
+        observedStatus === null
+          ? null
+          : {
+              status: observedStatus,
+              source: "herdr-detection" as const,
+              paneId: attempt.paneId,
+              at: this.deps.clock(),
+            },
+    };
   }
 
   /**
@@ -421,15 +470,21 @@ export class InteractiveLaneController {
       this.assertControllable(attempt);
       const target = this.targetOf(attempt);
       const keys = options.keys ?? ["esc"];
+      const controlId = this.deps.idgen();
 
       await commit({
         type: "lane_cancel_turn",
         actor: "human",
         laneId,
-        data: { attemptId: attempt.attemptId, method: "send-keys", keys: [...keys] },
+        data: {
+          attemptId: attempt.attemptId,
+          controlId,
+          method: "send-keys",
+          keys: [...keys],
+        },
       });
 
-      const delivery = await this.deliver(
+      const { error, ...delivery } = await this.deliver(
         () => this.deps.agentControl.sendKeys(target, keys),
         target,
       );
@@ -439,12 +494,13 @@ export class InteractiveLaneController {
         laneId,
         data: {
           attemptId: attempt.attemptId,
+          controlId,
           control: "cancel-turn",
           method: "send-keys",
           ...delivery,
         },
       });
-      if (delivery.error) throw delivery.error;
+      if (error) throw error;
       return delivery.observedStatus;
     });
   }
@@ -466,6 +522,7 @@ export class InteractiveLaneController {
       const attempt = this.targetAttempt(run, laneId, options.attemptId);
       this.assertControllable(attempt);
 
+      const controlId = this.deps.idgen();
       const probe = await this.probePane(attempt);
       if (probe.outcome !== "live") {
         await commit({
@@ -489,7 +546,11 @@ export class InteractiveLaneController {
         type: "lane_abort_session",
         actor: "human",
         laneId,
-        data: { attemptId: attempt.attemptId, method: "signal-process-group" },
+        data: {
+          attemptId: attempt.attemptId,
+          controlId,
+          method: "signal-process-group",
+        },
       });
 
       // An undelivered signal is an OBSERVATION, not a failure: the pane's
@@ -497,7 +558,7 @@ export class InteractiveLaneController {
       // gone. The attempt still ends, and the cause says which of the two
       // happened, so `aborted` never implies a signal that was not sent.
       let signalDetail: string | null = null;
-      const delivery = await this.deliver(async () => {
+      const { error, ...delivery } = await this.deliver(async () => {
         const evidence = await this.deps.adapter.interruptPane({
           id: attempt.paneId,
         });
@@ -511,6 +572,7 @@ export class InteractiveLaneController {
         laneId,
         data: {
           attemptId: attempt.attemptId,
+          controlId,
           control: "abort-session",
           method: "signal-process-group",
           ...delivery,
@@ -532,7 +594,7 @@ export class InteractiveLaneController {
           },
         });
       }
-      if (delivery.error) throw delivery.error;
+      if (error) throw error;
     });
   }
 
@@ -570,27 +632,6 @@ export class InteractiveLaneController {
   }
 
   // ------------------------------------------------------------- observations
-
-  /**
-   * Read Herdr's advisory classification and record it WITH its source. This
-   * is a UI signal and a wait edge. It is not evidence, and nothing downstream
-   * can read it as one.
-   */
-  async observeAdvisoryState(
-    runId: string,
-    laneId: string,
-    options: { readonly attemptId?: string } = {},
-  ): Promise<AdvisoryAgentStatus | null> {
-    return this.mutate(runId, async (commit, run) => {
-      const attempt = this.targetAttempt(run, laneId, options.attemptId);
-      const observed = await this.deps.agentControl.getAgent(
-        this.targetOf(attempt),
-      );
-      if (observed === null) return null;
-      await commit(this.advisoryEvent(laneId, attempt, observed.status, null));
-      return observed.status;
-    });
-  }
 
   /**
    * Wait for Herdr to classify the pane as showing an approval or question UI.
@@ -823,13 +864,6 @@ export class InteractiveLaneController {
     return this.attemptsOf(await this.load(runId), laneId);
   }
 
-  async disposition(
-    runId: string,
-    attemptId: string,
-  ): Promise<AttemptDisposition> {
-    return attemptDisposition(this.attempt(await this.load(runId), attemptId));
-  }
-
   // ---------------------------------------------------------------- internals
 
   /**
@@ -955,6 +989,12 @@ export class InteractiveLaneController {
    * over an attempt that already ended.
    */
   private assertControllable(attempt: InteractiveAttemptView): void {
+    // A registered-but-unbound attempt is STARTING. It is not probed and not
+    // reconciled: no agent has been detected there yet, so "the pane does not
+    // host the expected agent" would be a conclusion about a race, not a fact.
+    if (attempt.agentName === null && attempt.endReason === null) {
+      throw new AttemptNotBoundError(attempt.attemptId);
+    }
     if (attempt.endReason !== null) {
       throw new AttemptNotControllableError(
         attempt.attemptId,
@@ -1154,4 +1194,23 @@ function parseAgentStatus(text: string): SemanticState | null {
   return SEMANTIC_STATES.find((value) => value === status) ?? null;
 }
 
-export type { DeliveredControl };
+
+/**
+ * What is known about an attempt's latest control. Derived from the intent and
+ * its delivery, never stored:
+ *
+ *   - `none`         — no control was ever requested;
+ *   - `unconfirmed`  — a request is recorded and no delivery is; the effect may
+ *                      or may not have reached the session, and NOTHING may
+ *                      replay it on that basis;
+ *   - `delivered`    — the effect landed;
+ *   - `failed`       — the effect was attempted and did not land.
+ */
+export function controlDeliveryState(
+  attempt: InteractiveAttemptView,
+): ControlDeliveryState {
+  const control = attempt.lastControl;
+  if (control === null) return "none";
+  if (control.delivery === null) return "unconfirmed";
+  return control.delivery.delivered ? "delivered" : "failed";
+}

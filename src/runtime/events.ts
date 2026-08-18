@@ -225,6 +225,8 @@ export interface InteractiveLaneRegisteredData {
   readonly worktreePath: string;
   /** Root the runtime derives each attempt's declared paths under. */
   readonly artifactRoot: string;
+  /** The repository the worktree was verified to belong to. */
+  readonly repoRoot: string;
 }
 
 export type LaneRegisteredData =
@@ -339,6 +341,8 @@ export interface LaneSteerObservedData {
  */
 export interface LaneCancelTurnData {
   readonly attemptId: string;
+  /** Pairs this intent with exactly one delivery. */
+  readonly controlId: string;
   readonly method: "send-keys";
   readonly keys: readonly string[];
 }
@@ -349,6 +353,8 @@ export interface LaneCancelTurnData {
  */
 export interface LaneAbortSessionData {
   readonly attemptId: string;
+  /** Pairs this intent with exactly one delivery. */
+  readonly controlId: string;
   readonly method: "signal-process-group";
 }
 
@@ -360,6 +366,8 @@ export interface LaneAbortSessionData {
  */
 export interface LaneControlDeliveredData {
   readonly attemptId: string;
+  /** Must name an intent that has no delivery yet, of the same control. */
+  readonly controlId: string;
   readonly control: DeliveredControl;
   readonly method: "send-keys" | "signal-process-group";
   readonly delivered: boolean;

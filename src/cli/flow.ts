@@ -12,8 +12,10 @@ import { RealHerdrAgentControl } from "../herdr/real-agent-control.ts";
 import { attemptDisposition } from "../interactive/attempts.ts";
 import {
   InteractiveLaneController,
+  controlDeliveryState,
   pendingRetries,
 } from "../interactive/control-plane.ts";
+import { GitWriteLaneIsolation } from "../interactive/isolation.ts";
 import type {
   IssueRef,
   OwnerDecision,
@@ -33,7 +35,7 @@ const USAGE =
  * abort, or a retry, so the CLI is where the authorization enters the ledger.
  */
 const INTERACTIVE_USAGE = [
-  "usage: flow open-lane --workflow <name> --workspace <ws> --cwd <dir> --lane <id> --kind <claude|codex|grok> --model <m> --effort <e> --worktree <path>",
+  "usage: flow open-lane --workflow <name> --workspace <ws> --cwd <dir> --lane <id> --kind <claude|codex|grok> --model <m> --effort <e> --repo <repoRoot> --worktree <linked worktree>",
   "       flow start-attempt <runId> <laneId> --brief-file <path> --note <text> [--parent <attemptId>]",
   "       flow steer <runId> <laneId> <text>",
   "       flow cancel-turn <runId> <laneId>",
@@ -97,6 +99,7 @@ const OPEN_LANE_FLAGS = [
   "--model",
   "--effort",
   "--worktree",
+  "--repo",
 ] as const;
 
 /** Parse an interactive invocation, or null when it is malformed. */
@@ -331,12 +334,14 @@ function renderInteractiveAttempts(run: RunView, stdout: TextSink): void {
         `  runner=${record.evidenceId} pane=${record.paneId} exitCode=${value(record.exitCode)} log=${record.logFile}\n`,
       );
     }
-    const delivery = attempt.lastControlDelivery;
+    const control = attempt.lastControl;
     stdout.write(
       `  steer submitted=${attempt.steerSubmissions} observed=${attempt.steerObservations} cancelTurnRequestedAt=${value(attempt.lastCancelTurnAt)} abortRequestedAt=${value(attempt.lastAbortAt)}\n`,
     );
+    // Never `control=null delivered=null`: an intent with no delivery is an
+    // explicit `unconfirmed`, not an absence.
     stdout.write(
-      `  lastDelivery control=${value(delivery?.control ?? null)} delivered=${value(delivery?.delivered ?? null)} detail=${quotedValue(delivery?.detail ?? null)}\n`,
+      `  lastControl=${value(control?.control ?? null)} delivery=${controlDeliveryState(attempt)} detail=${quotedValue(control?.delivery?.detail ?? null)} requestedAt=${value(control?.requestedAt ?? null)}\n`,
     );
     stdout.write(
       `  reconciliation=${value(attempt.reconciliation?.outcome ?? null)} detail=${quotedValue(attempt.reconciliation?.detail ?? null)}\n`,
@@ -531,6 +536,8 @@ export function realInteractiveController(
     adapter: new RealHerdrAdapter(),
     agentControl: new RealHerdrAgentControl(),
     ledger,
+    // Proves the write lane's worktree before any pane or event exists.
+    isolation: new GitWriteLaneIsolation(),
     // Attempt artifacts share the ledger's lifetime, so a checkpoint the
     // ledger points at cannot outlive or predecease the record naming it.
     artifactRoot: join(ledgerRoot, "interactive"),
@@ -574,6 +581,7 @@ async function runInteractiveCli(
           model: flags["--model"]!,
           effort: flags["--effort"]!,
           worktreePath: flags["--worktree"]!,
+          repoRoot: flags["--repo"]!,
         });
         runId = opened.runId;
         stdout.write(`runId=${opened.runId} laneId=${opened.laneId}\n`);
