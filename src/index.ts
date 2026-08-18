@@ -122,6 +122,7 @@ export {
   InteractiveLaneController,
   LaneTakenOverError,
   RetryNotAuthorizedError,
+  attemptArtifactPaths,
   pendingRetries,
 } from "./interactive/control-plane.ts";
 export type {
@@ -131,12 +132,11 @@ export type {
   StartAttemptInput,
   StartAttemptOutcome,
 } from "./interactive/control-plane.ts";
-export {
-  attemptDisposition,
-  objectiveFactsOf,
-  projectAttemptDisposition,
-} from "./interactive/attempts.ts";
-export type { ObjectiveAttemptFacts } from "./interactive/attempts.ts";
+// `objectiveFactsOf` and `projectAttemptDisposition` are the advisory wall's
+// two halves and are NOT exported: a caller wants a disposition, and reaching
+// for the halves is how the wall gets routed around. Their tests import the
+// module path directly, as the command builders' tests already do.
+export { attemptDisposition } from "./interactive/attempts.ts";
 export type {
   AdvisoryAgentStatus,
   AdvisoryObservation,
@@ -145,10 +145,10 @@ export type {
   AttemptCheckpoint,
   AttemptDisposition,
   AttemptEndReason,
-  AttemptStartFailure,
+  ControlDelivery,
+  DeliveredControl,
   InteractiveAgentKind,
   InteractiveAttemptView,
-  InteractiveLaneView,
   InteractiveRunnerEvidence,
   ReconciliationOutcome,
   ReconciliationRecord,

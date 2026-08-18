@@ -46,6 +46,7 @@ function harness(
     adapter,
     agentControl,
     ledger,
+    artifactRoot: root,
     clock: () => clock.now(),
     idgen: () => `id-${++seq}`,
     sessionIdgen: () => `sess-${seq}`,
@@ -67,10 +68,7 @@ const LANE = {
 function attemptInput(dir: string, note = "owner authorized attempt") {
   return {
     brief: "implement the ticket",
-    briefFile: join(dir, "brief.md"),
-    checkpointFile: join(dir, "checkpoint.md"),
-    resultPointer: join(dir, "result.md"),
-    authorization: { note },
+        authorization: { note },
   };
 }
 
@@ -141,7 +139,7 @@ describe("attempt identity and lineage", () => {
     expect(started.started).toBe(false);
     expect(started.startFailure).toContain("timeout");
     const [attempt] = await h.controller.attempts(runId, laneId);
-    expect(attempt!.startFailure?.cause).toContain("timeout");
+    expect(attempt!.endCause).toContain("timeout");
     expect(attempt!.endReason).toBe("start-failed");
     // No second attempt was created on its own.
     expect(await h.controller.attempts(runId, laneId)).toHaveLength(1);
@@ -411,6 +409,7 @@ describe("controller recovery", () => {
       adapter: gone,
       agentControl: h.agentControl,
       ledger: h.ledger,
+      artifactRoot: root,
       clock: () => 9_000,
       idgen: () => "id-recovered",
     });
@@ -605,6 +604,7 @@ function freshController(
       adapter,
       agentControl,
       ledger,
+      artifactRoot: root,
       clock: () => 5_000,
       idgen: () => "id-fresh",
     }),

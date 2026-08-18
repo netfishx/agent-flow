@@ -6,7 +6,7 @@
 //     pane and keeps the contract the read-only lane already proved: exact
 //     argv, durable log, a sentinel carrying the real exit code.
 
-import { escapeRegex, shellSingleQuote } from "../herdr/argv.ts";
+import { shellSingleQuote } from "../herdr/argv.ts";
 import type { InteractiveAgentKind } from "./types.ts";
 
 export interface NativeArgsInput {
@@ -77,32 +77,6 @@ export function buildNativeArgs(input: NativeArgsInput): string[] {
       ];
     }
   }
-}
-
-/** The runner sentinel: same shape as the lane's, scoped to one evidence record. */
-export function runnerSentinelToken(runId: string, evidenceId: string): string {
-  return `FLOW_${runId}_RUNNER_${evidenceId}_EXIT`;
-}
-
-export function runnerSentinelRegex(runId: string, evidenceId: string): string {
-  return `${escapeRegex(runnerSentinelToken(runId, evidenceId))}=[0-9]+`;
-}
-
-export function parseRunnerExit(
-  runId: string,
-  evidenceId: string,
-  output: string,
-): number | null {
-  const re = new RegExp(
-    `${escapeRegex(runnerSentinelToken(runId, evidenceId))}=([0-9]+)`,
-    "g",
-  );
-  let last: number | null = null;
-  for (const match of output.matchAll(re)) {
-    const digits = match[1];
-    if (digits !== undefined) last = Number.parseInt(digits, 10);
-  }
-  return last;
 }
 
 export interface RunnerCommandInput {

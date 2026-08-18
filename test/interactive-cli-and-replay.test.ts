@@ -3,7 +3,7 @@
 // event from disk into the same projection.
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -69,11 +69,12 @@ function seams(): Seams {
   };
 }
 
-function controllerOver(ledger: FsLedger, shared: Seams) {
+function controllerOver(ledger: FsLedger, shared: Seams, root: string) {
   return new InteractiveLaneController({
     adapter: shared.adapter,
     agentControl: shared.agentControl,
     ledger,
+    artifactRoot: root,
     clock: () => 2_000,
     idgen: () => `id-${shared.next()}`,
     sessionIdgen: () => "sess-1",
@@ -83,13 +84,10 @@ function controllerOver(ledger: FsLedger, shared: Seams) {
 async function seedLane(root: string) {
   const ledger = new FsLedger(root);
   const shared = seams();
-  const controller = controllerOver(ledger, shared);
+  const controller = controllerOver(ledger, shared, root);
   const { runId, laneId } = await controller.openLane({ ...LANE });
   await controller.startAttempt(runId, laneId, {
     brief: "implement it",
-    briefFile: join(root, "brief.md"),
-    checkpointFile: join(root, "checkpoint.md"),
-    resultPointer: join(root, "result.md"),
     authorization: { note: "owner authorized" },
   });
   return { ledger, controller, shared, runId, laneId };
@@ -103,6 +101,7 @@ describe("interactive CLI argv", () => {
       laneId: "l1",
       attemptId: null,
       text: "do the thing",
+      flags: {},
     });
     expect(parseInteractiveArgs(["cancel-turn", "r1", "l1"])).toEqual({
       command: "cancel-turn",
@@ -110,6 +109,7 @@ describe("interactive CLI argv", () => {
       laneId: "l1",
       attemptId: null,
       text: null,
+      flags: {},
     });
     expect(parseInteractiveArgs(["abort-session", "r1", "l1"])).toEqual({
       command: "abort-session",
@@ -117,6 +117,7 @@ describe("interactive CLI argv", () => {
       laneId: "l1",
       attemptId: null,
       text: null,
+      flags: {},
     });
     expect(parseInteractiveArgs(["reconcile", "r1", "l1", "a1"])).toEqual({
       command: "reconcile",
@@ -124,6 +125,7 @@ describe("interactive CLI argv", () => {
       laneId: "l1",
       attemptId: "a1",
       text: null,
+      flags: {},
     });
     expect(
       parseInteractiveArgs([
@@ -140,6 +142,7 @@ describe("interactive CLI argv", () => {
       laneId: "l1",
       attemptId: "a1",
       text: "owner said so",
+      flags: {},
     });
 
     // A retry with no recorded note is not an authorization.
@@ -178,7 +181,7 @@ describe("interactive CLI argv", () => {
       stderr,
       {
         environment: { FLOW_LEDGER_ROOT: root },
-        interactiveFactory: () => controllerOver(ledger, shared),
+        interactiveFactory: () => controllerOver(ledger, shared, root),
       },
     );
     expect(stderr.text).toBe("");
@@ -209,7 +212,7 @@ describe("interactive CLI argv", () => {
       stderr,
       {
         environment: { FLOW_LEDGER_ROOT: root },
-        interactiveFactory: () => controllerOver(ledger, shared),
+        interactiveFactory: () => controllerOver(ledger, shared, root),
       },
     );
     expect(stderr.text).toBe("");
@@ -229,7 +232,7 @@ describe("interactive CLI argv", () => {
       stderr,
       {
         environment: { FLOW_LEDGER_ROOT: root },
-        interactiveFactory: () => controllerOver(ledger, shared),
+        interactiveFactory: () => controllerOver(ledger, shared, root),
       },
     );
     expect(code).toBe(1);
@@ -262,9 +265,6 @@ describe("ledger replay", () => {
     );
     await controller.startAttempt(runId, laneId, {
       brief: "second go",
-      briefFile: join(root, "brief-2.md"),
-      checkpointFile: join(root, "checkpoint-2.md"),
-      resultPointer: join(root, "result-2.md"),
       authorization: { note: "owner authorized retry" },
       parentAttemptId: first!.attemptId,
     });
@@ -307,9 +307,6 @@ describe("ledger replay", () => {
     await controller.authorizeRetry(runId, laneId, first!.attemptId, "retry");
     await controller.startAttempt(runId, laneId, {
       brief: "again",
-      briefFile: join(root, "b2.md"),
-      checkpointFile: join(root, "c2.md"),
-      resultPointer: join(root, "r2.md"),
       authorization: { note: "retry" },
       parentAttemptId: first!.attemptId,
     });
@@ -330,5 +327,98 @@ describe("ledger replay", () => {
     for (const key of Object.keys(distinguishing[0]!) as (keyof (typeof distinguishing)[0])[]) {
       expect(distinguishing[0]![key]).not.toBe(distinguishing[1]![key]);
     }
+  });
+});
+
+describe("the production entry point is reachable", () => {
+  test("open-lane then start-attempt drives the real CLI path", async () => {
+    const root = await tempRoot();
+    const ledger = new FsLedger(root);
+    const shared = seams();
+    const briefFile = join(root, "brief.md");
+    await writeFile(briefFile, "implement the ticket\n", "utf8");
+
+    const opened = new Sink();
+    const openedErr = new Sink();
+    const openCode = await runFlowCli(
+      [
+        "open-lane",
+        "--workflow", "impl",
+        "--workspace", "ws",
+        "--cwd", root,
+        "--lane", "impl-1",
+        "--kind", "claude",
+        "--model", "sonnet",
+        "--effort", "high",
+        "--worktree", root,
+      ],
+      opened,
+      openedErr,
+      {
+        environment: { FLOW_LEDGER_ROOT: root },
+        interactiveFactory: () => controllerOver(ledger, shared, root),
+      },
+    );
+    expect(openedErr.text).toBe("");
+    expect(openCode).toBe(0);
+    const runId = opened.text.match(/^runId=(\S+)/m)?.[1];
+    expect(runId).toBeDefined();
+
+    const started = new Sink();
+    const startedErr = new Sink();
+    const startCode = await runFlowCli(
+      [
+        "start-attempt",
+        runId!,
+        "impl-1",
+        "--brief-file", briefFile,
+        "--note", "owner authorized the first attempt",
+      ],
+      started,
+      startedErr,
+      {
+        environment: { FLOW_LEDGER_ROOT: root },
+        interactiveFactory: () => controllerOver(ledger, shared, root),
+      },
+    );
+    expect(startedErr.text).toBe("");
+    expect(startCode).toBe(0);
+    expect(started.text).toContain("started=true");
+    expect(started.text).toContain("disposition=running");
+
+    // The lane and its attempt are durable, with declared paths under the
+    // ledger root rather than anywhere the caller chose.
+    const run = (await new FsLedger(root).load(runId!))!;
+    const attempt = run.interactiveAttempts[run.interactiveAttemptOrder[0]!]!;
+    expect(run.lanes["impl-1"]!.kind).toBe("interactive");
+    expect(run.lanes["impl-1"]!.logFile).toBeNull();
+    expect(run.lanes["impl-1"]!.sentinelToken).toBeNull();
+    expect(attempt.checkpointFile.startsWith(root)).toBe(true);
+    expect(attempt.authorization.note).toContain("owner authorized");
+  });
+
+  test("open-lane rejects an unsupported agent kind", async () => {
+    expect(
+      parseInteractiveArgs([
+        "open-lane",
+        "--workflow", "impl",
+        "--workspace", "ws",
+        "--cwd", "/tmp",
+        "--lane", "impl-1",
+        "--kind", "pi",
+        "--model", "m",
+        "--effort", "high",
+        "--worktree", "/tmp",
+      ]),
+    ).toBeNull();
+  });
+
+  test("start-attempt requires both a brief file and an authorization note", () => {
+    expect(
+      parseInteractiveArgs(["start-attempt", "r1", "l1", "--brief-file", "/b"]),
+    ).toBeNull();
+    expect(
+      parseInteractiveArgs(["start-attempt", "r1", "l1", "--note", "ok"]),
+    ).toBeNull();
   });
 });

@@ -164,6 +164,26 @@ function laneState(lane: LaneView): LaneState {
   }
 }
 
+/**
+ * A dispatched lane's durable artifacts and sentinel. They are nullable on
+ * `LaneView` only because an INTERACTIVE lane registers without them — it has
+ * no captured stdout and no sentinel. This runtime dispatches no interactive
+ * lane, so a null here is a programming error, and it fails loudly rather than
+ * silently reading or writing an empty path.
+ */
+function dispatchArtifact(
+  lane: LaneView,
+  field: "logFile" | "stderrFile" | "sentinelToken",
+): string {
+  const value = lane[field];
+  if (value === null) {
+    throw new Error(
+      `lane "${lane.laneId}" has no ${field}: this runtime dispatches no interactive lanes`,
+    );
+  }
+  return value;
+}
+
 function rejectionMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
@@ -905,7 +925,7 @@ export class WorkflowRuntime {
           continue;
         }
 
-        const output = await this.readDurable(lane.logFile);
+        const output = await this.readDurable(dispatchArtifact(lane, "logFile"));
         const exitCode = parseExitFromSentinel(runId, laneId, output);
         await this.recordPostFlightIsolation(runId, laneId);
         if (exitCode !== null) {
@@ -1039,7 +1059,7 @@ export class WorkflowRuntime {
     const run = this.getRun(runId);
     const lane = this.getLane(run, laneId);
     const output =
-      lane.dispatchedAt === null ? "" : await this.readDurable(lane.logFile);
+      lane.dispatchedAt === null ? "" : await this.readDurable(dispatchArtifact(lane, "logFile"));
     const parsedExit = parseExitFromSentinel(runId, laneId, output);
     const tail = output
       .trim()
@@ -1052,7 +1072,7 @@ export class WorkflowRuntime {
       exitCode: lane.exitCode ?? parsedExit,
       waitMatched: lane.waitMatched,
       timedOut: false,
-      sentinelToken: lane.sentinelToken,
+      sentinelToken: dispatchArtifact(lane, "sentinelToken"),
       outputTail: tail,
     };
   }
@@ -1470,7 +1490,7 @@ export class WorkflowRuntime {
     // Post-flight isolation must precede the terminal event (see the note on
     // recordPostFlightIsolation); the lane's process is already gone here.
     await this.recordPostFlightIsolation(runId, laneId);
-    const output = await this.readDurable(lane.logFile);
+    const output = await this.readDurable(dispatchArtifact(lane, "logFile"));
     const exitCode = parseExitFromSentinel(runId, laneId, output);
     if (exitCode === null) {
       await this.commitEventConditionally(
@@ -1699,8 +1719,8 @@ export class WorkflowRuntime {
       runId,
       laneId,
       command: terminalLane.dispatchedCommand,
-      stdoutArtifact: terminalLane.logFile,
-      stderrArtifact: terminalLane.stderrFile,
+      stdoutArtifact: dispatchArtifact(terminalLane, "logFile"),
+      stderrArtifact: dispatchArtifact(terminalLane, "stderrFile"),
       dispatchedAt: terminalLane.dispatchedAt,
       liveAt: terminalLane.liveAt,
       completedAt: terminalLane.completedAt,
@@ -1814,7 +1834,7 @@ export class WorkflowRuntime {
     }
     let stderrText: string | null = null;
     try {
-      stderrText = await readFile(lane.stderrFile, "utf8");
+      stderrText = await readFile(dispatchArtifact(lane, "stderrFile"), "utf8");
     } catch {
       stderrText = null;
     }

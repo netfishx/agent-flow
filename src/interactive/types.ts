@@ -8,6 +8,7 @@
 // reach a completion decision by any path.
 
 import type { SemanticState } from "../runtime/events.ts";
+import type { SessionIdentity } from "../review/types.ts";
 
 /** The three CLI families a write lane may host, per the owner's ruling. */
 export type InteractiveAgentKind = "claude" | "codex" | "grok";
@@ -60,13 +61,38 @@ export interface SteerObservation {
   readonly observed: AdvisoryObservation | null;
 }
 
-/** How an attempt's session ended. Distinct from what the work achieved. */
+/**
+ * How an attempt's session ended. Distinct from what the work achieved.
+ *
+ * An end is PERMANENT. Once one is recorded the attempt accepts no further
+ * control, no second end, and no observation that restores either — a later
+ * `live` reconciliation is still recorded, but it cannot resurrect the attempt.
+ */
 export type AttemptEndReason =
   | "session-exit"
   | "interrupted"
   | "aborted"
   | "start-failed"
   | "lost";
+
+/** The two controls that act on a session rather than submit text to it. */
+export type DeliveredControl = "cancel-turn" | "abort-session";
+
+/**
+ * What happened when a control INTENT was carried out. Recorded separately
+ * from the intent, and after it, so a control whose effect landed but whose
+ * observation failed still leaves both facts: requested, and delivered.
+ * `observedStatus` is null when the post-effect read did not answer — that is
+ * an absence of observation, never a confirmation.
+ */
+export interface ControlDelivery {
+  readonly control: DeliveredControl;
+  readonly method: "send-keys" | "signal-process-group";
+  readonly delivered: boolean;
+  readonly detail: string | null;
+  readonly observedStatus: AdvisoryAgentStatus | null;
+  readonly at: number;
+}
 
 /**
  * The attempt's outcome. `completed` is reachable only from objective evidence
@@ -81,8 +107,18 @@ export type AttemptDisposition =
   | "superseded"
   | "unknown";
 
-/** How a resuming controller found the attempt's pane. */
-export type ReconciliationOutcome = "live" | "reoccupied" | "missing";
+/**
+ * How a resuming controller found the attempt's pane.
+ *
+ * `unknown-probe` is the fourth honest answer: the probe itself failed, so the
+ * controller knows nothing about the pane. It is NOT folded into `missing` —
+ * a broken control plane is not evidence that an Agent is gone.
+ */
+export type ReconciliationOutcome =
+  | "live"
+  | "reoccupied"
+  | "missing"
+  | "unknown-probe";
 
 export interface ReconciliationRecord {
   readonly outcome: ReconciliationOutcome;
@@ -125,11 +161,6 @@ export interface InteractiveRunnerEvidence {
   readonly endedAt: number | null;
 }
 
-export interface AttemptStartFailure {
-  readonly cause: string;
-  readonly at: number;
-}
-
 /**
  * The durable, append-only record of one interactive attempt. Two attempts of
  * one lane are distinguishable from these fields alone, with no pane inspected.
@@ -148,7 +179,12 @@ export interface InteractiveAttemptView {
   readonly paneId: string;
   /** Observed agent name. NOT a durable handle: Herdr clears it on exit. */
   readonly agentName: string | null;
-  readonly agentSessionId: string | null;
+  /**
+   * Session identity, in the vocabulary the headless lane already uses: either
+   * `measured` with the evidence that ties it to this attempt, or `unavailable`
+   * with the reason. A missing session always says why.
+   */
+  readonly session: SessionIdentity;
   readonly worktreePath: string;
   readonly briefFile: string;
   /** Declared path the Agent writes its checkpoint to; never scrollback. */
@@ -158,26 +194,28 @@ export interface InteractiveAttemptView {
   readonly startedAt: number;
   readonly endedAt: number | null;
   readonly endReason: AttemptEndReason | null;
+  /** Why it ended, when the reason needs one (a start failure's cause). */
+  readonly endCause: string | null;
   /** The session's own exit code when observed. A session fact, not a verdict. */
   readonly exitCode: number | null;
+  /**
+   * DERIVED, not stored as its own event: the child attempt that named this one
+   * as its parent. One fact, one writer — the child's `parentAttemptId`.
+   */
   readonly supersededBy: string | null;
   readonly authorization: AttemptAuthorization;
   readonly agentCheckpoint: AttemptCheckpoint | null;
   readonly runnerEvidence: readonly InteractiveRunnerEvidence[];
+  /** The LATEST observation of the pane. History stays in the event log. */
   readonly reconciliation: ReconciliationRecord | null;
-  readonly startFailure: AttemptStartFailure | null;
   /** ADVISORY channel. Excluded from outcome projection by construction. */
   readonly advisory: readonly AdvisoryObservation[];
   readonly controlMode: "managed" | "human_owned";
   readonly steerSubmissions: number;
   readonly steerObservations: number;
+  /** When a cancel-turn was REQUESTED. Delivery is a separate fact. */
   readonly lastCancelTurnAt: number | null;
+  /** When an abort was REQUESTED. Delivery is a separate fact. */
   readonly lastAbortAt: number | null;
-}
-
-/** A lane's attempts in start order, newest last. */
-export interface InteractiveLaneView {
-  readonly laneId: string;
-  readonly runId: string;
-  readonly attempts: readonly InteractiveAttemptView[];
+  readonly lastControlDelivery: ControlDelivery | null;
 }

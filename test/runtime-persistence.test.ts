@@ -439,7 +439,7 @@ describe("persisted terminal lane facts", () => {
     const evidence = JSON.parse(await readFile(lane.evidenceFile!, "utf8"));
     expect(lane.verificationState).toBe("verified");
     expect(evidence.environmentFailure).toBeNull();
-    expect(await readFile(lane.logFile, "utf8")).toContain(
+    expect(await readFile(lane.logFile!, "utf8")).toContain(
       "EXTRA stdout is not a runtime protocol line",
     );
   });
@@ -522,7 +522,7 @@ describe("persisted terminal lane facts", () => {
 
     const loaded = await ledger.load(handle.runId);
     const lane = loaded!.lanes["stderr-lane"]!;
-    const durableStdout = await readFile(lane.logFile, "utf8");
+    const durableStdout = await readFile(lane.logFile!, "utf8");
     const evidence = JSON.parse(
       await readFile(lane.evidenceFile!, "utf8"),
     ) as Record<string, unknown>;
@@ -589,7 +589,7 @@ describe("persisted terminal lane facts", () => {
 
     const lane = (await ledger.load(handle.runId))!.lanes["structured-env"]!;
     const evidence = JSON.parse(await readFile(lane.evidenceFile!, "utf8"));
-    expect(await readFile(lane.stderrFile, "utf8")).toContain("sleep");
+    expect(await readFile(lane.stderrFile!, "utf8")).toContain("sleep");
     expect(evidence.environmentFailure).toBe(
       "runner setup rejected the environment",
     );

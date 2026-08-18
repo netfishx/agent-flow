@@ -115,12 +115,3 @@ export function parseAgentStarted(raw: string): AgentStartedView {
   };
 }
 
-export function parseAgentList(raw: string): readonly AgentInfoView[] {
-  const result = resultOf("agent list", raw, "agent_list") as Record<
-    string,
-    unknown
-  >;
-  const agents = result.agents;
-  if (!Array.isArray(agents)) throw new HerdrParseError("agent list", raw);
-  return agents.map((entry) => agentInfoFrom("agent list", raw, entry));
-}

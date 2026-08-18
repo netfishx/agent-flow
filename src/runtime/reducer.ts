@@ -84,10 +84,17 @@ export interface LaneWorktreeDispositionView {
 export interface LaneView {
   readonly laneId: string;
   readonly paneId: string;
-  readonly logFile: string;
-  readonly stderrFile: string;
-  readonly sentinelToken: string;
+  /**
+   * Headless-lane artifacts and completion sentinel. Null on an INTERACTIVE
+   * lane, which has no captured stdout and no sentinel — an empty string here
+   * would be a path that does not exist dressed up as one that does.
+   */
+  readonly logFile: string | null;
+  readonly stderrFile: string | null;
+  readonly sentinelToken: string | null;
   readonly kind: "simulated" | "agent" | "interactive";
+  /** Root the interactive lane derives each attempt's declared paths under. */
+  readonly artifactRoot: string | null;
   readonly steps: number;
   readonly stepDelaySeconds: number;
   readonly role?: string;
@@ -593,12 +600,17 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
               rawReportFile: data.rawReportFile,
               worktreePath: data.worktreePath,
               preassignedSessionId: data.preassignedSessionId,
+              artifactRoot: null,
+              logFile: data.logFile,
+              stderrFile: data.stderrFile,
+              sentinelToken: data.sentinelToken,
             }
           : data.kind === "interactive"
             ? {
-                // Brief, session id, and result paths belong to an ATTEMPT,
-                // not to the lane: a retry allocates new ones and the lane
-                // outlives them all.
+                // An interactive lane has no captured stdout and no sentinel,
+                // so it registers none. Brief, session, and result paths belong
+                // to an ATTEMPT: a retry allocates new ones under artifactRoot,
+                // and the lane outlives every attempt.
                 kind: "interactive" as const,
                 steps: 0,
                 stepDelaySeconds: 0,
@@ -611,6 +623,10 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
                 rawReportFile: null,
                 worktreePath: data.worktreePath,
                 preassignedSessionId: null,
+                artifactRoot: data.artifactRoot,
+                logFile: null,
+                stderrFile: null,
+                sentinelToken: null,
               }
             : {
                 // Replayed pre-#7 events carry no `kind`; they are simulated.
@@ -626,13 +642,14 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
                 rawReportFile: null,
                 worktreePath: null,
                 preassignedSessionId: null,
+                artifactRoot: null,
+                logFile: data.logFile,
+                stderrFile: data.stderrFile,
+                sentinelToken: data.sentinelToken,
               };
       const lane: LaneView = {
         laneId: event.data.laneId,
         paneId: event.data.paneId,
-        logFile: event.data.logFile,
-        stderrFile: event.data.stderrFile,
-        sentinelToken: event.data.sentinelToken,
         ...(event.data.role === undefined ? {} : { role: event.data.role }),
         ...registration,
         isolationPre: null,
@@ -748,16 +765,24 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       if (attemptId === undefined) return withCheckpoint;
       // An interactive attempt's checkpoint is AGENT-authored at a declared
       // path. `origin` travels with it, so a runtime-derived `unknown` record
-      // can never be rendered as the Agent's own claim.
-      return withAttempt(withCheckpoint, event, attemptId, (attempt) => ({
-        ...attempt,
-        agentCheckpoint: {
-          file: event.data.checkpointFile,
-          semanticState: event.data.semanticState,
-          origin: event.actor === "runtime" ? "runtime" : "agent",
-          at: event.at,
-        },
-      }));
+      // can never be rendered as the Agent's own claim. Write-once: a second
+      // collection would overwrite the record the first one preserved.
+      return withAttempt(withCheckpoint, event, attemptId, (attempt) => {
+        if (attempt.agentCheckpoint !== null) {
+          throw new Error(
+            `attempt "${attemptId}" already has a checkpoint; it is write-once`,
+          );
+        }
+        return {
+          ...attempt,
+          agentCheckpoint: {
+            file: event.data.checkpointFile,
+            semanticState: event.data.semanticState,
+            origin: event.actor === "runtime" ? "runtime" : "agent",
+            at: event.at,
+          },
+        };
+      });
     }
     case "lane_exited":
       return withLane(state, event, (lane) => {
@@ -944,7 +969,10 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         effort: data.effort,
         paneId: data.paneId,
         agentName: null,
-        agentSessionId: null,
+        session: {
+          kind: "unavailable",
+          reason: "the attempt has not bound an agent yet",
+        },
         worktreePath: data.worktreePath,
         briefFile: data.briefFile,
         checkpointFile: data.checkpointFile,
@@ -952,23 +980,33 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         startedAt: event.at,
         endedAt: null,
         endReason: null,
+        endCause: null,
         exitCode: null,
         supersededBy: null,
         authorization: { ...data.authorization, at: event.at },
         agentCheckpoint: null,
         runnerEvidence: [],
         reconciliation: null,
-        startFailure: null,
         advisory: [],
         controlMode: lane.controlMode,
         steerSubmissions: 0,
         steerObservations: 0,
         lastCancelTurnAt: null,
         lastAbortAt: null,
+        lastControlDelivery: null,
       };
+      // `supersededBy` is DERIVED here from the child naming its parent. There
+      // is no separate supersede event, so the two directions cannot disagree.
+      const parent =
+        data.parentAttemptId === null
+          ? null
+          : state.interactiveAttempts[data.parentAttemptId]!;
       return withRun(state, event, {
         interactiveAttempts: {
           ...state.interactiveAttempts,
+          ...(parent === null
+            ? {}
+            : { [parent.attemptId]: { ...parent, supersededBy: data.attemptId } }),
           [data.attemptId]: attempt,
         },
         interactiveAttemptOrder: [
@@ -977,56 +1015,45 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         ],
       });
     }
-    case "interactive_attempt_start_failed":
-      return withAttempt(state, event, event.data.attemptId, (attempt) => {
-        if (attempt.startFailure !== null) {
-          throw new Error("duplicate interactive_attempt_start_failed");
-        }
-        return {
-          ...attempt,
-          startFailure: { cause: event.data.cause, at: event.at },
-          endedAt: attempt.endedAt ?? event.at,
-          endReason: attempt.endReason ?? "start-failed",
-        };
-      });
     case "interactive_attempt_bound":
       return withAttempt(state, event, event.data.attemptId, (attempt) => {
         if (attempt.agentName !== null) {
           throw new Error("duplicate interactive_attempt_bound");
         }
+        if (attempt.endReason !== null) {
+          throw new Error(
+            `attempt "${attempt.attemptId}" ended as "${attempt.endReason}" and cannot bind an agent`,
+          );
+        }
         return {
           ...attempt,
           agentName: event.data.agentName,
-          agentSessionId: event.data.agentSessionId,
+          session: event.data.session,
         };
       });
     case "interactive_attempt_ended":
       return withAttempt(state, event, event.data.attemptId, (attempt) => {
-        if (attempt.endReason !== null && attempt.startFailure === null) {
-          throw new Error("duplicate interactive_attempt_ended");
+        // An end is PERMANENT. No second end, whatever the first one was —
+        // a start failure is an end like any other, and overwriting it would
+        // delete the only record of why the attempt never ran.
+        if (attempt.endReason !== null) {
+          throw new Error(
+            `attempt "${attempt.attemptId}" already ended as "${attempt.endReason}"`,
+          );
         }
         return {
           ...attempt,
           endedAt: event.at,
           endReason: event.data.endReason,
+          endCause: event.data.cause,
           exitCode: event.data.exitCode,
         };
       });
-    case "interactive_attempt_superseded": {
-      const successor = event.data.supersededBy;
-      if (!state.interactiveAttempts[successor]) {
-        throw new Error(
-          `interactive_attempt_superseded names unknown successor "${successor}"`,
-        );
-      }
-      return withAttempt(state, event, event.data.attemptId, (attempt) => {
-        if (attempt.supersededBy !== null) {
-          throw new Error("duplicate interactive_attempt_superseded");
-        }
-        return { ...attempt, supersededBy: successor };
-      });
-    }
     case "interactive_attempt_reconciled":
+      // Reconciliation is a repeatable OBSERVATION: the projection keeps the
+      // latest and the event log keeps the history. It never revives an ended
+      // attempt — `endReason` is not touched here, and the control-plane guard
+      // reads it, so a later `live` sighting restores nothing.
       return withAttempt(state, event, event.data.attemptId, (attempt) => ({
         ...attempt,
         // The pane id is re-read rather than assumed: a pane moved between
@@ -1106,6 +1133,8 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
                 ),
               ],
       }));
+    // Control INTENT, recorded before the Herdr call so a controller that dies
+    // mid-call still leaves the request behind. Delivery is a separate fact.
     case "lane_cancel_turn":
       return withAttempt(state, event, event.data.attemptId, (attempt) => ({
         ...attempt,
@@ -1116,7 +1145,35 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         ...attempt,
         lastAbortAt: event.at,
       }));
-    case "lane_blocked_observed":
+    case "lane_control_delivered":
+      return withAttempt(state, event, event.data.attemptId, (attempt) => ({
+        ...attempt,
+        lastControlDelivery: {
+          control: event.data.control,
+          method: event.data.method,
+          delivered: event.data.delivered,
+          detail: event.data.detail,
+          observedStatus: event.data.observedStatus,
+          at: event.at,
+        },
+        // A status seen after the effect is still ADVISORY, and joins that
+        // channel rather than becoming a delivery confirmation of its own.
+        advisory:
+          event.data.observedStatus === null
+            ? attempt.advisory
+            : [
+                ...attempt.advisory,
+                advisoryOf(
+                  {
+                    status: event.data.observedStatus,
+                    source: "herdr-detection",
+                    paneId: attempt.paneId,
+                    message: null,
+                  },
+                  event.at,
+                ),
+              ],
+      }));
     case "lane_advisory_state_observed":
       return withAttempt(state, event, event.data.attemptId, (attempt) => ({
         ...attempt,

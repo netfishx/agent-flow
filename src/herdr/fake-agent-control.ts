@@ -34,6 +34,12 @@ export interface FakeAgentControlOptions {
   /** Programs keyed by the agent name the controller derives. */
   readonly programs?: Readonly<Record<string, FakeAgentProgram>>;
   readonly defaultProgram?: FakeAgentProgram;
+  /**
+   * The pane fake to mark occupied when an agent starts. `herdr agent start`
+   * puts a real process in the pane, so without this the adapter would report
+   * every interactive pane as idle and a signal to it as undelivered.
+   */
+  readonly panes?: { occupyPane(paneId: string): void };
 }
 
 interface LiveAgent {
@@ -50,6 +56,7 @@ interface LiveAgent {
 export class FakeHerdrAgentControl implements HerdrAgentControl {
   private readonly programs: Readonly<Record<string, FakeAgentProgram>>;
   private readonly defaultProgram: FakeAgentProgram;
+  private readonly panes: { occupyPane(paneId: string): void } | null;
   private readonly live = new Map<string, LiveAgent>();
 
   // Observability for assertions.
@@ -62,6 +69,7 @@ export class FakeHerdrAgentControl implements HerdrAgentControl {
   constructor(options: FakeAgentControlOptions = {}) {
     this.programs = options.programs ?? {};
     this.defaultProgram = options.defaultProgram ?? {};
+    this.panes = options.panes ?? null;
   }
 
   /** Model a pane whose agent died: Herdr keeps no record of a dead session. */
@@ -124,6 +132,7 @@ export class FakeHerdrAgentControl implements HerdrAgentControl {
       program,
     };
     this.live.set(options.name, agent);
+    this.panes?.occupyPane(options.paneId);
     return {
       agent: this.infoOf(agent, "idle"),
       argv: [options.kind, ...(options.nativeArgs ?? [])],

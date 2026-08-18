@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { RealHerdrAdapter } from "../herdr/real-adapter.ts";
 import { issueApiPath } from "../issue/gh-argv.ts";
 import { GitReviewIsolation } from "../review/isolation.ts";
@@ -31,10 +32,19 @@ const USAGE =
  * one of them is a HUMAN act: no runtime path issues a steer, a cancel, an
  * abort, or a retry, so the CLI is where the authorization enters the ledger.
  */
-const INTERACTIVE_USAGE =
-  "usage: flow steer <runId> <laneId> <text> | flow cancel-turn <runId> <laneId> | flow abort-session <runId> <laneId> | flow authorize-retry <runId> <laneId> <attemptId> --note <text> | flow reconcile <runId> <laneId> <attemptId>";
+const INTERACTIVE_USAGE = [
+  "usage: flow open-lane --workflow <name> --workspace <ws> --cwd <dir> --lane <id> --kind <claude|codex|grok> --model <m> --effort <e> --worktree <path>",
+  "       flow start-attempt <runId> <laneId> --brief-file <path> --note <text> [--parent <attemptId>]",
+  "       flow steer <runId> <laneId> <text>",
+  "       flow cancel-turn <runId> <laneId>",
+  "       flow abort-session <runId> <laneId>",
+  "       flow authorize-retry <runId> <laneId> <attemptId> --note <text>",
+  "       flow reconcile <runId> <laneId> <attemptId>",
+].join("\n");
 
 export const INTERACTIVE_COMMANDS = [
+  "open-lane",
+  "start-attempt",
   "steer",
   "cancel-turn",
   "abort-session",
@@ -46,20 +56,80 @@ export type InteractiveCommand = (typeof INTERACTIVE_COMMANDS)[number];
 
 export interface InteractiveInvocation {
   readonly command: InteractiveCommand;
-  readonly runId: string;
-  readonly laneId: string;
+  readonly runId: string | null;
+  readonly laneId: string | null;
   readonly attemptId: string | null;
   readonly text: string | null;
+  readonly flags: Readonly<Record<string, string>>;
 }
 
-/** Parse an interactive control invocation, or null when it is malformed. */
+const AGENT_KINDS: ReadonlySet<string> = new Set(["claude", "codex", "grok"]);
+
+/** Parse `--flag value` pairs; null on a repeat, a stray, or a missing value. */
+function parseFlags(
+  args: readonly string[],
+  allowed: readonly string[],
+): Readonly<Record<string, string>> | null {
+  const values: Record<string, string> = {};
+  for (let index = 0; index < args.length; index += 2) {
+    const flag = args[index];
+    const value = args[index + 1];
+    if (
+      flag === undefined ||
+      value === undefined ||
+      !allowed.includes(flag) ||
+      flag in values ||
+      value.startsWith("--")
+    ) {
+      return null;
+    }
+    values[flag] = value;
+  }
+  return values;
+}
+
+const OPEN_LANE_FLAGS = [
+  "--workflow",
+  "--workspace",
+  "--cwd",
+  "--lane",
+  "--kind",
+  "--model",
+  "--effort",
+  "--worktree",
+] as const;
+
+/** Parse an interactive invocation, or null when it is malformed. */
 export function parseInteractiveArgs(
   args: readonly string[],
 ): InteractiveInvocation | null {
-  const [command, runId, laneId, third, ...rest] = args;
+  const [command, ...rest] = args;
   if (
     command === undefined ||
-    !(INTERACTIVE_COMMANDS as readonly string[]).includes(command) ||
+    !(INTERACTIVE_COMMANDS as readonly string[]).includes(command)
+  ) {
+    return null;
+  }
+
+  if (command === "open-lane") {
+    const flags = parseFlags(rest, OPEN_LANE_FLAGS);
+    if (flags === null) return null;
+    for (const flag of OPEN_LANE_FLAGS) {
+      if (flags[flag] === undefined) return null;
+    }
+    if (!AGENT_KINDS.has(flags["--kind"]!)) return null;
+    return {
+      command,
+      runId: null,
+      laneId: null,
+      attemptId: null,
+      text: null,
+      flags,
+    };
+  }
+
+  const [runId, laneId, third, ...tail] = rest;
+  if (
     runId === undefined ||
     laneId === undefined ||
     runId.startsWith("--") ||
@@ -71,10 +141,30 @@ export function parseInteractiveArgs(
     command: command as InteractiveCommand,
     runId,
     laneId,
+    flags: {},
   } as const;
 
+  if (command === "start-attempt") {
+    const flags = parseFlags(
+      third === undefined ? [] : [third, ...tail],
+      ["--brief-file", "--note", "--parent"],
+    );
+    if (
+      flags === null ||
+      flags["--brief-file"] === undefined ||
+      flags["--note"] === undefined
+    ) {
+      return null;
+    }
+    return {
+      ...base,
+      attemptId: flags["--parent"] ?? null,
+      text: null,
+      flags,
+    };
+  }
   if (command === "steer") {
-    if (third === undefined || rest.length > 0) return null;
+    if (third === undefined || tail.length > 0) return null;
     return { ...base, attemptId: null, text: third };
   }
   if (command === "cancel-turn" || command === "abort-session") {
@@ -82,7 +172,7 @@ export function parseInteractiveArgs(
     return { ...base, attemptId: null, text: null };
   }
   if (command === "reconcile") {
-    if (third === undefined || third.startsWith("--") || rest.length > 0) {
+    if (third === undefined || third.startsWith("--") || tail.length > 0) {
       return null;
     }
     return { ...base, attemptId: third, text: null };
@@ -91,13 +181,13 @@ export function parseInteractiveArgs(
   if (
     third === undefined ||
     third.startsWith("--") ||
-    rest.length !== 2 ||
-    rest[0] !== "--note" ||
-    rest[1] === undefined
+    tail.length !== 2 ||
+    tail[0] !== "--note" ||
+    tail[1] === undefined
   ) {
     return null;
   }
-  return { ...base, attemptId: third, text: rest[1] };
+  return { ...base, attemptId: third, text: tail[1] };
 }
 
 const DEFAULT_LANE_TIMEOUT_MS = 300_000;
@@ -217,11 +307,15 @@ function renderInteractiveAttempts(run: RunView, stdout: TextSink): void {
     stdout.write(
       `attempt=${attempt.attemptId} lane=${attempt.laneId} ordinal=${attempt.ordinal} parent=${value(attempt.parentAttemptId)}\n`,
     );
+    const session =
+      attempt.session.kind === "measured"
+        ? `measured:${attempt.session.id}`
+        : `unavailable(${quotedValue(attempt.session.reason)})`;
     stdout.write(
-      `  disposition=${attemptDisposition(attempt)} endReason=${value(attempt.endReason)} exitCode=${value(attempt.exitCode)} supersededBy=${value(attempt.supersededBy)}\n`,
+      `  disposition=${attemptDisposition(attempt)} endReason=${value(attempt.endReason)} endCause=${quotedValue(attempt.endCause)} exitCode=${value(attempt.exitCode)} supersededBy=${value(attempt.supersededBy)}\n`,
     );
     stdout.write(
-      `  agentKind=${attempt.agentKind} pane=${attempt.paneId} name=${value(attempt.agentName)} session=${value(attempt.agentSessionId)} controlMode=${attempt.controlMode}\n`,
+      `  agentKind=${attempt.agentKind} pane=${attempt.paneId} name=${value(attempt.agentName)} session=${session} controlMode=${attempt.controlMode}\n`,
     );
     stdout.write(
       `  authorization actor=${attempt.authorization.actor} note=${quotedValue(attempt.authorization.note)} pendingRetries=${pendingRetries(run, attempt.attemptId)}\n`,
@@ -237,11 +331,15 @@ function renderInteractiveAttempts(run: RunView, stdout: TextSink): void {
         `  runner=${record.evidenceId} pane=${record.paneId} exitCode=${value(record.exitCode)} log=${record.logFile}\n`,
       );
     }
+    const delivery = attempt.lastControlDelivery;
     stdout.write(
-      `  steer submitted=${attempt.steerSubmissions} observed=${attempt.steerObservations} cancelTurnAt=${value(attempt.lastCancelTurnAt)} abortAt=${value(attempt.lastAbortAt)}\n`,
+      `  steer submitted=${attempt.steerSubmissions} observed=${attempt.steerObservations} cancelTurnRequestedAt=${value(attempt.lastCancelTurnAt)} abortRequestedAt=${value(attempt.lastAbortAt)}\n`,
     );
     stdout.write(
-      `  reconciliation=${value(attempt.reconciliation?.outcome ?? null)} detail=${quotedValue(attempt.reconciliation?.detail ?? null)} startFailure=${quotedValue(attempt.startFailure?.cause ?? null)}\n`,
+      `  lastDelivery control=${value(delivery?.control ?? null)} delivered=${value(delivery?.delivered ?? null)} detail=${quotedValue(delivery?.detail ?? null)}\n`,
+    );
+    stdout.write(
+      `  reconciliation=${value(attempt.reconciliation?.outcome ?? null)} detail=${quotedValue(attempt.reconciliation?.detail ?? null)}\n`,
     );
     // ADVISORY. Never evidence, and never an input to `disposition` above.
     stdout.write(
@@ -269,7 +367,7 @@ function renderRun(run: RunView, stdout: TextSink): void {
       `  registeredAt=${lane.registeredAt} dispatchIntentAt=${value(lane.dispatchIntentAt)} dispatchedAt=${value(lane.dispatchedAt)} liveAt=${value(lane.liveAt)} completedAt=${value(lane.completedAt)} checkpointAt=${value(lane.checkpointAt)} contractEvaluatedAt=${value(lane.contractEvaluatedAt)} verificationRecordedAt=${value(lane.verificationRecordedAt)}\n`,
     );
     stdout.write(
-      `  artifacts stdout=${lane.logFile} stderr=${lane.stderrFile} checkpoint=${value(lane.checkpointFile)} result=${value(lane.resultFile)} evidence=${value(lane.evidenceFile)}\n`,
+      `  artifacts stdout=${value(lane.logFile)} stderr=${value(lane.stderrFile)} checkpoint=${value(lane.checkpointFile)} result=${value(lane.resultFile)} evidence=${value(lane.evidenceFile)}\n`,
     );
     if (lane.kind === "agent") {
       const session =
@@ -427,14 +525,18 @@ async function requireLedgerRoot(root: string): Promise<void> {
  */
 export function realInteractiveController(
   ledger: Ledger,
+  ledgerRoot: string,
 ): InteractiveLaneController {
   return new InteractiveLaneController({
     adapter: new RealHerdrAdapter(),
     agentControl: new RealHerdrAgentControl(),
     ledger,
+    // Attempt artifacts share the ledger's lifetime, so a checkpoint the
+    // ledger points at cannot outlive or predecease the record naming it.
+    artifactRoot: join(ledgerRoot, "interactive"),
     clock: () => Date.now(),
     idgen: () =>
-      `att-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,
+      `att-${Date.now().toString(36)}-${randomUUID().replaceAll("-", "").slice(0, 12)}`,
     sessionIdgen: () => randomUUID(),
   });
 }
@@ -456,31 +558,69 @@ async function runInteractiveCli(
     await requireLedgerRoot(root);
     const ledger = new FsLedger(root);
     const controller =
-      options.interactiveFactory?.(ledger) ?? realInteractiveController(ledger);
-    const { runId, laneId } = invocation;
+      options.interactiveFactory?.(ledger) ??
+      realInteractiveController(ledger, root);
+    const flags = invocation.flags;
+    let runId = invocation.runId;
+    const laneId = invocation.laneId!;
     switch (invocation.command) {
+      case "open-lane": {
+        const opened = await controller.openLane({
+          workflow: flags["--workflow"]!,
+          workspace: flags["--workspace"]!,
+          cwd: flags["--cwd"]!,
+          laneId: flags["--lane"]!,
+          agentKind: flags["--kind"] as "claude" | "codex" | "grok",
+          model: flags["--model"]!,
+          effort: flags["--effort"]!,
+          worktreePath: flags["--worktree"]!,
+        });
+        runId = opened.runId;
+        stdout.write(`runId=${opened.runId} laneId=${opened.laneId}\n`);
+        break;
+      }
+      case "start-attempt": {
+        // The brief comes from a FILE, never from an argv fragment: it is the
+        // lane's contract with the Agent, and it is the first prompt.
+        const brief = await Bun.file(flags["--brief-file"]!).text();
+        const outcome = await controller.startAttempt(runId!, laneId, {
+          brief,
+          authorization: { note: flags["--note"]! },
+          ...(invocation.attemptId === null
+            ? {}
+            : { parentAttemptId: invocation.attemptId }),
+        });
+        stdout.write(
+          `attempt=${outcome.attemptId} started=${outcome.started} startFailure=${quotedValue(outcome.startFailure)}\n`,
+        );
+        break;
+      }
       case "steer":
-        await controller.steer(runId, laneId, invocation.text!);
+        await controller.steer(runId!, laneId, invocation.text!);
         break;
       case "cancel-turn":
-        await controller.cancelTurn(runId, laneId);
+        await controller.cancelTurn(runId!, laneId);
         break;
       case "abort-session":
-        await controller.abortSession(runId, laneId);
+        await controller.abortSession(runId!, laneId);
         break;
       case "authorize-retry":
         await controller.authorizeRetry(
-          runId,
+          runId!,
           laneId,
           invocation.attemptId!,
           invocation.text!,
         );
         break;
       case "reconcile":
-        await controller.reconcileAttempt(runId, laneId, invocation.attemptId!);
+        await controller.reconcileAttempt(
+          runId!,
+          laneId,
+          invocation.attemptId!,
+        );
         break;
     }
-    const run = await ledger.load(runId);
+    const run = await ledger.load(runId!);
     if (!run) {
       stderr.write(`run "${runId}" not found\n`);
       return 1;

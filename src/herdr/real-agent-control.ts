@@ -37,13 +37,22 @@ export interface RealHerdrAgentControlOptions {
 }
 
 /**
- * Herdr error codes this port interprets rather than raises. Everything else
- * is a genuine failure and is thrown, so a broken CLI never masquerades as a
- * benign observation.
+ * The only Herdr error codes this port interprets rather than raises. Each one
+ * is observed, not assumed:
+ *
+ *   - `agent_prompt_stalled` and `timeout` are documented in
+ *     `herdr agent prompt --help` on the installed 0.8.0 binary;
+ *   - `agent_not_found` is what `herdr agent get <missing>` actually returns:
+ *     `{"error":{"code":"agent_not_found","message":"agent target … not found"}}`.
+ *
+ * Anything else is a control-plane failure and is thrown. An unclassified
+ * error must never be read as "the Agent is gone": a broken probe knows
+ * nothing about the session, and pretending otherwise would let a socket
+ * hiccup end an attempt that is still running.
  */
 const STALLED = "agent_prompt_stalled";
 const TIMEOUT = "timeout";
-const NOT_FOUND = new Set(["not_found", "agent_not_found", "unknown_target"]);
+const AGENT_ABSENT = "agent_not_found";
 
 export class RealHerdrAgentControl implements HerdrAgentControl {
   private readonly binary: string;
@@ -136,8 +145,9 @@ export class RealHerdrAgentControl implements HerdrAgentControl {
     const { stdout, stderr, exitCode } = await this.run(agentGetArgv(target));
     if (exitCode === 0) return parseAgentInfo(stdout);
     const error = parseHerdrError(stderr);
-    // A dead session simply has no record: agent state is live-only.
-    if (error !== null && NOT_FOUND.has(error.code)) return null;
+    // A dead session simply has no record: agent state is live-only. Only
+    // Herdr SAYING so counts; a failure to ask counts as nothing.
+    if (error?.code === AGENT_ABSENT) return null;
     throw new Error(
       `herdr agent get failed (exit ${exitCode}): ${
         error ? `${error.code}: ${error.message}` : stderr.trim() || "no output"

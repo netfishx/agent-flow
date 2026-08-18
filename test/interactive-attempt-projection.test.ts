@@ -23,7 +23,7 @@ function attempt(
     effort: "high",
     paneId: "w1:p2",
     agentName: null,
-    agentSessionId: null,
+    session: { kind: "unavailable", reason: "not bound yet" },
     worktreePath: "/tmp/wt",
     briefFile: "/tmp/brief.md",
     checkpointFile: "/tmp/checkpoint.md",
@@ -31,19 +31,20 @@ function attempt(
     startedAt: 10,
     endedAt: null,
     endReason: null,
+    endCause: null,
     exitCode: null,
     supersededBy: null,
     authorization: { actor: "human", note: "owner authorized", at: 5 },
     agentCheckpoint: null,
     runnerEvidence: [],
     reconciliation: null,
-    startFailure: null,
     advisory: [],
     controlMode: "managed",
     steerSubmissions: 0,
     steerObservations: 0,
     lastCancelTurnAt: null,
     lastAbortAt: null,
+    lastControlDelivery: null,
     ...patch,
   };
 }
@@ -181,10 +182,19 @@ describe("attempt disposition", () => {
 
   test("a start failure is a start failure, never a retry", () => {
     const failed = attempt({
-      startFailure: { cause: "herdr agent start timed out after 30000ms", at: 12 },
       endedAt: 12,
       endReason: "start-failed",
+      endCause: "herdr agent start timed out after 30000ms",
     });
     expect(projectAttemptDisposition(objectiveFactsOf(failed))).toBe("unknown");
+  });
+
+  test("a failed probe fails closed, whatever evidence exists", () => {
+    const view = attempt({
+      agentCheckpoint: completeCheckpoint,
+      runnerEvidence: [runnerEvidence],
+      reconciliation: { outcome: "unknown-probe", at: 50, detail: "socket died" },
+    });
+    expect(projectAttemptDisposition(objectiveFactsOf(view))).toBe("unknown");
   });
 });

@@ -33,15 +33,29 @@ describe("agent names", () => {
     expect(isValidAgentName("")).toBe(false);
   });
 
-  test("derives a valid name from a lane and attempt", () => {
+  test("derives a valid, stable, lane-readable name", () => {
     const name = agentNameFor("Standards/Claude", "att-7");
     expect(isValidAgentName(name)).toBe(true);
-    expect(name).toContain("att-7".toLowerCase().replace(/[^a-z0-9_-]/g, "-"));
+    expect(name).toContain("standards");
+    // Same inputs, same name: a control call can re-derive the target.
+    expect(agentNameFor("Standards/Claude", "att-7")).toBe(name);
   });
 
   test("a derived name stays inside the length ceiling", () => {
     const name = agentNameFor("a".repeat(40), "b".repeat(40));
     expect(isValidAgentName(name)).toBe(true);
+    expect(name.length).toBeLessThanOrEqual(32);
+  });
+
+  test("attempt ids sharing a long prefix do not collide", () => {
+    // A prefix-truncating name would map all of these onto one string, and a
+    // duplicate name is rejected by Herdr as a start failure.
+    const names = new Set(
+      Array.from({ length: 200 }, (_, i) =>
+        agentNameFor("a-long-lane-identifier", `att-mabcdefg-${i}`),
+      ),
+    );
+    expect(names.size).toBe(200);
   });
 });
 

@@ -191,6 +191,19 @@ export class FakeHerdrAdapter implements HerdrAdapter {
     return this.paneByLane.get(laneId);
   }
 
+  /**
+   * Model an interactive agent process living in a pane. `herdr agent start`
+   * puts a real process there, so its foreground group differs from the shell
+   * and a signal to that group IS delivered — without this the fake would only
+   * ever exercise the "nothing to signal" path.
+   */
+  occupyPane(paneId: string): void {
+    const state = this.panes.get(paneId);
+    if (!state) throw new Error(`fake: unknown pane ${paneId}`);
+    state.role = "lane";
+    state.finished = false;
+  }
+
   /** Simulate a lane exiting on its own without going through wait/interrupt. */
   finishLane(laneId: string): void {
     const paneId = this.paneByLane.get(laneId);
