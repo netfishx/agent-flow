@@ -479,6 +479,46 @@ describe("P2-D write-lane worktree isolation", () => {
 });
 
 describe("P2-C the ledger lease survives concurrent churn", () => {
+  test("a lock file that is present but unwritten is contention, not corruption", async () => {
+    // Deterministic stand-in for the race: a controller has created the lock
+    // and not yet flushed its record. Reading it must not be read as damage.
+    const dir = await mkdtemp(join(tmpdir(), "flow-r3-empty-"));
+    try {
+      const ledger = new FsLedger(dir);
+      const runDir = join(dir, "runs", "run-empty");
+      await mkdir(runDir, { recursive: true });
+      await writeFile(join(runDir, "controller.lock"), "", "utf8");
+      let message = "";
+      try {
+        await ledger.acquireLease("run-empty", {
+          controllerId: "c",
+          pid: process.pid,
+        });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain("already held");
+      expect(message).not.toContain("corrupt");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a genuinely malformed lock file is still reported as corrupt", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "flow-r3-bad-"));
+    try {
+      const ledger = new FsLedger(dir);
+      const runDir = join(dir, "runs", "run-bad");
+      await mkdir(runDir, { recursive: true });
+      await writeFile(join(runDir, "controller.lock"), "not json at all\n", "utf8");
+      await expect(
+        ledger.acquireLease("run-bad", { controllerId: "c", pid: process.pid }),
+      ).rejects.toThrow(/corrupt/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("high-frequency contention yields only success or already-held", async () => {
     const dir = await mkdtemp(join(tmpdir(), "flow-r3-lease-"));
     try {
