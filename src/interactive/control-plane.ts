@@ -1045,14 +1045,10 @@ export class InteractiveLaneController {
         observed: null,
       };
     }
-    if (observed.name !== null && observed.name !== attempt.expectedAgentName) {
-      return {
-        outcome: "reoccupied",
-        paneId: observed.paneId,
-        detail: `pane hosts agent "${observed.name}", expected "${attempt.expectedAgentName}"`,
-        observed: null,
-      };
-    }
+    // No further name check: the lookup was BY `expectedAgentName`, so a
+    // record returned here is that name's by construction. A pane running
+    // under some OTHER name is caught above, where the name lookup finds
+    // nothing and the pane itself is asked who is there.
     return { outcome: "live", paneId: observed.paneId, detail: null, observed };
   }
 

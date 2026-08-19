@@ -238,6 +238,8 @@ describe("P1-1 crash window 2: agent started, bind never committed", () => {
   });
 
   test("the same pane running a different agent name is not adopted", async () => {
+    // The expected name resolves to nothing, so the pane itself is asked who
+    // is there — and it answers with a stranger.
     const { fresh, h, runId, laneId, attempt } = await orphaned();
     h.control.renameAgentOnPane(attempt.paneId, "someone-elses-agent");
     expect(
@@ -245,7 +247,9 @@ describe("P1-1 crash window 2: agent started, bind never committed", () => {
     ).toBe("reoccupied");
     const [after] = await fresh.controller.attempts(runId, laneId);
     expect(after!.agentName).toBeNull();
+    expect(after!.reconciliation?.detail).toContain("someone-elses-agent");
     expect(h.control.promptCalls).toHaveLength(0);
+    expect(h.adapter.interruptedPaneIds).toHaveLength(0);
   });
 
   test("a lookup failure stays unknown and fabricates no absence", async () => {
