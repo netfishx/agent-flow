@@ -106,17 +106,13 @@ export interface ControlRecord {
 }
 
 /**
- * What is known about the latest control. Derived from the intent/delivery
- * pair, never stored: `unconfirmed` is the honest answer when a controller
- * recorded the request and then died, or when the delivery record itself was
- * lost — the effect may or may not have reached the session, and nothing may
- * replay it on that basis.
+ * What is known about ONE control. Derived from its intent/delivery pair,
+ * never stored: `unconfirmed` is the honest answer when a controller recorded
+ * the request and then died, or when the delivery record itself was lost — the
+ * effect may or may not have reached the session, and nothing may replay it on
+ * that basis.
  */
-export type ControlDeliveryState =
-  | "none"
-  | "unconfirmed"
-  | "delivered"
-  | "failed";
+export type ControlDeliveryState = "unconfirmed" | "delivered" | "failed";
 
 /**
  * The attempt's outcome. `completed` is reachable only from objective evidence
@@ -201,6 +197,12 @@ export interface InteractiveAttemptView {
   readonly effort: string;
   /** The pane at start; re-recorded when reconciliation finds it moved. */
   readonly paneId: string;
+  /**
+   * The deterministic name this attempt's agent is started under, recorded at
+   * registration. It is what lets a fresh controller prove that a live agent
+   * in the pane is THIS attempt's and not a stranger's.
+   */
+  readonly expectedAgentName: string;
   /** Observed agent name. NOT a durable handle: Herdr clears it on exit. */
   readonly agentName: string | null;
   /**
@@ -241,6 +243,11 @@ export interface InteractiveAttemptView {
   readonly lastCancelTurnAt: number | null;
   /** When an abort was REQUESTED. Delivery is a separate fact. */
   readonly lastAbortAt: number | null;
-  /** The latest control request paired with its delivery, if one landed. */
-  readonly lastControl: ControlRecord | null;
+  /**
+   * Every control ever requested on this attempt, in event order. A history
+   * rather than a slot: a request whose delivery was lost stays `unconfirmed`
+   * forever, and the next control must not be able to erase it. `controlId` is
+   * unique within the attempt for the same reason.
+   */
+  readonly controls: readonly ControlRecord[];
 }

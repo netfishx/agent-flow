@@ -125,7 +125,9 @@ export {
   RetryNotAuthorizedError,
   WriteLaneIsolationError,
   controlDeliveryState,
+  latestControl,
   pendingRetries,
+  unresolvedControls,
 } from "./interactive/control-plane.ts";
 export { GitWriteLaneIsolation } from "./interactive/isolation.ts";
 export type {

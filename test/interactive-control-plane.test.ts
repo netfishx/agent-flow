@@ -22,7 +22,16 @@ import type {
 import type { FakeHerdrAdapterOptions } from "../src/herdr/fake-adapter.ts";
 
 /** Accepts every worktree; isolation itself is proved against real git. */
-const permissiveIsolation = { verifyWriteWorktree: async () => ({ ok: true as const }) };
+const permissiveIsolation = {
+  verifyWriteWorktree: async (input: {
+    readonly repoRoot: string;
+    readonly worktreePath: string;
+  }) => ({
+    ok: true as const,
+    canonicalRepoRoot: input.repoRoot,
+    canonicalWorktreePath: input.worktreePath,
+  }),
+};
 
 
 let root: string;

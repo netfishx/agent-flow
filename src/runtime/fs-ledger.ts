@@ -65,13 +65,30 @@ let snapshotSequence = 0;
  */
 const LEASE_ACQUIRE_ATTEMPTS = 8;
 
-/** The lock file was gone or unwritten when read: contention, not corruption. */
+/** The lock file was gone when read: contention, not corruption. */
 class LeaseVanishedError extends Error {
   constructor(runId: string) {
     super(`controller lease for run "${runId}" vanished while being read`);
     this.name = "LeaseVanishedError";
   }
 }
+
+/**
+ * The lock file exists but carries no readable owner. New locks are published
+ * atomically, so this can only be a legacy lock left by the old
+ * create-then-write sequence, or genuine damage. Either way nobody can prove
+ * who holds it, so it is re-read a few times and then surfaced as corrupt —
+ * never waited on forever, and never deleted on this process's say-so.
+ */
+class LeaseUnreadableError extends Error {
+  constructor(runId: string) {
+    super(`controller lease for run "${runId}" has no readable owner`);
+    this.name = "LeaseUnreadableError";
+  }
+}
+
+/** How many times an unreadable lock is re-read before it is called corrupt. */
+const LEASE_STABILITY_READS = 3;
 let commitStateSequence = 0;
 let leaseSequence = 0;
 let commitLockSequence = 0;
@@ -408,20 +425,41 @@ export class FsLedger implements Ledger {
       epoch,
       acquiredAt: Date.now(),
     });
-    // The create/read pair is not atomic together, so a holder releasing at
-    // exactly the wrong moment is retried rather than reported. The bound is
-    // finite: persistent contention still surfaces as "already held".
-    let handle: FileHandle | undefined;
+    // Publish atomically. A lock is never visible half-written: the record is
+    // written to a private temp file, flushed, and then `link`ed onto the lock
+    // path, which fails rather than replacing an existing holder. The old
+    // create-then-write sequence could leave a public empty lock on a crash.
+    let published = false;
     for (let attempt = 0; ; attempt++) {
+      const temp = join(
+        runDir,
+        `.controller.lock.tmp-${process.pid}-${++leaseSequence}`,
+      );
       try {
-        handle = await open(lockFile, "wx");
-        break;
+        const handle = await open(temp, "wx");
+        try {
+          await handle.writeFile(`${JSON.stringify(record(0))}\n`, "utf8");
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        await link(temp, lockFile);
+        published = true;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+          await unlink(temp).catch(() => {});
+          throw error;
+        }
+      } finally {
+        // The temp file is ours in every outcome — published, lost the race,
+        // or thrown — and never outlives this call.
+        await unlink(temp).catch(() => {});
       }
+      if (published) break;
+
       let holder: ControllerLeaseRecord;
       try {
-        holder = await this.readControllerLease(lockFile, runId);
+        holder = await this.readLeaseWithStability(lockFile, runId);
       } catch (error) {
         if (
           error instanceof LeaseVanishedError &&
@@ -433,6 +471,11 @@ export class FsLedger implements Ledger {
           throw new ControllerLeaseHeldError(
             `controller lease for run "${runId}" is already held`,
           );
+        }
+        if (error instanceof LeaseUnreadableError) {
+          throw new Error(`corrupt controller lease for run "${runId}"`, {
+            cause: error,
+          });
         }
         throw error;
       }
@@ -449,17 +492,6 @@ export class FsLedger implements Ledger {
         record(holder.epoch + 1),
       );
       break;
-    }
-    if (handle) {
-      try {
-        await handle.writeFile(`${JSON.stringify(record(0))}\n`, "utf8");
-        await handle.sync();
-      } catch (error) {
-        await handle.close();
-        await unlink(lockFile).catch(() => {});
-        throw error;
-      }
-      await handle.close();
     }
 
     let released = false;
@@ -480,6 +512,28 @@ export class FsLedger implements Ledger {
     };
   }
 
+  /**
+   * Read the lock, re-reading an unreadable one a few times before calling it
+   * corrupt. A lock mid-publish is never unreadable — publication is atomic —
+   * so a lock that stays unreadable is a legacy or damaged one, and saying so
+   * is better than waiting on an owner nobody can name.
+   */
+  private async readLeaseWithStability(
+    lockFile: string,
+    runId: string,
+  ): Promise<ControllerLeaseRecord> {
+    let lastUnreadable: unknown = null;
+    for (let read = 0; read < LEASE_STABILITY_READS; read++) {
+      try {
+        return await this.readControllerLease(lockFile, runId);
+      } catch (error) {
+        if (!(error instanceof LeaseUnreadableError)) throw error;
+        lastUnreadable = error;
+      }
+    }
+    throw lastUnreadable;
+  }
+
   private async readControllerLease(
     lockFile: string,
     runId: string,
@@ -496,16 +550,12 @@ export class FsLedger implements Ledger {
       }
       throw error;
     }
-    // A create that has not written its record yet leaves an empty file. Same
-    // reasoning: a race, not a malformed lock.
-    if (raw.trim().length === 0) throw new LeaseVanishedError(runId);
+    if (raw.trim().length === 0) throw new LeaseUnreadableError(runId);
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
-    } catch (error) {
-      throw new Error(`corrupt controller lease for run "${runId}"`, {
-        cause: error,
-      });
+    } catch {
+      throw new LeaseUnreadableError(runId);
     }
     if (
       typeof parsed !== "object" ||
@@ -518,7 +568,7 @@ export class FsLedger implements Ledger {
       (parsed as { epoch: number }).epoch < 0 ||
       !Number.isFinite((parsed as { acquiredAt?: unknown }).acquiredAt)
     ) {
-      throw new Error(`corrupt controller lease for run "${runId}"`);
+      throw new LeaseUnreadableError(runId);
     }
     return parsed as ControllerLeaseRecord;
   }

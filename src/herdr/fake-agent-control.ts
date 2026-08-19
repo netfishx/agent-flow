@@ -43,7 +43,7 @@ export interface FakeAgentControlOptions {
 }
 
 interface LiveAgent {
-  readonly name: string;
+  name: string;
   readonly paneId: string;
   /** The detected kind label; a DIFFERENT value models a reoccupied pane. */
   agent: string;
@@ -75,6 +75,27 @@ export class FakeHerdrAgentControl implements HerdrAgentControl {
   /** Model a pane whose agent died: Herdr keeps no record of a dead session. */
   killAgent(name: string): void {
     this.live.delete(name);
+  }
+
+  /** Model a pane whose occupant changed kind, addressed by pane rather than name. */
+  reoccupyByPane(paneId: string, change: { agent?: string }): void {
+    for (const agent of this.live.values()) {
+      if (agent.paneId !== paneId) continue;
+      if (change.agent !== undefined) agent.agent = change.agent;
+      return;
+    }
+    throw new Error(`fake: no live agent on pane ${paneId}`);
+  }
+
+  /** Model a pane whose agent runs under someone else's name. */
+  renameAgentOnPane(paneId: string, name: string): void {
+    for (const [key, agent] of [...this.live.entries()]) {
+      if (agent.paneId !== paneId) continue;
+      this.live.delete(key);
+      this.live.set(name, { ...agent, name });
+      return;
+    }
+    throw new Error(`fake: no live agent on pane ${paneId}`);
   }
 
   /** Model a pane another process now occupies. */

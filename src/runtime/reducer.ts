@@ -974,6 +974,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         model: data.model,
         effort: data.effort,
         paneId: data.paneId,
+        expectedAgentName: data.expectedAgentName,
         agentName: null,
         session: {
           kind: "unavailable",
@@ -999,7 +1000,7 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
         steerObservations: 0,
         lastCancelTurnAt: null,
         lastAbortAt: null,
-        lastControl: null,
+        controls: [],
       };
       // `supersededBy` is DERIVED here from the child naming its parent. There
       // is no separate supersede event, so the two directions cannot disagree.
@@ -1152,21 +1153,23 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
           : ("signal-process-group" as const);
       const controlId = event.data.controlId;
       return withAttempt(state, event, event.data.attemptId, (attempt) => {
-        if (attempt.lastControl?.controlId === controlId) {
-          throw new Error(`duplicate control intent "${controlId}"`);
+        // Unique for the life of the attempt, not just against the latest
+        // record: reusing an id would let a later delivery attach to the wrong
+        // request.
+        if (attempt.controls.some((record) => record.controlId === controlId)) {
+          throw new Error(
+            `control id "${controlId}" was already used on attempt "${attempt.attemptId}"`,
+          );
         }
         return {
           ...attempt,
           ...(control === "cancel-turn"
             ? { lastCancelTurnAt: event.at }
             : { lastAbortAt: event.at }),
-          lastControl: {
-            controlId,
-            control,
-            method,
-            requestedAt: event.at,
-            delivery: null,
-          },
+          controls: [
+            ...attempt.controls,
+            { controlId, control, method, requestedAt: event.at, delivery: null },
+          ],
         };
       });
     }
@@ -1174,10 +1177,13 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       return withAttempt(state, event, event.data.attemptId, (attempt) => {
         // A delivery is meaningless without the request it carried out, and a
         // second one would overwrite the first record of what happened.
-        const pending = attempt.lastControl;
-        if (pending === null || pending.controlId !== event.data.controlId) {
+        const index = attempt.controls.findIndex(
+          (record) => record.controlId === event.data.controlId,
+        );
+        const pending = index === -1 ? null : attempt.controls[index]!;
+        if (pending === null) {
           throw new Error(
-            `lane_control_delivered "${event.data.controlId}" has no pending control intent`,
+            `lane_control_delivered "${event.data.controlId}" has no pending control intent on attempt "${attempt.attemptId}"`,
           );
         }
         if (pending.delivery !== null) {
@@ -1190,9 +1196,8 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
             `delivery control "${event.data.control}" does not match intent "${pending.control}"`,
           );
         }
-        return {
-        ...attempt,
-        lastControl: {
+        const controls = [...attempt.controls];
+        controls[index] = {
           ...pending,
           delivery: {
             delivered: event.data.delivered,
@@ -1200,25 +1205,28 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
             observedStatus: event.data.observedStatus,
             at: event.at,
           },
-        },
-        // A status seen after the effect is still ADVISORY, and joins that
-        // channel rather than becoming a delivery confirmation of its own.
-        advisory:
-          event.data.observedStatus === null
-            ? attempt.advisory
-            : [
-                ...attempt.advisory,
-                advisoryOf(
-                  {
-                    status: event.data.observedStatus,
-                    source: "herdr-detection",
-                    paneId: attempt.paneId,
-                    message: null,
-                  },
-                  event.at,
-                ),
-              ],
-      };
+        };
+        return {
+          ...attempt,
+          controls,
+          // A status seen after the effect is still ADVISORY, and joins that
+          // channel rather than becoming a delivery confirmation of its own.
+          advisory:
+            event.data.observedStatus === null
+              ? attempt.advisory
+              : [
+                  ...attempt.advisory,
+                  advisoryOf(
+                    {
+                      status: event.data.observedStatus,
+                      source: "herdr-detection",
+                      paneId: attempt.paneId,
+                      message: null,
+                    },
+                    event.at,
+                  ),
+                ],
+        };
       });
     case "lane_advisory_state_observed":
       return withAttempt(state, event, event.data.attemptId, (attempt) => ({

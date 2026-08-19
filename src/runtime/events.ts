@@ -248,6 +248,12 @@ export interface InteractiveAttemptStartedData {
   readonly model: string;
   readonly effort: string;
   readonly paneId: string;
+  /**
+   * The deterministic agent name this attempt will be started under. Recorded
+   * BEFORE the start so a controller that dies before `bound` can still prove,
+   * by strict name match, that a live agent in that pane is THIS attempt's.
+   */
+  readonly expectedAgentName: string;
   readonly worktreePath: string;
   readonly briefFile: string;
   /** Declared paths the Agent writes to. Nothing durable reads scrollback. */

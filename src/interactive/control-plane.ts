@@ -36,9 +36,11 @@ import {
 import type { SessionIdentity } from "../review/types.ts";
 import { buildNativeArgs, buildRunnerCommand } from "./commands.ts";
 import type { WriteLaneIsolationPort } from "./isolation.ts";
+import type { AgentInfoView } from "../herdr/agent-json.ts";
 import type {
   AdvisoryAgentStatus,
   ControlDeliveryState,
+  ControlRecord,
   DeliveredControl,
   InteractiveAgentKind,
   InteractiveAttemptView,
@@ -183,6 +185,14 @@ export function attemptArtifactPaths(
   };
 }
 
+/** What a pane probe concluded, plus the record that proved it when live. */
+interface ProbeResult {
+  readonly outcome: ReconciliationOutcome;
+  readonly paneId: string;
+  readonly detail: string | null;
+  readonly observed: AgentInfoView | null;
+}
+
 const DEFAULT_STEER_WAIT_MS = 5_000;
 const DEFAULT_RUNNER_TIMEOUT_MS = 300_000;
 
@@ -215,6 +225,12 @@ export class InteractiveLaneController {
     if (!isolation.ok) {
       throw new WriteLaneIsolationError(config.worktreePath, isolation.reason);
     }
+    // From here the caller's path is never used again. Verification resolved
+    // symlinks to reach its verdict, so recording or executing against the
+    // unresolved path would let a later re-point move the Agent somewhere
+    // nothing was ever checked.
+    const worktreePath = isolation.canonicalWorktreePath;
+    const repoRoot = isolation.canonicalRepoRoot;
     const runId = this.deps.idgen();
     assertHandleId("runId", runId);
     const created = await this.deps.adapter.createTab({
@@ -248,8 +264,8 @@ export class InteractiveLaneController {
           agentKind: config.agentKind,
           model: config.model,
           effort: config.effort,
-          worktreePath: config.worktreePath,
-          repoRoot: config.repoRoot,
+          worktreePath,
+          repoRoot,
           artifactRoot: join(this.deps.artifactRoot, runId, config.laneId),
           ...(config.role === undefined ? {} : { role: config.role }),
         },
@@ -285,6 +301,7 @@ export class InteractiveLaneController {
       }
       const attemptId = this.deps.idgen();
       assertHandleId("attemptId", attemptId);
+      const expectedAgentName = agentNameFor(laneId, attemptId);
 
       // A NEW pane per attempt: a retry never resumes, impersonates, or
       // replaces a prior session, so it never reuses that session's pane.
@@ -307,6 +324,7 @@ export class InteractiveLaneController {
           model: lane.model ?? "",
           effort: lane.effort ?? "",
           paneId: pane.id,
+          expectedAgentName,
           worktreePath: lane.worktreePath ?? run.cwd,
           briefFile: paths.briefFile,
           checkpointFile: paths.checkpointFile,
@@ -326,7 +344,7 @@ export class InteractiveLaneController {
           effort: lane.effort ?? "",
           sessionId: preassigned,
         });
-      const name = agentNameFor(laneId, attemptId);
+      const name = expectedAgentName;
       const startedAt = this.deps.clock();
       let started;
       try {
@@ -718,7 +736,10 @@ export class InteractiveLaneController {
   ): Promise<ReconciliationOutcome> {
     return this.mutate(runId, async (commit, run) => {
       const attempt = this.attempt(run, attemptId);
-      const probe = await this.probePane(attempt);
+      const probe =
+        attempt.agentName === null
+          ? await this.probeStartingAttempt(attempt)
+          : await this.probePane(attempt);
       await commit({
         type: "interactive_attempt_reconciled",
         actor: "runtime",
@@ -732,6 +753,42 @@ export class InteractiveLaneController {
           detail: probe.detail,
         },
       });
+
+      // ADOPTION. A controller can die after `agent start` returned and before
+      // the bind landed, leaving a real Agent alive under an attempt that has
+      // no name. The probe above just proved, by strict pane + kind + expected
+      // deterministic name match, that the live agent IS this attempt's — so
+      // the attempt is bound from that evidence rather than orphaned.
+      if (probe.outcome === "live" && attempt.agentName === null) {
+        const observed = probe.observed!;
+        await commit({
+          type: "interactive_attempt_bound",
+          actor: "runtime",
+          laneId,
+          data: {
+            attemptId,
+            agentName: observed.name ?? attempt.expectedAgentName,
+            session: sessionIdentityOf(
+              attempt.agentKind,
+              observed.sessionId,
+              null,
+            ),
+            // Herdr does not report the argv of an agent it did not just
+            // start, so this records the adoption rather than inventing one.
+            argv: [],
+            readinessMs: 0,
+          },
+        });
+        // The brief may never have been submitted. It is delivered now, once:
+        // an EXISTING submission is left alone even when its observation is
+        // unconfirmed, because replaying it could double-instruct the Agent.
+        const adopted = this.attempt(this.runs.get(runId)!, attemptId);
+        if (adopted.steerSubmissions === 0) {
+          const brief = await this.read(adopted.briefFile);
+          await this.submitSteer(commit, laneId, adopted, brief);
+        }
+      }
+
       // Only a POSITIVE finding ends an attempt. `unknown-probe` means the
       // control plane failed, which is not evidence about the Agent.
       const ends = probe.outcome === "reoccupied" || probe.outcome === "missing";
@@ -870,11 +927,7 @@ export class InteractiveLaneController {
    * Probe the attempt's pane. Distinguishes a Herdr answer ("no such agent")
    * from a Herdr failure ("the probe broke"): only the first is evidence.
    */
-  private async probePane(attempt: InteractiveAttemptView): Promise<{
-    readonly outcome: ReconciliationOutcome;
-    readonly paneId: string;
-    readonly detail: string | null;
-  }> {
+  private async probePane(attempt: InteractiveAttemptView): Promise<ProbeResult> {
     let observed;
     try {
       observed = await this.deps.agentControl.getAgent(this.targetOf(attempt));
@@ -885,15 +938,17 @@ export class InteractiveLaneController {
         detail: `the pane could not be probed: ${
           error instanceof Error ? error.message : String(error)
         }`,
+        observed: null,
       };
     }
     if (observed !== null) {
       return observed.agent === attempt.agentKind
-        ? { outcome: "live", paneId: observed.paneId, detail: null }
+        ? { outcome: "live", paneId: observed.paneId, detail: null, observed }
         : {
             outcome: "reoccupied",
             paneId: observed.paneId,
             detail: `pane hosts ${observed.agent ?? "an unrecognized occupant"}, expected ${attempt.agentKind}`,
+            observed: null,
           };
     }
     try {
@@ -903,13 +958,102 @@ export class InteractiveLaneController {
         outcome: "missing",
         paneId: attempt.paneId,
         detail: "pane could not be resolved",
+        observed: null,
       };
     }
     return {
       outcome: "reoccupied",
       paneId: attempt.paneId,
       detail: "the pane no longer hosts the expected agent",
+      observed: null,
     };
+  }
+
+  /**
+   * Probe an attempt that registered but never bound.
+   *
+   * The lookup is by the DETERMINISTIC name recorded at registration, and the
+   * result is accepted only when pane, kind and name all match. Anything else
+   * is a stranger's session or a pane that never ran one — never adopted,
+   * never prompted, never signalled.
+   */
+  private async probeStartingAttempt(
+    attempt: InteractiveAttemptView,
+  ): Promise<ProbeResult> {
+    let observed;
+    try {
+      observed = await this.deps.agentControl.getAgent(
+        attempt.expectedAgentName,
+      );
+    } catch (error) {
+      return {
+        outcome: "unknown-probe",
+        paneId: attempt.paneId,
+        detail: `the expected agent could not be looked up: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        observed: null,
+      };
+    }
+    if (observed === null) {
+      // No agent under this attempt's own name. Ask the pane itself before
+      // concluding: something else may be running there, and that is a
+      // different fact from nothing having started.
+      let occupant;
+      try {
+        occupant = await this.deps.agentControl.getAgent(attempt.paneId);
+      } catch (error) {
+        return {
+          outcome: "unknown-probe",
+          paneId: attempt.paneId,
+          detail: `the pane could not be probed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          observed: null,
+        };
+      }
+      if (occupant !== null) {
+        return {
+          outcome: "reoccupied",
+          paneId: occupant.paneId,
+          detail: `pane hosts agent "${occupant.name ?? "unnamed"}" (${occupant.agent ?? "unrecognized"}), expected "${attempt.expectedAgentName}"`,
+          observed: null,
+        };
+      }
+      // Nothing there. Saying the pane "no longer hosts" this attempt's Agent
+      // would describe something that never happened.
+      return {
+        outcome: "missing",
+        paneId: attempt.paneId,
+        detail: "the expected agent never started in this pane",
+        observed: null,
+      };
+    }
+    if (observed.paneId !== attempt.paneId) {
+      return {
+        outcome: "reoccupied",
+        paneId: attempt.paneId,
+        detail: `the expected agent name resolves to pane ${observed.paneId}, not ${attempt.paneId}`,
+        observed: null,
+      };
+    }
+    if (observed.agent !== attempt.agentKind) {
+      return {
+        outcome: "reoccupied",
+        paneId: observed.paneId,
+        detail: `pane hosts ${observed.agent ?? "an unrecognized occupant"}, expected ${attempt.agentKind}`,
+        observed: null,
+      };
+    }
+    if (observed.name !== null && observed.name !== attempt.expectedAgentName) {
+      return {
+        outcome: "reoccupied",
+        paneId: observed.paneId,
+        detail: `pane hosts agent "${observed.name}", expected "${attempt.expectedAgentName}"`,
+        observed: null,
+      };
+    }
+    return { outcome: "live", paneId: observed.paneId, detail: null, observed };
   }
 
   /**
@@ -1207,10 +1351,26 @@ function parseAgentStatus(text: string): SemanticState | null {
  *   - `failed`       — the effect was attempted and did not land.
  */
 export function controlDeliveryState(
-  attempt: InteractiveAttemptView,
+  record: ControlRecord,
 ): ControlDeliveryState {
-  const control = attempt.lastControl;
-  if (control === null) return "none";
-  if (control.delivery === null) return "unconfirmed";
-  return control.delivery.delivered ? "delivered" : "failed";
+  if (record.delivery === null) return "unconfirmed";
+  return record.delivery.delivered ? "delivered" : "failed";
+}
+
+/**
+ * Controls whose delivery never landed. They are kept, never replayed, and
+ * never erased by a later control: the effect may have reached the session,
+ * and only a human can decide what to do about that.
+ */
+export function unresolvedControls(
+  attempt: InteractiveAttemptView,
+): readonly ControlRecord[] {
+  return attempt.controls.filter((record) => record.delivery === null);
+}
+
+/** The most recent control, or null when none was ever requested. */
+export function latestControl(
+  attempt: InteractiveAttemptView,
+): ControlRecord | null {
+  return attempt.controls.at(-1) ?? null;
 }

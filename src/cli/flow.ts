@@ -13,7 +13,9 @@ import { attemptDisposition } from "../interactive/attempts.ts";
 import {
   InteractiveLaneController,
   controlDeliveryState,
+  latestControl,
   pendingRetries,
+  unresolvedControls,
 } from "../interactive/control-plane.ts";
 import { GitWriteLaneIsolation } from "../interactive/isolation.ts";
 import type {
@@ -334,15 +336,21 @@ function renderInteractiveAttempts(run: RunView, stdout: TextSink): void {
         `  runner=${record.evidenceId} pane=${record.paneId} exitCode=${value(record.exitCode)} log=${record.logFile}\n`,
       );
     }
-    const control = attempt.lastControl;
+    const latest = latestControl(attempt);
+    const unresolved = unresolvedControls(attempt);
     stdout.write(
       `  steer submitted=${attempt.steerSubmissions} observed=${attempt.steerObservations} cancelTurnRequestedAt=${value(attempt.lastCancelTurnAt)} abortRequestedAt=${value(attempt.lastAbortAt)}\n`,
     );
-    // Never `control=null delivered=null`: an intent with no delivery is an
-    // explicit `unconfirmed`, not an absence.
+    // Never `control=null delivered=null`: a request with no delivery is an
+    // explicit `unconfirmed`, not an absence, and it is never dropped.
     stdout.write(
-      `  lastControl=${value(control?.control ?? null)} delivery=${controlDeliveryState(attempt)} detail=${quotedValue(control?.delivery?.detail ?? null)} requestedAt=${value(control?.requestedAt ?? null)}\n`,
+      `  controls=${attempt.controls.length} unresolvedControls=${unresolved.length} lastControl=${value(latest?.control ?? null)} delivery=${latest === null ? "none" : controlDeliveryState(latest)} detail=${quotedValue(latest?.delivery?.detail ?? null)}\n`,
     );
+    for (const record of unresolved) {
+      stdout.write(
+        `  unresolved control=${record.control} controlId=${record.controlId} requestedAt=${record.requestedAt} delivery=unconfirmed\n`,
+      );
+    }
     stdout.write(
       `  reconciliation=${value(attempt.reconciliation?.outcome ?? null)} detail=${quotedValue(attempt.reconciliation?.detail ?? null)}\n`,
     );

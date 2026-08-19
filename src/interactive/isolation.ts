@@ -13,7 +13,17 @@ import { isAbsolute } from "node:path";
 import { realpath } from "node:fs/promises";
 
 export type WriteLaneIsolationOutcome =
-  | { readonly ok: true }
+  | {
+      readonly ok: true;
+      /**
+       * The paths every later step must use. Verification resolves symlinks to
+       * decide, so the caller has to record and execute against the SAME
+       * resolved paths — otherwise re-pointing a symlink afterwards would move
+       * the Agent into a directory nothing ever verified.
+       */
+      readonly canonicalRepoRoot: string;
+      readonly canonicalWorktreePath: string;
+    }
   | { readonly ok: false; readonly reason: string };
 
 export interface WriteLaneIsolationPort {
@@ -147,6 +157,20 @@ export class GitWriteLaneIsolation implements WriteLaneIsolationPort {
         `"${worktreePath}" does not start clean (for example: ${first.trim()})`,
       );
     }
-    return { ok: true };
+    // The toplevel git reported IS the canonical worktree root, already
+    // symlink-resolved by the comparison above.
+    let canonicalWorktreePath: string;
+    let canonicalRepoRoot: string;
+    try {
+      canonicalWorktreePath = await realpath(worktreePath);
+      canonicalRepoRoot = await realpath(repoRoot);
+    } catch (error) {
+      return refuse(
+        `"${worktreePath}" could not be resolved to a canonical path: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    return { ok: true, canonicalRepoRoot, canonicalWorktreePath };
   }
 }

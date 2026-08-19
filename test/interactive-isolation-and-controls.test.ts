@@ -2,7 +2,7 @@
 // against 97482a4 and is the reason its fix exists.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FakeHerdrAdapter, createClock } from "../src/herdr/fake-adapter.ts";
@@ -43,7 +43,11 @@ const START = { brief: "do it", authorization: { note: "authorized" } } as const
 
 /** Accepts every worktree; isolation itself is tested against real git below. */
 const permissive: WriteLaneIsolationPort = {
-  verifyWriteWorktree: async () => ({ ok: true }),
+  verifyWriteWorktree: async (input) => ({
+    ok: true,
+    canonicalRepoRoot: input.repoRoot,
+    canonicalWorktreePath: input.worktreePath,
+  }),
 };
 
 function harness(
@@ -95,7 +99,8 @@ describe("P2-A a starting attempt is never probed or reconciled", () => {
       data: {
         attemptId: "crashed-1", ordinal: 1, parentAttemptId: null,
         agentKind: "claude", model: "sonnet", effort: "high", paneId: "wf:p9",
-        worktreePath: "/tmp/repo-wt", briefFile: join(root, "b.md"),
+        expectedAgentName: "f-impl-1-crashed", worktreePath: "/tmp/repo-wt",
+        briefFile: join(root, "b.md"),
         checkpointFile: join(root, "c.md"), resultPointer: join(root, "r.md"),
         authorization: { actor: "human", note: "authorized" },
       },
@@ -195,11 +200,11 @@ describe("P2-B delivery state is derived, never ambiguous", () => {
     const { runId, laneId } = await h.controller.openLane({ ...LANE });
     await h.controller.startAttempt(runId, laneId, START);
     let [a] = await h.controller.attempts(runId, laneId);
-    expect(controlDeliveryState(a!)).toBe("none");
+    expect(a!.controls).toHaveLength(0);
 
     await h.controller.cancelTurn(runId, laneId);
     [a] = await h.controller.attempts(runId, laneId);
-    expect(controlDeliveryState(a!)).toBe("delivered");
+    expect(controlDeliveryState(a!.controls.at(-1)!)).toBe("delivered");
   });
 
   test("an intent whose delivery never landed reads as unconfirmed", async () => {
@@ -223,13 +228,13 @@ describe("P2-B delivery state is derived, never ambiguous", () => {
     // The effect happened; the delivery record did not.
     expect(h.control.sendKeysCalls).toHaveLength(1);
     const [a] = await h.controller.attempts(runId, laneId);
-    expect(a!.lastControl?.control).toBe("cancel-turn");
-    expect(a!.lastControl?.delivery).toBeNull();
-    expect(controlDeliveryState(a!)).toBe("unconfirmed");
+    expect(a!.controls.at(-1)?.control).toBe("cancel-turn");
+    expect(a!.controls.at(-1)?.delivery).toBeNull();
+    expect(controlDeliveryState(a!.controls.at(-1)!)).toBe("unconfirmed");
     // A fresh controller replays to the same answer and repeats nothing.
     const fresh = harness({ ledger: base });
     const [replayed] = await fresh.controller.attempts(runId, laneId);
-    expect(controlDeliveryState(replayed!)).toBe("unconfirmed");
+    expect(controlDeliveryState(replayed!.controls.at(-1)!)).toBe("unconfirmed");
     expect(fresh.control.sendKeysCalls).toHaveLength(0);
   });
 
@@ -246,7 +251,7 @@ describe("P2-B delivery state is derived, never ambiguous", () => {
     await h.controller.startAttempt(runId, laneId, START);
     await expect(h.controller.cancelTurn(runId, laneId)).rejects.toThrow();
     const [a] = await h.controller.attempts(runId, laneId);
-    expect(controlDeliveryState(a!)).toBe("failed");
+    expect(controlDeliveryState(a!.controls.at(-1)!)).toBe("failed");
   });
 
   test("the CLI never renders control=null delivered=null", async () => {
@@ -316,7 +321,8 @@ describe("P2-B reducer pairs every delivery with its intent", () => {
       laneId: "l1",
       data: {
         attemptId: "a1", ordinal: 1, parentAttemptId: null, agentKind: "claude",
-        model: "m", effort: "high", paneId: "p2", worktreePath: "/tmp/wt",
+        model: "m", effort: "high", paneId: "p2", expectedAgentName: "f-l1-a1",
+        worktreePath: "/tmp/wt",
         briefFile: "/tmp/b", checkpointFile: "/tmp/c", resultPointer: "/tmp/r",
         authorization: { actor: "human", note: "ok" },
       },
@@ -443,8 +449,13 @@ describe("P2-D write-lane worktree isolation", () => {
     expect(await verify(otherLinked)).toMatchObject({ ok: false });
     // 4. the repository's own main checkout
     expect(await verify(main)).toMatchObject({ ok: false });
-    // 5. a legitimate linked worktree
-    expect(await verify(linked)).toEqual({ ok: true });
+    // 5. a legitimate linked worktree, which reports its canonical paths
+    const accepted = await verify(linked);
+    expect(accepted.ok).toBe(true);
+    if (accepted.ok) {
+      expect(accepted.canonicalWorktreePath).toBe(await realpath(linked));
+      expect(accepted.canonicalRepoRoot).toBe(await realpath(main));
+    }
     // relative paths are refused before any git call
     expect(await verify("wt-a")).toMatchObject({ ok: false });
   });
@@ -479,9 +490,10 @@ describe("P2-D write-lane worktree isolation", () => {
 });
 
 describe("P2-C the ledger lease survives concurrent churn", () => {
-  test("a lock file that is present but unwritten is contention, not corruption", async () => {
-    // Deterministic stand-in for the race: a controller has created the lock
-    // and not yet flushed its record. Reading it must not be read as damage.
+  test("a lock file that is present but unwritten is reported as corrupt", async () => {
+    // Round-four rule: publication is atomic, so a lock can no longer be
+    // legitimately half-written. One that is unreadable names an owner nobody
+    // can check, so it is surfaced rather than waited on forever.
     const dir = await mkdtemp(join(tmpdir(), "flow-r3-empty-"));
     try {
       const ledger = new FsLedger(dir);
@@ -497,8 +509,8 @@ describe("P2-C the ledger lease survives concurrent churn", () => {
       } catch (error) {
         message = error instanceof Error ? error.message : String(error);
       }
-      expect(message).toContain("already held");
-      expect(message).not.toContain("corrupt");
+      expect(message).toContain("corrupt");
+      expect(message).not.toContain("already held");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

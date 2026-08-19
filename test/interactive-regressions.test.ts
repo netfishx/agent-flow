@@ -21,7 +21,16 @@ import { agentNameFor } from "../src/herdr/agent-argv.ts";
 import { RealHerdrAgentControl } from "../src/herdr/real-agent-control.ts";
 
 /** Accepts every worktree; isolation itself is proved against real git. */
-const permissiveIsolation = { verifyWriteWorktree: async () => ({ ok: true as const }) };
+const permissiveIsolation = {
+  verifyWriteWorktree: async (input: {
+    readonly repoRoot: string;
+    readonly worktreePath: string;
+  }) => ({
+    ok: true as const,
+    canonicalRepoRoot: input.repoRoot,
+    canonicalWorktreePath: input.worktreePath,
+  }),
+};
 
 
 let root: string;
@@ -161,10 +170,10 @@ describe("P1-2 a performed control never loses its intent", () => {
     expect(h.control.sendKeysCalls).toHaveLength(before + 1);
     const [after] = await h.controller.attempts(runId, laneId);
     expect(after!.lastCancelTurnAt).not.toBeNull();
-    expect(after!.lastControl?.control).toBe("cancel-turn");
-    expect(after!.lastControl?.delivery?.delivered).toBe(true);
+    expect(after!.controls.at(-1)?.control).toBe("cancel-turn");
+    expect(after!.controls.at(-1)?.delivery?.delivered).toBe(true);
     // Unobserved, and recorded as unobserved rather than as a confirmation.
-    expect(after!.lastControl?.delivery?.observedStatus).toBeNull();
+    expect(after!.controls.at(-1)?.delivery?.observedStatus).toBeNull();
   });
 
   test("abort keeps the intent and the terminal fact when observation throws", async () => {
@@ -196,7 +205,7 @@ describe("P1-2 a performed control never loses its intent", () => {
     const [after] = await h.controller.attempts(runId, laneId);
     // The intent survives; the delivery says it did NOT land.
     expect(after!.lastCancelTurnAt).not.toBeNull();
-    expect(after!.lastControl?.delivery?.delivered).toBe(false);
+    expect(after!.controls.at(-1)?.delivery?.delivered).toBe(false);
   });
 });
 

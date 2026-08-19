@@ -174,6 +174,8 @@ export class FakeHerdrAdapter implements HerdrAdapter {
   readonly waitTimeoutMs: number[] = [];
   readonly interruptedPaneIds: string[] = [];
   readonly dispatched: { paneId: string; command: string }[] = [];
+  /** Every cwd a pane was split into — proves which path Herdr really got. */
+  readonly splitCwds: string[] = [];
 
   constructor(options: FakeHerdrAdapterOptions = {}) {
     this.clock = options.clock ?? createClock();
@@ -241,6 +243,7 @@ export class FakeHerdrAdapter implements HerdrAdapter {
       throw new Error("fake: splitPane failed");
     }
     this.splitPaneCalls++;
+    this.splitCwds.push(_opts.cwd);
     const paneId = `wf:p${++this.paneSeq}`;
     this.panes.set(paneId, {
       paneId,

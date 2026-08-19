@@ -22,6 +22,7 @@ function attempt(
     model: "sonnet",
     effort: "high",
     paneId: "w1:p2",
+    expectedAgentName: "f-l1-a1",
     agentName: null,
     session: { kind: "unavailable", reason: "not bound yet" },
     worktreePath: "/tmp/wt",
@@ -44,7 +45,7 @@ function attempt(
     steerObservations: 0,
     lastCancelTurnAt: null,
     lastAbortAt: null,
-    lastControl: null,
+    controls: [],
     ...patch,
   };
 }
