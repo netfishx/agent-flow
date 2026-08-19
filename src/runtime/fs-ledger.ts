@@ -429,25 +429,33 @@ export class FsLedger implements Ledger {
     // written to a private temp file, flushed, and then `link`ed onto the lock
     // path, which fails rather than replacing an existing holder. The old
     // create-then-write sequence could leave a public empty lock on a crash.
-    let published = false;
+    let owned: ControllerLeaseRecord | undefined;
     for (let attempt = 0; ; attempt++) {
+      const mine = record(0);
       const temp = join(
         runDir,
         `.controller.lock.tmp-${process.pid}-${++leaseSequence}`,
       );
+      let published = false;
       try {
         const handle = await open(temp, "wx");
         try {
-          await handle.writeFile(`${JSON.stringify(record(0))}\n`, "utf8");
+          await handle.writeFile(`${JSON.stringify(mine)}\n`, "utf8");
           await handle.sync();
         } finally {
           await handle.close();
         }
         await link(temp, lockFile);
         published = true;
+        // The link is only durable once the directory entry is flushed, which
+        // is the same promise `replaceControllerLease` makes after its rename.
+        await this.syncDirectory(runDir);
+        owned = mine;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-          await unlink(temp).catch(() => {});
+          // A link that cannot be made durable is not a lease. Losing the race
+          // is the only failure that leaves the lock standing.
+          if (published) await unlink(lockFile).catch(() => {});
           throw error;
         }
       } finally {
@@ -455,7 +463,7 @@ export class FsLedger implements Ledger {
         // or thrown — and never outlives this call.
         await unlink(temp).catch(() => {});
       }
-      if (published) break;
+      if (owned) break;
 
       let holder: ControllerLeaseRecord;
       try {
@@ -484,7 +492,7 @@ export class FsLedger implements Ledger {
           `controller lease for run "${runId}" is already held`,
         );
       }
-      await this.takeOverControllerLease(
+      owned = await this.takeOverControllerLease(
         runDir,
         lockFile,
         runId,
@@ -493,6 +501,12 @@ export class FsLedger implements Ledger {
       );
       break;
     }
+    if (!owned) {
+      // Unreachable: every exit from the loop above either assigns the record
+      // this call published, or throws.
+      throw new Error(`controller lease for run "${runId}" was not acquired`);
+    }
+    const held = owned;
 
     let released = false;
     let releaseInFlight: Promise<void> | null = null;
@@ -500,7 +514,12 @@ export class FsLedger implements Ledger {
       release: () => {
         if (released) return Promise.resolve();
         if (releaseInFlight) return releaseInFlight;
-        releaseInFlight = unlink(lockFile)
+        releaseInFlight = this.releaseControllerLease(
+          runDir,
+          lockFile,
+          runId,
+          held,
+        )
           .then(() => {
             released = true;
           })
@@ -510,6 +529,41 @@ export class FsLedger implements Ledger {
         return releaseInFlight;
       },
     };
+  }
+
+  /**
+   * Delete the lock only while it still carries the record this handle
+   * published. A controller whose PID was judged dead keeps its handle, and
+   * that handle must never unlink the lock of the controller that took over —
+   * doing so would hand a third controller a lease the second still holds.
+   */
+  private async releaseControllerLease(
+    runDir: string,
+    lockFile: string,
+    runId: string,
+    held: ControllerLeaseRecord,
+  ): Promise<void> {
+    let current: ControllerLeaseRecord;
+    try {
+      current = await this.readControllerLease(lockFile, runId);
+    } catch (error) {
+      // Already gone: there is nothing left to release.
+      if (error instanceof LeaseVanishedError) return;
+      // Nobody can prove this lock is ours, so it stays where it is.
+      if (error instanceof LeaseUnreadableError) {
+        throw new Error(`corrupt controller lease for run "${runId}"`, {
+          cause: error,
+        });
+      }
+      throw error;
+    }
+    if (!isDeepStrictEqual(current, held)) return;
+    try {
+      await unlink(lockFile);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    await this.syncDirectory(runDir);
   }
 
   /**
@@ -603,13 +657,14 @@ export class FsLedger implements Ledger {
     }
   }
 
+  /** Returns the record actually published, whose epoch the loop may advance. */
   private async takeOverControllerLease(
     runDir: string,
     lockFile: string,
     runId: string,
     observed: ControllerLeaseRecord,
     replacement: ControllerLeaseRecord,
-  ): Promise<void> {
+  ): Promise<ControllerLeaseRecord> {
     let holder = observed;
     const marker: ControllerTakeoverMarker = {
       schemaVersion: 1,
@@ -649,11 +704,12 @@ export class FsLedger implements Ledger {
             `controller lease for run "${runId}" is already held`,
           );
         }
-        await this.replaceControllerLease(runDir, lockFile, {
+        const publishedRecord: ControllerLeaseRecord = {
           ...replacement,
           epoch: holder.epoch + 1,
-        });
-        return;
+        };
+        await this.replaceControllerLease(runDir, lockFile, publishedRecord);
+        return publishedRecord;
       }
 
       const currentHolder = await this.readControllerLease(lockFile, runId);
@@ -1182,7 +1238,7 @@ export class FsLedger implements Ledger {
     }
   }
 
-  private async syncDirectory(path: string): Promise<void> {
+  protected async syncDirectory(path: string): Promise<void> {
     const directory = await open(path, "r");
     try {
       await directory.sync();

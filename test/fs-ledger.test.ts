@@ -1705,3 +1705,220 @@ describe("FsLedger public capabilities", () => {
     await expect(new FsLedger(root).commit(started())).resolves.toBeUndefined();
   });
 });
+
+// A lease handle whose PID was judged dead keeps existing, and the controller
+// that took over does not. Every sequence below is fixed: no sleeps, no
+// probabilistic contention, no reliance on which process wins a race.
+describe("controller lease release is owner-checked", () => {
+  const CONTROLLER_A = { controllerId: "controller-a", pid: 111 } as const;
+  const CONTROLLER_B = { controllerId: "controller-b", pid: 222 } as const;
+  const CONTROLLER_C = { controllerId: "controller-c", pid: 333 } as const;
+
+  /** Everything alive except A, which is what makes B's takeover happen. */
+  const aIsDead = (pid: number): boolean => pid !== CONTROLLER_A.pid;
+
+  async function lockOf(root: string): Promise<ControllerLease | null> {
+    try {
+      return JSON.parse(
+        await readFile(join(root, "runs", "run-fs", "controller.lock"), "utf8"),
+      ) as ControllerLease;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
+  interface ControllerLease {
+    readonly controllerId: string;
+    readonly pid: number;
+    readonly epoch: number;
+    readonly acquiredAt: number;
+  }
+
+  test("a stale handle cannot delete the lock of the controller that took over", async () => {
+    const root = await tempRoot();
+    const a = await new FsLedger(root, () => true).acquireLease(
+      "run-fs",
+      CONTROLLER_A,
+    );
+    expect((await lockOf(root))!.epoch).toBe(0);
+
+    const b = await new FsLedger(root, aIsDead).acquireLease(
+      "run-fs",
+      CONTROLLER_B,
+    );
+    expect(await lockOf(root)).toMatchObject({
+      controllerId: CONTROLLER_B.controllerId,
+      epoch: 1,
+    });
+
+    await expect(a.release()).resolves.toBeUndefined();
+    expect(await lockOf(root)).toMatchObject({
+      controllerId: CONTROLLER_B.controllerId,
+      epoch: 1,
+    });
+
+    await expect(
+      new FsLedger(root, () => true).acquireLease("run-fs", CONTROLLER_C),
+    ).rejects.toBeInstanceOf(ControllerLeaseHeldError);
+
+    await expect(b.release()).resolves.toBeUndefined();
+    expect(await lockOf(root)).toBeNull();
+  });
+
+  test("a release that runs after its own operation failed still spares the new owner", async () => {
+    const root = await tempRoot();
+    const a = await new FsLedger(root, () => true).acquireLease(
+      "run-fs",
+      CONTROLLER_A,
+    );
+    await new FsLedger(root, aIsDead).acquireLease("run-fs", CONTROLLER_B);
+
+    const operation = (async () => {
+      try {
+        throw new Error("primary operation failed");
+      } finally {
+        await a.release();
+      }
+    })();
+    await expect(operation).rejects.toThrow("primary operation failed");
+    expect(await lockOf(root)).toMatchObject({
+      controllerId: CONTROLLER_B.controllerId,
+      epoch: 1,
+    });
+  });
+
+  test("the owner's own release deletes the lock and repeats idempotently", async () => {
+    const root = await tempRoot();
+    const handle = await new FsLedger(root, () => true).acquireLease(
+      "run-fs",
+      CONTROLLER_A,
+    );
+
+    await expect(handle.release()).resolves.toBeUndefined();
+    expect(await lockOf(root)).toBeNull();
+    await expect(handle.release()).resolves.toBeUndefined();
+    expect(await lockOf(root)).toBeNull();
+  });
+
+  test("a release finds nothing to do when the lock is already gone", async () => {
+    const root = await tempRoot();
+    const handle = await new FsLedger(root, () => true).acquireLease(
+      "run-fs",
+      CONTROLLER_A,
+    );
+    await unlink(join(root, "runs", "run-fs", "controller.lock"));
+
+    await expect(handle.release()).resolves.toBeUndefined();
+    expect(await lockOf(root)).toBeNull();
+  });
+
+  test("a malformed lock is reported and left in place", async () => {
+    const root = await tempRoot();
+    const lockFile = join(root, "runs", "run-fs", "controller.lock");
+    const handle = await new FsLedger(root, () => true).acquireLease(
+      "run-fs",
+      CONTROLLER_A,
+    );
+    await writeFile(lockFile, "{corrupt", "utf8");
+
+    await expect(handle.release()).rejects.toThrow(/corrupt controller lease/);
+    expect(await readFile(lockFile, "utf8")).toBe("{corrupt");
+  });
+
+  test("a matching controllerId at a later epoch is not ours to delete", async () => {
+    const root = await tempRoot();
+    const lockFile = join(root, "runs", "run-fs", "controller.lock");
+    const handle = await new FsLedger(root, () => true).acquireLease(
+      "run-fs",
+      CONTROLLER_A,
+    );
+    const mine = (await lockOf(root))!;
+    await writeFile(
+      lockFile,
+      `${JSON.stringify({ ...mine, epoch: mine.epoch + 1 })}\n`,
+      "utf8",
+    );
+
+    await expect(handle.release()).resolves.toBeUndefined();
+    expect(await lockOf(root)).toMatchObject({
+      controllerId: CONTROLLER_A.controllerId,
+      epoch: 1,
+    });
+  });
+
+  test("a matching epoch under another controllerId is not ours to delete", async () => {
+    const root = await tempRoot();
+    const lockFile = join(root, "runs", "run-fs", "controller.lock");
+    const handle = await new FsLedger(root, () => true).acquireLease(
+      "run-fs",
+      CONTROLLER_A,
+    );
+    const mine = (await lockOf(root))!;
+    await writeFile(
+      lockFile,
+      `${JSON.stringify({ ...mine, controllerId: CONTROLLER_B.controllerId })}\n`,
+      "utf8",
+    );
+
+    await expect(handle.release()).resolves.toBeUndefined();
+    expect(await lockOf(root)).toMatchObject({
+      controllerId: CONTROLLER_B.controllerId,
+      epoch: 0,
+    });
+  });
+});
+
+class DirectorySyncSpyLedger extends FsLedger {
+  readonly synced: string[] = [];
+
+  protected override async syncDirectory(path: string): Promise<void> {
+    this.synced.push(path);
+    await super.syncDirectory(path);
+  }
+}
+
+describe("controller lease publication is durable", () => {
+  async function leaseTempFiles(root: string): Promise<string[]> {
+    return (await readdir(join(root, "runs", "run-fs"))).filter((name) =>
+      name.startsWith(".controller.lock.tmp-"),
+    );
+  }
+
+  test("the run directory is flushed once the link publishes the lock", async () => {
+    const root = await tempRoot();
+    const ledger = new DirectorySyncSpyLedger(root, () => true);
+
+    const handle = await ledger.acquireLease("run-fs", {
+      controllerId: "controller-1",
+      pid: 101,
+    });
+
+    expect(ledger.synced).toEqual([join(root, "runs", "run-fs")]);
+    expect(await leaseTempFiles(root)).toEqual([]);
+    await handle.release();
+    // Deleting the lock is a directory change too, and gets the same flush.
+    expect(ledger.synced).toHaveLength(2);
+  });
+
+  test("losing the link publishes nothing, flushes nothing, and leaves no temp", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root, () => true).acquireLease("run-fs", {
+      controllerId: "controller-1",
+      pid: 101,
+    });
+    const loser = new DirectorySyncSpyLedger(root, () => true);
+
+    await expect(
+      loser.acquireLease("run-fs", { controllerId: "controller-2", pid: 202 }),
+    ).rejects.toBeInstanceOf(ControllerLeaseHeldError);
+
+    expect(loser.synced).toEqual([]);
+    expect(await leaseTempFiles(root)).toEqual([]);
+    expect(
+      JSON.parse(
+        await readFile(join(root, "runs", "run-fs", "controller.lock"), "utf8"),
+      ),
+    ).toMatchObject({ controllerId: "controller-1", epoch: 0 });
+  });
+});
