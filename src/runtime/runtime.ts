@@ -414,7 +414,18 @@ export class WorkflowRuntime {
         startedAt,
       );
     } catch (error) {
-      await this.releaseControllerLease(runId);
+      // A failed release must not erase why the start failed. The pre-dispatch
+      // path below already combines both errors; this uses the shape the rest
+      // of the codebase settled on — the start error stays primary and keeps
+      // its identity in `cause`, the release failure rides in the message.
+      try {
+        await this.releaseControllerLease(runId);
+      } catch (releaseError) {
+        throw new Error(
+          `run start failed: ${rejectionMessage(error)}; controller lease release failed: ${rejectionMessage(releaseError)}`,
+          { cause: error },
+        );
+      }
       throw error;
     }
     try {
@@ -858,6 +869,7 @@ export class WorkflowRuntime {
 
       const leaseAlreadyHeld = this.leases.has(runId);
       if (!leaseAlreadyHeld) await this.acquireControllerLease(runId);
+      let deliveryError: unknown;
       try {
         const authoritative = await this.deps.ledger.load(runId);
         if (!authoritative) throw new Error(`run not found: "${runId}"`);
@@ -879,8 +891,23 @@ export class WorkflowRuntime {
         });
         await this.reconcileBoundIssue(runId);
         return this.workflowStatus(this.getRun(runId));
+      } catch (error) {
+        deliveryError = error;
+        throw error;
       } finally {
-        if (!leaseAlreadyHeld) await this.releaseControllerLease(runId);
+        if (!leaseAlreadyHeld) {
+          try {
+            await this.releaseControllerLease(runId);
+          } catch (releaseError) {
+            if (deliveryError !== undefined) {
+              throw new Error(
+                `delivery resume failed: ${rejectionMessage(deliveryError)}; controller lease release failed: ${rejectionMessage(releaseError)}`,
+                { cause: deliveryError },
+              );
+            }
+            throw releaseError;
+          }
+        }
       }
     }
 
