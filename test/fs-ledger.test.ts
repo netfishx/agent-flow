@@ -1878,6 +1878,17 @@ class DirectorySyncSpyLedger extends FsLedger {
   }
 }
 
+/**
+ * A ledger whose directory flush always fails. On the takeover path the only
+ * flush is the one `replaceControllerLease` performs after its rename, so this
+ * injects "the record is public but not durable" deterministically.
+ */
+class FailingDirectorySyncLedger extends FsLedger {
+  protected override async syncDirectory(): Promise<void> {
+    throw new Error("injected directory sync failure");
+  }
+}
+
 describe("controller lease publication is durable", () => {
   async function leaseTempFiles(root: string): Promise<string[]> {
     return (await readdir(join(root, "runs", "run-fs"))).filter((name) =>
@@ -1920,5 +1931,38 @@ describe("controller lease publication is durable", () => {
         await readFile(join(root, "runs", "run-fs", "controller.lock"), "utf8"),
       ),
     ).toMatchObject({ controllerId: "controller-1", epoch: 0 });
+  });
+
+  test("a takeover that cannot flush its rename strands no lock", async () => {
+    const root = await tempRoot();
+    await new FsLedger(root, () => false).acquireLease("run-fs", {
+      controllerId: "dead-controller",
+      pid: 100,
+    });
+    const runDir = join(root, "runs", "run-fs");
+    const lockFile = join(runDir, "controller.lock");
+
+    // The rename publishes the takeover record; the flush that would make it
+    // durable fails, so the takeover is not a lease and must not leave a lock.
+    await expect(
+      new FailingDirectorySyncLedger(root, (pid) => pid === 200).acquireLease(
+        "run-fs",
+        { controllerId: "controller-2", pid: 200 },
+      ),
+    ).rejects.toThrow("injected directory sync failure");
+
+    expect(await readdir(runDir)).not.toContain("controller.lock");
+    expect(await leaseTempFiles(root)).toEqual([]);
+
+    // With no orphan standing, the next controller acquires normally.
+    const next = await new FsLedger(root, () => true).acquireLease("run-fs", {
+      controllerId: "controller-3",
+      pid: 303,
+    });
+    expect(JSON.parse(await readFile(lockFile, "utf8"))).toMatchObject({
+      controllerId: "controller-3",
+      epoch: 0,
+    });
+    await expect(next.release()).resolves.toBeUndefined();
   });
 });

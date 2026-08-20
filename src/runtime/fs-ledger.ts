@@ -536,6 +536,14 @@ export class FsLedger implements Ledger {
    * published. A controller whose PID was judged dead keeps its handle, and
    * that handle must never unlink the lock of the controller that took over —
    * doing so would hand a third controller a lease the second still holds.
+   *
+   * The read and the unlink are not one atomic step, so this only holds under
+   * the production liveness premises: `realPidIsAlive` calls a PID dead ONLY
+   * on ESRCH, and every caller acquires with its own live `process.pid`. A
+   * live holder is therefore never judged dead, which bounds the residual
+   * stale-release window to a holder that has already exited. Crossing hosts,
+   * crossing PID namespaces, or changing liveness semantics voids that premise
+   * and requires re-deciding the lock protocol itself — not patching here.
    */
   private async releaseControllerLease(
     runDir: string,
@@ -637,6 +645,7 @@ export class FsLedger implements Ledger {
       `.controller.lock.tmp-${process.pid}-${++leaseSequence}`,
     );
     let handle: FileHandle | undefined;
+    let published = false;
     try {
       handle = await open(temp, "wx");
       await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
@@ -644,15 +653,16 @@ export class FsLedger implements Ledger {
       await handle.close();
       handle = undefined;
       await rename(temp, lockFile);
-      const directory = await open(runDir, "r");
-      try {
-        await directory.sync();
-      } finally {
-        await directory.close();
-      }
+      published = true;
+      await this.syncDirectory(runDir);
     } catch (error) {
       await handle?.close().catch(() => {});
       await unlink(temp).catch(() => {});
+      // A lock that cannot be made durable is not a lease. The rename already
+      // made this record public, and the caller is about to throw, so leaving
+      // it there would strand a lock no controller holds and no takeover can
+      // reclaim while its PID is alive. Cleanup never masks the real error.
+      if (published) await unlink(lockFile).catch(() => {});
       throw error;
     }
   }
