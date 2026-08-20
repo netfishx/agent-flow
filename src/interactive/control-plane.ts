@@ -1201,6 +1201,7 @@ export class InteractiveLaneController {
         controllerId: `interactive-${process.pid}`,
         pid: process.pid,
       });
+      let bodyError: unknown;
       try {
         const loaded = await this.deps.ledger.load(runId);
         if (loaded === null && options.creates !== true) {
@@ -1210,8 +1211,25 @@ export class InteractiveLaneController {
         else this.runs.delete(runId);
         const commit = (input: NewRunEvent) => this.append(runId, input);
         return await body(commit, loaded as RunView);
+      } catch (error) {
+        bodyError = error;
+        throw error;
       } finally {
-        await lease.release();
+        // A failed release must not erase why the mutation failed. Same shape
+        // as `FsLedger.withCommitLock`: the body error stays primary and keeps
+        // its identity in `cause`, the release failure rides in the message,
+        // and neither is swallowed.
+        try {
+          await lease.release();
+        } catch (releaseError) {
+          if (bodyError !== undefined) {
+            throw new Error(
+              `interactive mutation failed: ${bodyError instanceof Error ? bodyError.message : String(bodyError)}; controller lease release failed: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`,
+              { cause: bodyError },
+            );
+          }
+          throw releaseError;
+        }
       }
     });
   }

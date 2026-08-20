@@ -18,6 +18,8 @@ import {
   unresolvedControls,
 } from "../src/interactive/control-plane.ts";
 import type { WriteLaneIsolationPort } from "../src/interactive/isolation.ts";
+import type { AgentPromptResult } from "../src/herdr/agent-control.ts";
+import type { AgentPromptOptions } from "../src/herdr/agent-argv.ts";
 
 let root: string;
 beforeEach(async () => {
@@ -751,5 +753,91 @@ describe("P2-2 the canonical worktree path is the only one used", () => {
     expect(await h.ledger.list()).toHaveLength(0);
     expect(h.adapter.splitCwds).toHaveLength(0);
     expect(h.control.startCalls).toHaveLength(0);
+  });
+});
+
+describe("a failed lease release never erases the mutation error", () => {
+  /**
+   * Sabotages the run's controller lock from inside the mutation body, so the
+   * release at the end of the same critical section cannot prove ownership and
+   * throws. `verdict` decides whether the body itself fails too.
+   */
+  class SabotagingSteer extends FakeHerdrAgentControl {
+    constructor(
+      options: { readonly panes: FakeHerdrAdapter },
+      private readonly sabotage: () => Promise<"throw" | "pass">,
+    ) {
+      super(options);
+    }
+
+    override async promptAgent(
+      target: string,
+      text: string,
+      options: AgentPromptOptions = {},
+    ): Promise<AgentPromptResult> {
+      if ((await this.sabotage()) === "throw") {
+        throw new Error("injected steer failure");
+      }
+      return super.promptAgent(target, text, options);
+    }
+  }
+
+  /** Returns the rejection of a steer, or null when it resolved. */
+  async function steerUnder(
+    verdict: "throw" | "pass",
+    corruptLock: boolean,
+  ): Promise<unknown> {
+    const ledgerRoot = join(root, "ledger");
+    let runDir = "";
+    let armed = false;
+    const h = harness({
+      ledger: new FsLedger(ledgerRoot),
+      control: (adapter) =>
+        new SabotagingSteer({ panes: adapter }, async () => {
+          // The attempt's own brief steers too; only the explicit steer below
+          // is sabotaged.
+          if (!armed) return "pass";
+          if (corruptLock) {
+            await writeFile(join(runDir, "controller.lock"), "{not json", "utf8");
+          }
+          return verdict;
+        }),
+    });
+    const { runId, laneId } = await h.controller.openLane({ ...LANE });
+    runDir = join(ledgerRoot, "runs", runId);
+    await h.controller.startAttempt(runId, laneId, START);
+    armed = true;
+    return h.controller.steer(runId, laneId, "keep going").then(
+      () => null,
+      (error: unknown) => error,
+    );
+  }
+
+  test("a body failure stays primary and the release failure stays visible", async () => {
+    const error = await steerUnder("throw", true);
+    expect(error).toBeInstanceOf(Error);
+    const failure = error as Error;
+    // Both facts survive: why the mutation failed, and that the lock is stuck.
+    expect(failure.message).toContain("injected steer failure");
+    expect(failure.message).toContain("controller lease release failed");
+    expect(failure.message).toContain("corrupt controller lease");
+    // The caller can still recognize the original error by identity.
+    expect(failure.cause).toBeInstanceOf(Error);
+    expect((failure.cause as Error).message).toBe("injected steer failure");
+  });
+
+  test("a release failure alone is raised as itself", async () => {
+    const error = await steerUnder("pass", true);
+    expect(error).toBeInstanceOf(Error);
+    const failure = error as Error;
+    expect(failure.message).toContain("corrupt controller lease");
+    expect(failure.message).not.toContain("injected steer failure");
+  });
+
+  test("a body failure with a clean release is rethrown untouched", async () => {
+    const error = await steerUnder("throw", false);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe("injected steer failure");
+    expect((error as Error).cause).toBeUndefined();
   });
 });
