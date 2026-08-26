@@ -18,22 +18,37 @@ export interface NativeArgsInput {
 }
 
 /**
- * REHEARSAL-PENDING. Every entry below is derived from the flags the headless
- * lane already proved on this machine (`src/review/commands.ts`) minus the
- * one-shot switch, plus the documented sandbox/permission value that lets the
- * session write. None of it has been run: #49's rehearsal is what turns these
- * from a reasoned default into a measured fact, and until then a caller may
- * override them wholesale via `nativeArgs` on the attempt input.
+ * The native argv each family is launched with. Model and effort come from the
+ * lane; the approval boundary is PINNED here, per invocation.
  *
- * Two differences from the headless batteries are deliberate and load-bearing:
+ * Stage 1 measured why it has to be pinned: a launch inherits whatever the host
+ * machine configured, and on the rehearsal machine that silently removed the
+ * human approval boundary in three different ways — grok read
+ * `permission_mode = "always-approve"` from its user config, codex read
+ * `approvals_reviewer = "guardian_subagent"` and routed approval requests to an
+ * automatic reviewer, and claude was launched by this function with
+ * `acceptEdits`, which auto-approves file edits and common file commands.
  *
- *   - `claude` does NOT get `--setting-sources ""` here. That flag loads no
- *     user settings, which is exactly why a headless claude lane never
- *     registers the Herdr integration hook and never publishes a session id.
- *     An interactive lane wants the hook, so the flag is absent.
- *   - No family gets an approval-suppressing flag (`dontAsk`, `read-only`,
- *     `--always-approve`). Suppressing the question would delete the human
- *     approval gate this lane exists to provide.
+ * What the pins guarantee, stated exactly:
+ *
+ *   - `claude --permission-mode default` and `grok --permission-mode default`
+ *     keep each family's own documented human-approval mode. A CLI flag beats
+ *     user config for that process, so the lane no longer inherits either.
+ *   - `codex -a on-request` leaves the MODEL deciding when to raise a request,
+ *     and `-c approvals_reviewer=none` makes every raised request go to the
+ *     human instead of the guardian subagent. This is NOT a claim that codex
+ *     asks before each worktree write: `-s workspace-write` is the sandbox
+ *     axis, and writes inside that sandbox need no request.
+ *
+ * Nothing here reads a vendor config file, and no family gets an
+ * approval-suppressing flag (`dontAsk`, `--always-approve`, `--approve-for-me`,
+ * `bypassPermissions`). `claude` also does NOT get `--setting-sources ""`: that
+ * flag loads no user settings, which is exactly why a headless claude lane
+ * never registers the Herdr integration hook and never publishes a session id,
+ * and an interactive lane wants the hook.
+ *
+ * A caller may still override the whole array via `nativeArgs` on the attempt
+ * input. That is an explicit operator act, and it replaces these safe defaults.
  */
 export function buildNativeArgs(input: NativeArgsInput): string[] {
   switch (input.agentKind) {
@@ -47,7 +62,7 @@ export function buildNativeArgs(input: NativeArgsInput): string[] {
         "--effort",
         input.effort,
         "--permission-mode",
-        "acceptEdits",
+        "default",
         "--session-id",
         input.sessionId,
       ];
@@ -61,6 +76,10 @@ export function buildNativeArgs(input: NativeArgsInput): string[] {
         `model_reasoning_effort=${input.effort}`,
         "-s",
         "workspace-write",
+        "-a",
+        "on-request",
+        "-c",
+        "approvals_reviewer=none",
       ];
     case "grok": {
       if (input.sessionId === null) {
@@ -74,6 +93,8 @@ export function buildNativeArgs(input: NativeArgsInput): string[] {
         input.model,
         "--reasoning-effort",
         input.effort,
+        "--permission-mode",
+        "default",
       ];
     }
   }

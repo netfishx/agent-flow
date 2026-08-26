@@ -20,6 +20,9 @@ import {
   parseAgentStarted,
 } from "../src/herdr/agent-json.ts";
 import { HerdrParseError } from "../src/herdr/json.ts";
+import { buildNativeArgs } from "../src/interactive/commands.ts";
+import { readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 describe("agent names", () => {
   test("accepts the documented shape and rejects everything else", () => {
@@ -269,5 +272,181 @@ describe("agent JSON", () => {
         JSON.stringify({ result: { type: "agent_started", agent: info } }),
       ),
     ).toThrow(HerdrParseError);
+  });
+});
+
+describe("the production native argv pins the approval boundary", () => {
+  // Stage 1 measured host configuration silently removing the human approval
+  // boundary: grok inherited `always-approve` from ~/.grok/config.toml, codex
+  // inherited `approvals_reviewer = "guardian_subagent"` from
+  // ~/.codex/config.toml, and claude was launched by this very function with
+  // `acceptEdits`. v1 therefore pins the policy per invocation.
+  const SESSION = "11111111-2222-3333-4444-555555555555";
+
+  test("claude asks its own way: default, never acceptEdits", () => {
+    const argv = buildNativeArgs({
+      agentKind: "claude",
+      model: "sonnet",
+      effort: "high",
+      sessionId: SESSION,
+    });
+
+    expect(argv).toEqual([
+      "--model",
+      "sonnet",
+      "--effort",
+      "high",
+      "--permission-mode",
+      "default",
+      "--session-id",
+      SESSION,
+    ]);
+    expect(argv).not.toContain("acceptEdits");
+    expect(argv).not.toContain("bypassPermissions");
+    expect(argv).not.toContain("dontAsk");
+  });
+
+  test("codex keeps its sandbox and sends every raised request to a human", () => {
+    const argv = buildNativeArgs({
+      agentKind: "codex",
+      model: "gpt-5.6-sol",
+      effort: "high",
+      sessionId: null,
+    });
+
+    expect(argv).toEqual([
+      "-c",
+      "model=gpt-5.6-sol",
+      "-c",
+      "model_reasoning_effort=high",
+      "-s",
+      "workspace-write",
+      "-a",
+      "on-request",
+      "-c",
+      "approvals_reviewer=none",
+    ]);
+    // The sandbox axis and the approval axis are separate, and both are pinned.
+    expect(argv[argv.indexOf("-s") + 1]).toBe("workspace-write");
+    expect(argv[argv.indexOf("-a") + 1]).toBe("on-request");
+    expect(argv).toContain("approvals_reviewer=none");
+    expect(argv).not.toContain("never");
+    expect(argv).not.toContain("--approve-for-me");
+  });
+
+  test("grok overrides its host config's always-approve", () => {
+    const argv = buildNativeArgs({
+      agentKind: "grok",
+      model: "grok-4.6",
+      effort: "high",
+      sessionId: SESSION,
+    });
+
+    expect(argv).toEqual([
+      "--no-leader",
+      "--session-id",
+      SESSION,
+      "-m",
+      "grok-4.6",
+      "--reasoning-effort",
+      "high",
+      "--permission-mode",
+      "default",
+    ]);
+    expect(argv).not.toContain("--always-approve");
+    expect(argv).not.toContain("--yolo");
+    expect(argv).not.toContain("bypassPermissions");
+  });
+
+  test("every pinned flag carries its value as the next argument", () => {
+    // A flag whose value drifted onto the wrong index is argv the CLI rejects.
+    const pairs = [
+      ["claude", SESSION, ["--model", "--effort", "--permission-mode", "--session-id"]],
+      ["codex", null, ["-s", "-a"]],
+      ["grok", SESSION, ["--session-id", "-m", "--reasoning-effort", "--permission-mode"]],
+    ] as const;
+    for (const [kind, sessionId, flags] of pairs) {
+      const argv = buildNativeArgs({
+        agentKind: kind,
+        model: "m",
+        effort: "e",
+        sessionId,
+      });
+      for (const flag of flags) {
+        const at = argv.indexOf(flag);
+        expect(at).toBeGreaterThanOrEqual(0);
+        const value = argv[at + 1];
+        expect(value).toBeDefined();
+        expect(value!.startsWith("-")).toBe(false);
+      }
+    }
+  });
+
+  test("model, effort and session inputs still reach the argv", () => {
+    expect(
+      buildNativeArgs({
+        agentKind: "claude",
+        model: "opus",
+        effort: "xhigh",
+        sessionId: SESSION,
+      }),
+    ).toEqual([
+      "--model",
+      "opus",
+      "--effort",
+      "xhigh",
+      "--permission-mode",
+      "default",
+      "--session-id",
+      SESSION,
+    ]);
+    expect(
+      buildNativeArgs({
+        agentKind: "codex",
+        model: "gpt-x",
+        effort: "low",
+        sessionId: null,
+      }).slice(0, 4),
+    ).toEqual(["-c", "model=gpt-x", "-c", "model_reasoning_effort=low"]);
+    expect(
+      buildNativeArgs({
+        agentKind: "grok",
+        model: "grok-9",
+        effort: "low",
+        sessionId: SESSION,
+      }).slice(0, 7),
+    ).toEqual([
+      "--no-leader",
+      "--session-id",
+      SESSION,
+      "-m",
+      "grok-9",
+      "--reasoning-effort",
+      "low",
+    ]);
+  });
+
+  test("production code reads no vendor CLI configuration", async () => {
+    // The pin is per invocation. A runtime that read ~/.claude, ~/.codex or
+    // ~/.grok would be inheriting the very host state Stage 1 caught.
+    const offenders: string[] = [];
+    const walk = async (dir: string): Promise<void> => {
+      for (const entry of await readdir(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(path);
+          continue;
+        }
+        if (!entry.name.endsWith(".ts")) continue;
+        const text = await readFile(path, "utf8");
+        for (const needle of [".claude", ".codex", ".grok"]) {
+          if (text.includes(`~/${needle}`) || text.includes(`/${needle}/`)) {
+            offenders.push(`${path}: ${needle}`);
+          }
+        }
+      }
+    };
+    await walk("src");
+    expect(offenders).toEqual([]);
   });
 });
