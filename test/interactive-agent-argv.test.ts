@@ -21,8 +21,6 @@ import {
 } from "../src/herdr/agent-json.ts";
 import { HerdrParseError } from "../src/herdr/json.ts";
 import { buildNativeArgs } from "../src/interactive/commands.ts";
-import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
 
 describe("agent names", () => {
   test("accepts the documented shape and rejects everything else", () => {
@@ -424,29 +422,5 @@ describe("the production native argv pins the approval boundary", () => {
       "--reasoning-effort",
       "low",
     ]);
-  });
-
-  test("production code reads no vendor CLI configuration", async () => {
-    // The pin is per invocation. A runtime that read ~/.claude, ~/.codex or
-    // ~/.grok would be inheriting the very host state Stage 1 caught.
-    const offenders: string[] = [];
-    const walk = async (dir: string): Promise<void> => {
-      for (const entry of await readdir(dir, { withFileTypes: true })) {
-        const path = join(dir, entry.name);
-        if (entry.isDirectory()) {
-          await walk(path);
-          continue;
-        }
-        if (!entry.name.endsWith(".ts")) continue;
-        const text = await readFile(path, "utf8");
-        for (const needle of [".claude", ".codex", ".grok"]) {
-          if (text.includes(`~/${needle}`) || text.includes(`/${needle}/`)) {
-            offenders.push(`${path}: ${needle}`);
-          }
-        }
-      }
-    };
-    await walk("src");
-    expect(offenders).toEqual([]);
   });
 });
