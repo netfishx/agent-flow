@@ -35,10 +35,12 @@ export interface NativeArgsInput {
  *     keep each family's own documented human-approval mode. A CLI flag beats
  *     user config for that process, so the lane no longer inherits either.
  *   - `codex -a on-request` leaves the MODEL deciding when to raise a request,
- *     and `-c approvals_reviewer=none` makes every raised request go to the
- *     human instead of the guardian subagent. This is NOT a claim that codex
- *     asks before each worktree write: `-s workspace-write` is the sandbox
- *     axis, and writes inside that sandbox need no request.
+ *     and `-c approvals_reviewer=user` sends every raised request to the person
+ *     rather than the guardian subagent. `user` is the value that means a human
+ *     reviewer; codex 0.149.1 accepts only `user`, `auto_review` and
+ *     `guardian_subagent`, and refuses to start on anything else. This is NOT a
+ *     claim that codex asks before each worktree write: `-s workspace-write` is
+ *     the sandbox axis, and writes inside that sandbox need no request.
  *
  * Nothing here reads a vendor config file, and no family gets an
  * approval-suppressing flag (`dontAsk`, `--always-approve`, `--approve-for-me`,
@@ -79,7 +81,7 @@ export function buildNativeArgs(input: NativeArgsInput): string[] {
         "-a",
         "on-request",
         "-c",
-        "approvals_reviewer=none",
+        "approvals_reviewer=user",
       ];
     case "grok": {
       if (input.sessionId === null) {

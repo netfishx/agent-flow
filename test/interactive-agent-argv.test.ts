@@ -322,12 +322,18 @@ describe("the production native argv pins the approval boundary", () => {
       "-a",
       "on-request",
       "-c",
-      "approvals_reviewer=none",
+      "approvals_reviewer=user",
     ]);
     // The sandbox axis and the approval axis are separate, and both are pinned.
     expect(argv[argv.indexOf("-s") + 1]).toBe("workspace-write");
     expect(argv[argv.indexOf("-a") + 1]).toBe("on-request");
-    expect(argv).toContain("approvals_reviewer=none");
+    // `user` is the reviewer that is a person. Stage 2 measured codex 0.149.1
+    // refusing to start at all on `none`: "unknown variant `none`, expected one
+    // of `user`, `auto_review`, `guardian_subagent`".
+    expect(argv).toContain("approvals_reviewer=user");
+    expect(argv).not.toContain("approvals_reviewer=none");
+    expect(argv).not.toContain("approvals_reviewer=auto_review");
+    expect(argv).not.toContain("approvals_reviewer=guardian_subagent");
     expect(argv).not.toContain("never");
     expect(argv).not.toContain("--approve-for-me");
   });
