@@ -17,8 +17,7 @@
 //     after. A failed observation never erases either.
 //   - advisory Herdr state is recorded, never consumed as an outcome.
 
-import { dirname, join } from "node:path";
-import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { HerdrAdapter } from "../herdr/adapter.ts";
 import type { HerdrAgentControl } from "../herdr/agent-control.ts";
 import {
@@ -117,7 +116,6 @@ export interface InteractiveDeps {
   /** Pre-assigned session UUIDs for claude/grok attempts. */
   readonly sessionIdgen?: () => string;
   readonly readDurable?: (path: string) => Promise<string>;
-  readonly writeDurable?: (path: string, text: string) => Promise<void>;
   /** How long `agent start` may take to report readiness. */
   readonly startTimeoutMs?: number;
   /** Window for the post-submission observation of a steer. */
@@ -142,8 +140,6 @@ export interface OpenLaneConfig {
 }
 
 export interface StartAttemptInput {
-  /** The brief, delivered as the FIRST agent prompt, not as a CLI argument. */
-  readonly brief: string;
   /** The human act that authorized this attempt. */
   readonly authorization: { readonly note: string };
   /** Override the rehearsal-pending native argv for this attempt. */
@@ -275,9 +271,17 @@ export class InteractiveLaneController {
   }
 
   /**
-   * Start one attempt: the RUNTIME provisions the pane, then Herdr starts or
-   * recognizes the interactive agent in it. `herdr agent start` never creates,
-   * splits, or moves layout, so pane topology stays this side of the seam.
+   * LAUNCH one attempt, and only launch it: the RUNTIME provisions the pane,
+   * then Herdr starts or recognizes the interactive agent in it. `herdr agent
+   * start` never creates, splits, or moves layout, so pane topology stays this
+   * side of the seam.
+   *
+   * Success means a session exists and is bound. It does NOT mean the session
+   * can be told anything: Herdr's readiness is advisory, and 0.8.2 reports a
+   * vendor update modal as `idle` with `interactive_ready: true`. A human looks
+   * at the visible pane, clears any trust/update/login dialog, and then submits
+   * the first instruction through `steer` — the same path every later
+   * instruction takes, with the same intent/delivery/observation evidence.
    *
    * The authorization check, the pane, and the attempt record are committed
    * inside ONE lease-held critical section, so two concurrent retries on one
@@ -311,7 +315,6 @@ export class InteractiveLaneController {
         cwd: lane.worktreePath ?? run.cwd,
       });
       const paths = attemptArtifactPaths(lane.artifactRoot!, attemptId);
-      await this.write(paths.briefFile, input.brief);
       await commit({
         type: "interactive_attempt_started",
         actor: "runtime",
@@ -385,12 +388,12 @@ export class InteractiveLaneController {
         },
       });
 
-      // The brief is the first prompt, submitted under the SAME lease: an
-      // interactive session has no one-shot prompt-file equivalent that also
-      // leaves it steerable, and releasing here would expose an attempt that
-      // is bound but has never been told what to do.
-      const bound = this.attempt(this.runs.get(runId)!, attemptId);
-      await this.submitSteer(commit, laneId, bound, input.brief);
+      // Launched and bound — and that is ALL this returns. Herdr's readiness
+      // is advisory: 0.8.2 reports a Codex update modal as `idle` with
+      // `interactive_ready: true`, so a session that exists may still be
+      // showing a trust, update, or login dialog. Submitting here would fire
+      // the first instruction at whatever owns the screen. A human looks at
+      // the pane and then submits the brief through `steer`.
       return { attemptId, started: true, startFailure: null };
     });
   }
@@ -421,9 +424,10 @@ export class InteractiveLaneController {
   }
 
   /**
-   * The one steer path, shared by `steer` and the brief the attempt starts
-   * with. Submission is recorded BEFORE the call, so a controller that dies
-   * mid-call still leaves the intent in the ledger; the transition afterwards
+   * The one steer path. Every instruction an Agent receives arrives here,
+   * including the first one after a launch. Submission is recorded BEFORE the
+   * call, so a controller that dies mid-call still leaves the intent in the
+   * ledger; the transition afterwards
    * is a separate observation. Neither says the steer was applied and neither
    * says the work finished — `--wait` tracks lifecycle state, not turns.
    */
@@ -779,14 +783,10 @@ export class InteractiveLaneController {
             readinessMs: 0,
           },
         });
-        // The brief may never have been submitted. It is delivered now, once:
-        // an EXISTING submission is left alone even when its observation is
-        // unconfirmed, because replaying it could double-instruct the Agent.
-        const adopted = this.attempt(this.runs.get(runId)!, attemptId);
-        if (adopted.steerSubmissions === 0) {
-          const brief = await this.read(adopted.briefFile);
-          await this.submitSteer(commit, laneId, adopted, brief);
-        }
+        // Adoption restores the BINDING, never a conversation. The adopted
+        // session may be sitting on a startup dialog, and recovery can no more
+        // read that pane than a launch can — so it submits nothing, and an
+        // existing unconfirmed submission is likewise never replayed.
       }
 
       // Only a POSITIVE finding ends an attempt. `unknown-probe` means the
@@ -1279,12 +1279,6 @@ export class InteractiveLaneController {
   private async read(path: string): Promise<string> {
     if (this.deps.readDurable) return this.deps.readDurable(path);
     return Bun.file(path).text();
-  }
-
-  private async write(path: string, text: string): Promise<void> {
-    if (this.deps.writeDurable) return this.deps.writeDurable(path, text);
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, text, "utf8");
   }
 }
 

@@ -40,7 +40,7 @@ const LANE = {
   worktreePath: "/tmp/repo-wt",
   repoRoot: "/tmp/repo",
 } as const;
-const START = { brief: "do it", authorization: { note: "authorized" } } as const;
+const START = { authorization: { note: "authorized" } } as const;
 
 function permissive(canonical?: {
   repoRoot: string;
@@ -188,7 +188,7 @@ describe("P1-1 crash window 2: agent started, bind never committed", () => {
     await expect(fresh.controller.abortSession(runId, laneId)).resolves.toBeUndefined();
   });
 
-  test("the initial brief is delivered exactly once by recovery", async () => {
+  test("adoption restores the binding and submits nothing", async () => {
     const { fresh, h, runId, laneId, attempt } = await orphaned();
     // The crash happened before any prompt was submitted.
     expect(h.control.promptCalls).toHaveLength(0);
@@ -196,22 +196,33 @@ describe("P1-1 crash window 2: agent started, bind never committed", () => {
 
     await fresh.controller.reconcileAttempt(runId, laneId, attempt.attemptId);
     const [after] = await fresh.controller.attempts(runId, laneId);
-    expect(after!.steerSubmissions).toBe(1);
-    expect(h.control.promptCalls.map((c) => c.text)).toEqual(["do it"]);
 
-    // Reconciling again does not send it a second time.
+    // Adopted, controllable — and still told nothing. The adopted session may
+    // be sitting on a trust or update dialog, and recovery cannot see that any
+    // more than a launch can.
+    expect(after!.agentName).not.toBeNull();
+    expect(after!.steerSubmissions).toBe(0);
+    expect(h.control.promptCalls).toHaveLength(0);
+
+    // Reconciling again still submits nothing.
     await fresh.controller.reconcileAttempt(runId, laneId, attempt.attemptId);
-    expect(h.control.promptCalls).toHaveLength(1);
+    expect(h.control.promptCalls).toHaveLength(0);
+
+    // The operator briefs it explicitly, exactly once.
+    await fresh.controller.steer(runId, laneId, "do it");
+    expect(h.control.promptCalls.map((c) => c.text)).toEqual(["do it"]);
   });
 
-  test("an unconfirmed brief submission is not replayed", async () => {
+  test("an unconfirmed steer submission is not replayed", async () => {
     const base = new InMemoryLedger();
     let dying: string | null = null;
     const h = harness({ ledger: dyingLedger(base, () => dying) });
     const { runId, laneId } = await h.controller.openLane({ ...LANE });
-    // Dies after submitting the brief, before recording what was observed.
+    await h.controller.startAttempt(runId, laneId, START);
+    // Dies after submitting the operator's brief, before recording what was
+    // observed.
     dying = "lane_steer_observed";
-    await expect(h.controller.startAttempt(runId, laneId, START)).rejects.toThrow();
+    await expect(h.controller.steer(runId, laneId, "do it")).rejects.toThrow();
     expect(h.control.promptCalls).toHaveLength(1);
 
     const fresh = harness({

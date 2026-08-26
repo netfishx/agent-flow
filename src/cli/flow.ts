@@ -38,7 +38,7 @@ const USAGE =
  */
 const INTERACTIVE_USAGE = [
   "usage: flow open-lane --workflow <name> --workspace <ws> --cwd <dir> --lane <id> --kind <claude|codex|grok> --model <m> --effort <e> --repo <repoRoot> --worktree <linked worktree>",
-  "       flow start-attempt <runId> <laneId> --brief-file <path> --note <text> [--parent <attemptId>]",
+  "       flow start-attempt <runId> <laneId> --note <text> [--parent <attemptId>]",
   "       flow steer <runId> <laneId> <text>",
   "       flow cancel-turn <runId> <laneId>",
   "       flow abort-session <runId> <laneId>",
@@ -150,17 +150,12 @@ export function parseInteractiveArgs(
   } as const;
 
   if (command === "start-attempt") {
+    // No brief here: starting a session and instructing it are separate acts.
     const flags = parseFlags(
       third === undefined ? [] : [third, ...tail],
-      ["--brief-file", "--note", "--parent"],
+      ["--note", "--parent"],
     );
-    if (
-      flags === null ||
-      flags["--brief-file"] === undefined ||
-      flags["--note"] === undefined
-    ) {
-      return null;
-    }
+    if (flags === null || flags["--note"] === undefined) return null;
     return {
       ...base,
       attemptId: flags["--parent"] ?? null,
@@ -596,11 +591,10 @@ async function runInteractiveCli(
         break;
       }
       case "start-attempt": {
-        // The brief comes from a FILE, never from an argv fragment: it is the
-        // lane's contract with the Agent, and it is the first prompt.
-        const brief = await Bun.file(flags["--brief-file"]!).text();
+        // Launch and bind only. Herdr's readiness is advisory — it reports a
+        // vendor update modal as idle — so the first instruction is a separate,
+        // human-driven act once the pane has been looked at.
         const outcome = await controller.startAttempt(runId!, laneId, {
-          brief,
           authorization: { note: flags["--note"]! },
           ...(invocation.attemptId === null
             ? {}
@@ -609,6 +603,11 @@ async function runInteractiveCli(
         stdout.write(
           `attempt=${outcome.attemptId} started=${outcome.started} startFailure=${quotedValue(outcome.startFailure)}\n`,
         );
+        if (outcome.started) {
+          stdout.write(
+            `the session is bound but has been told nothing; inspect the pane, clear any trust or update dialog, then submit the brief with: flow steer ${runId} ${laneId} <text>\n`,
+          );
+        }
         break;
       }
       case "steer":

@@ -56,7 +56,6 @@ const LANE = {
 } as const;
 
 const START = {
-  brief: "implement it",
   authorization: { note: "owner authorized" },
 } as const;
 
@@ -556,5 +555,79 @@ describe("old ledgers still replay", () => {
     expect(view!.lanes["sim-1"]!.logFile).toBe("/tmp/log");
     expect(view!.interactiveAttemptOrder).toEqual([]);
     expect(view!.retryAuthorizations).toEqual([]);
+  });
+});
+
+describe("launching a session and briefing it are separate operations", () => {
+  // Stage 1 measured Herdr 0.8.2 calling a Codex update modal `idle` with
+  // `interactive_ready: true`. A launch therefore proves a session exists, not
+  // that anything can be told to it, and the runtime refuses to guess.
+  const AUTH = { authorization: { note: "owner authorized" } } as const;
+
+  /** Fails the test if a launch consults vendor lifecycle state at all. */
+  class NoStateProbe extends FakeHerdrAgentControl {
+    override async getAgent(): Promise<never> {
+      throw new Error("startAttempt read vendor agent state");
+    }
+
+    override async waitForState(): Promise<never> {
+      throw new Error("startAttempt waited on vendor agent state");
+    }
+  }
+
+  async function launched(h: ReturnType<typeof harness>) {
+    const { runId, laneId } = await h.controller.openLane({ ...LANE });
+    const outcome = await h.controller.startAttempt(runId, laneId, AUTH);
+    const [attempt] = await h.controller.attempts(runId, laneId);
+    return { runId, laneId, outcome, attempt: attempt! };
+  }
+
+  test("a start Herdr calls idle and ready still submits no prompt", async () => {
+    const h = harness();
+    const { outcome, attempt } = await launched(h);
+
+    expect(outcome.started).toBe(true);
+    expect(h.control.startCalls).toHaveLength(1);
+    // Advisory readiness authorizes nothing.
+    expect(h.control.promptCalls).toEqual([]);
+    expect(attempt.steerSubmissions).toBe(0);
+  });
+
+  test("the attempt is bound and controllable once the session is up", async () => {
+    const h = harness();
+    const { attempt } = await launched(h);
+
+    expect(attempt.agentName).toBe(attempt.expectedAgentName);
+    expect(attempt.endReason).toBeNull();
+    expect(attemptDisposition(attempt)).toBe("running");
+  });
+
+  test("an operator steer is the first and only prompt", async () => {
+    const h = harness();
+    const { runId, laneId } = await launched(h);
+
+    const observation = await h.controller.steer(runId, laneId, "AF49 brief");
+
+    expect(h.control.promptCalls.map((call) => call.text)).toEqual([
+      "AF49 brief",
+    ]);
+    const [attempt] = await h.controller.attempts(runId, laneId);
+    expect(attempt!.steerSubmissions).toBe(1);
+    // The existing steer evidence chain carries the brief: intent, delivery,
+    // observation — no new event and no new state.
+    expect(observation.outcome).toBe("state-observed");
+    expect(attempt!.advisory.length).toBeGreaterThan(0);
+  });
+
+  test("a launch needs no vendor TUI state to succeed", async () => {
+    const h = harness({
+      control: (adapter) => new NoStateProbe({ panes: adapter }),
+    });
+
+    const { outcome } = await launched(h);
+
+    expect(outcome.started).toBe(true);
+    expect(outcome.startFailure).toBeNull();
+    expect(h.control.promptCalls).toEqual([]);
   });
 });

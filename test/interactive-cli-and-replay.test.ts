@@ -3,7 +3,7 @@
 // event from disk into the same projection.
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -15,6 +15,7 @@ import { FakeHerdrAgentControl } from "../src/herdr/fake-agent-control.ts";
 import { FsLedger } from "../src/runtime/fs-ledger.ts";
 import { attemptDisposition } from "../src/interactive/attempts.ts";
 import { InteractiveLaneController } from "../src/interactive/control-plane.ts";
+import type { RunEvent } from "../src/runtime/events.ts";
 
 /** Accepts every worktree; isolation itself is proved against real git. */
 const permissiveIsolation = {
@@ -102,7 +103,6 @@ async function seedLane(root: string) {
   const controller = controllerOver(ledger, shared, root);
   const { runId, laneId } = await controller.openLane({ ...LANE });
   await controller.startAttempt(runId, laneId, {
-    brief: "implement it",
     authorization: { note: "owner authorized" },
   });
   return { ledger, controller, shared, runId, laneId };
@@ -202,7 +202,7 @@ describe("interactive CLI argv", () => {
     expect(stderr.text).toBe("");
     expect(code).toBe(0);
     expect(stdout.text).toContain("disposition=running");
-    expect(stdout.text).toContain("steer submitted=2 observed=2");
+    expect(stdout.text).toContain("steer submitted=1 observed=1");
     // The advisory channel is rendered, and rendered as what it is.
     expect(stdout.text).toContain("advisory(not evidence)");
   });
@@ -279,7 +279,6 @@ describe("ledger replay", () => {
       "owner authorized retry",
     );
     await controller.startAttempt(runId, laneId, {
-      brief: "second go",
       authorization: { note: "owner authorized retry" },
       parentAttemptId: first!.attemptId,
     });
@@ -295,7 +294,7 @@ describe("ledger replay", () => {
 
     const [before, after] = attempts;
     expect(before!.supersededBy).toBe(after!.attemptId);
-    expect(before!.steerSubmissions).toBe(2);
+    expect(before!.steerSubmissions).toBe(1);
     expect(before!.lastCancelTurnAt).not.toBeNull();
     expect(before!.runnerEvidence).toHaveLength(1);
     expect(before!.runnerEvidence[0]!.exitCode).toBe(0);
@@ -315,13 +314,164 @@ describe("ledger replay", () => {
     expect(replayed!.lanes[laneId]!.controlMode).toBe("managed");
   });
 
+  test("a ledger written when start delivered the brief replays unchanged", async () => {
+    // Hand-seeded in the pre-split shape: `interactive_attempt_started` carries
+    // a briefFile, and the brief's steer was committed by the RUNTIME inside
+    // the start. Those events are durable facts and must still project the
+    // same attempt after the split.
+    const root = await tempRoot();
+    const ledger = new FsLedger(root);
+    const runId = "legacy-run";
+    const laneId = "impl-1";
+    const attemptId = "legacy-attempt";
+    const artifactRoot = join(root, "interactive", runId, laneId);
+    const events: RunEvent[] = [
+      {
+        schemaVersion: 1,
+        eventId: `${runId}#1`,
+        runId,
+        sequence: 1,
+        type: "run_started",
+        at: 1_000,
+        actor: "runtime",
+        controllerEpoch: 0,
+        data: {
+          workflow: "impl",
+          workspace: "ws",
+          cwd: "/tmp/repo-wt",
+          splitDirection: "right",
+          tabId: "wf:t1",
+          controllerPaneId: "wf:p1",
+          fixedPoint: null,
+          issue: null,
+        },
+      },
+      {
+        schemaVersion: 1,
+        eventId: `${runId}#2`,
+        runId,
+        laneId,
+        sequence: 2,
+        type: "lane_registered",
+        at: 1_001,
+        actor: "runtime",
+        controllerEpoch: 0,
+        data: {
+          kind: "interactive",
+          laneId,
+          paneId: "wf:p1",
+          agentKind: "claude",
+          model: "sonnet",
+          effort: "high",
+          worktreePath: "/tmp/repo-wt",
+          repoRoot: "/tmp/repo",
+          artifactRoot,
+        },
+      },
+      {
+        schemaVersion: 1,
+        eventId: `${runId}#3`,
+        runId,
+        laneId,
+        sequence: 3,
+        type: "interactive_attempt_started",
+        at: 1_002,
+        actor: "runtime",
+        controllerEpoch: 0,
+        data: {
+          attemptId,
+          ordinal: 1,
+          parentAttemptId: null,
+          agentKind: "claude",
+          model: "sonnet",
+          effort: "high",
+          paneId: "wf:p2",
+          expectedAgentName: "f-impl-1-0123456789abcdef",
+          worktreePath: "/tmp/repo-wt",
+          briefFile: join(artifactRoot, "attempts", attemptId, "brief.md"),
+          checkpointFile: join(artifactRoot, "attempts", attemptId, "checkpoint.md"),
+          resultPointer: join(artifactRoot, "attempts", attemptId, "result.md"),
+          authorization: { actor: "human", note: "owner authorized" },
+        },
+      },
+      {
+        schemaVersion: 1,
+        eventId: `${runId}#4`,
+        runId,
+        laneId,
+        sequence: 4,
+        type: "interactive_attempt_bound",
+        at: 1_003,
+        actor: "runtime",
+        controllerEpoch: 0,
+        data: {
+          attemptId,
+          agentName: "f-impl-1-0123456789abcdef",
+          session: { kind: "measured", id: "sess-legacy", source: "herdr" },
+          argv: ["claude", "--model", "sonnet"],
+          readinessMs: 42,
+        },
+      },
+      {
+        schemaVersion: 1,
+        eventId: `${runId}#5`,
+        runId,
+        laneId,
+        sequence: 5,
+        type: "lane_steer_submitted",
+        at: 1_004,
+        actor: "human",
+        controllerEpoch: 0,
+        data: {
+          attemptId,
+          text: "implement the ticket",
+          paneId: "wf:p2",
+          target: "f-impl-1-0123456789abcdef",
+        },
+      },
+      {
+        schemaVersion: 1,
+        eventId: `${runId}#6`,
+        runId,
+        laneId,
+        sequence: 6,
+        type: "lane_steer_observed",
+        at: 1_005,
+        actor: "runtime",
+        controllerEpoch: 0,
+        data: {
+          attemptId,
+          outcome: "state-observed",
+          observedStatus: "working",
+          source: "herdr-detection",
+        },
+      },
+    ] as RunEvent[];
+    for (const event of events) await ledger.commit(event);
+
+    const replayed = (await new FsLedger(root).load(runId))!;
+    const attempt = replayed.interactiveAttempts[attemptId]!;
+
+    expect(replayed.interactiveAttemptOrder).toEqual([attemptId]);
+    expect(attempt.agentName).toBe("f-impl-1-0123456789abcdef");
+    expect(attempt.session.kind).toBe("measured");
+    expect(attempt.briefFile).toBe(
+      join(artifactRoot, "attempts", attemptId, "brief.md"),
+    );
+    // The brief that a start used to send is still one submission with one
+    // observation, and the attempt still projects as running.
+    expect(attempt.steerSubmissions).toBe(1);
+    expect(attempt.steerObservations).toBe(1);
+    expect(attempt.endReason).toBeNull();
+    expect(attemptDisposition(attempt)).toBe("running");
+  });
+
   test("a replayed run needs no pane to tell two attempts apart", async () => {
     const root = await tempRoot();
     const { controller, runId, laneId } = await seedLane(root);
     const [first] = await controller.attempts(runId, laneId);
     await controller.authorizeRetry(runId, laneId, first!.attemptId, "retry");
     await controller.startAttempt(runId, laneId, {
-      brief: "again",
       authorization: { note: "retry" },
       parentAttemptId: first!.attemptId,
     });
@@ -350,8 +500,7 @@ describe("the production entry point is reachable", () => {
     const root = await tempRoot();
     const ledger = new FsLedger(root);
     const shared = seams();
-    const briefFile = join(root, "brief.md");
-    await writeFile(briefFile, "implement the ticket\n", "utf8");
+
 
     const opened = new Sink();
     const openedErr = new Sink();
@@ -387,7 +536,6 @@ describe("the production entry point is reachable", () => {
         "start-attempt",
         runId!,
         "impl-1",
-        "--brief-file", briefFile,
         "--note", "owner authorized the first attempt",
       ],
       started,
@@ -401,6 +549,11 @@ describe("the production entry point is reachable", () => {
     expect(startCode).toBe(0);
     expect(started.text).toContain("started=true");
     expect(started.text).toContain("disposition=running");
+    // Launched and bound is not instructed: the CLI says so, and names the
+    // command that actually delivers the brief.
+    expect(started.text).toContain("has been told nothing");
+    expect(started.text).toContain("flow steer");
+    expect(started.text).toContain("steer submitted=0 observed=0");
 
     // The lane and its attempt are durable, with declared paths under the
     // ledger root rather than anywhere the caller chose.
@@ -442,12 +595,20 @@ describe("the production entry point is reachable", () => {
     ).toBeNull();
   });
 
-  test("start-attempt requires both a brief file and an authorization note", () => {
+  test("start-attempt takes an authorization note and no brief", () => {
+    // The note is the human act that authorizes the attempt, and is required.
     expect(
-      parseInteractiveArgs(["start-attempt", "r1", "l1", "--brief-file", "/b"]),
+      parseInteractiveArgs(["start-attempt", "r1", "l1"]),
     ).toBeNull();
     expect(
       parseInteractiveArgs(["start-attempt", "r1", "l1", "--note", "ok"]),
+    ).not.toBeNull();
+    // A brief is no longer a start input; offering one is a usage error, not
+    // a silently ignored flag.
+    expect(
+      parseInteractiveArgs([
+        "start-attempt", "r1", "l1", "--note", "ok", "--brief-file", "/b",
+      ]),
     ).toBeNull();
   });
 });

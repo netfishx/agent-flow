@@ -39,7 +39,7 @@ const LANE = {
   worktreePath: "/tmp/repo-wt",
   repoRoot: "/tmp/repo",
 } as const;
-const START = { brief: "do it", authorization: { note: "authorized" } } as const;
+const START = { authorization: { note: "authorized" } } as const;
 
 /** Accepts every worktree; isolation itself is tested against real git below. */
 const permissive: WriteLaneIsolationPort = {
@@ -126,7 +126,7 @@ describe("P2-A a starting attempt is never probed or reconciled", () => {
     expect(h.control.promptCalls).toHaveLength(0);
   });
 
-  test("a normal start still binds and delivers its brief", async () => {
+  test("a normal start binds and instructs nothing", async () => {
     const h = harness();
     const { runId, laneId } = await h.controller.openLane({ ...LANE });
     const outcome = await h.controller.startAttempt(runId, laneId, START);
@@ -134,8 +134,12 @@ describe("P2-A a starting attempt is never probed or reconciled", () => {
     const [a] = await h.controller.attempts(runId, laneId);
     expect(a!.agentName).not.toBeNull();
     expect(a!.reconciliation).toBeNull();
-    expect(a!.steerSubmissions).toBe(1);
-    expect(h.control.promptCalls[0]!.text).toBe("do it");
+    // A launched session has been told nothing until an operator steers it.
+    expect(a!.steerSubmissions).toBe(0);
+    expect(h.control.promptCalls).toHaveLength(0);
+
+    await h.controller.steer(runId, laneId, "do it");
+    expect(h.control.promptCalls.map((call) => call.text)).toEqual(["do it"]);
   });
 
   test("a failed start ends in an unrewritable start-failed", async () => {
@@ -186,11 +190,12 @@ describe("P2-A a starting attempt is never probed or reconciled", () => {
     expect(events.filter((e) => e === "release")).toHaveLength(1);
     expect(events[0]).toBe("acquire");
     expect(events.at(-1)).toBe("release");
-    // Registration, binding and the brief all landed inside that one lease.
+    // Registration and binding landed inside that one lease. Nothing was
+    // submitted to the Agent: the brief is a separate, later operation.
     const inside = events.slice(1, -1);
     expect(inside).toContain("commit:interactive_attempt_started");
     expect(inside).toContain("commit:interactive_attempt_bound");
-    expect(inside).toContain("commit:lane_steer_submitted");
+    expect(inside).not.toContain("commit:lane_steer_submitted");
   });
 });
 

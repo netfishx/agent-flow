@@ -212,6 +212,7 @@ export interface InteractiveAttemptView {
    */
   readonly session: SessionIdentity;
   readonly worktreePath: string;
+  /** Declared path for this attempt's brief; the brief itself arrives by steer. */
   readonly briefFile: string;
   /** Declared path the Agent writes its checkpoint to; never scrollback. */
   readonly checkpointFile: string;

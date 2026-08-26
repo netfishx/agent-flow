@@ -82,7 +82,6 @@ const LANE = {
 
 function attemptInput(dir: string, note = "owner authorized attempt") {
   return {
-    brief: "implement the ticket",
         authorization: { note },
   };
 }
@@ -168,11 +167,11 @@ describe("steer records submission and observation separately", () => {
     const observation = await controller.steer(runId, laneId, "focus the parser");
     expect(observation.outcome).toBe("state-observed");
 
-    // Two submissions: the brief is the first prompt, then this steer. Each is
-    // counted separately from the transition observed after it.
+    // One submission: a launch instructs nothing, so this steer is the first
+    // prompt. It is counted separately from the transition observed after it.
     const [attempt] = await controller.attempts(runId, laneId);
-    expect(attempt!.steerSubmissions).toBe(2);
-    expect(attempt!.steerObservations).toBe(2);
+    expect(attempt!.steerSubmissions).toBe(1);
+    expect(attempt!.steerObservations).toBe(1);
     // The observation is advisory, and the attempt is not complete.
     expect(attemptDisposition(attempt!)).toBe("running");
   });
@@ -183,6 +182,7 @@ describe("steer records submission and observation separately", () => {
     });
     const { runId, laneId } = await h.controller.openLane({ ...LANE });
     await h.controller.startAttempt(runId, laneId, attemptInput(root));
+    await h.controller.steer(runId, laneId, "the brief");
     const [attempt] = await h.controller.attempts(runId, laneId);
     expect(attempt!.steerSubmissions).toBe(1);
     expect(attempt!.steerObservations).toBe(1);
@@ -192,7 +192,7 @@ describe("steer records submission and observation separately", () => {
   test("a stalled prompt is recorded as stalled and completes nothing", async () => {
     const h = harness({
       agent: {
-        defaultProgram: { promptOutcomes: ["state-observed", "stalled"] },
+        defaultProgram: { promptOutcomes: ["stalled"] },
       },
     });
     const { runId, laneId } = await h.controller.openLane({ ...LANE });
@@ -230,7 +230,7 @@ describe("cancel-turn and abort-session are different acts", () => {
     expect(attempt!.endedAt).toBeNull();
     // Still steerable.
     await controller.steer(runId, laneId, "try again");
-    expect(agentControl.promptCalls).toHaveLength(2);
+    expect(agentControl.promptCalls).toHaveLength(1);
   });
 
   test("abort-session signals the process group and ends the attempt", async () => {
