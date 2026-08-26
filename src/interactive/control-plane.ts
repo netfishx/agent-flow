@@ -303,6 +303,23 @@ export class InteractiveLaneController {
       if (parentAttemptId !== null && pendingRetries(run, parentAttemptId) <= 0) {
         throw new RetryNotAuthorizedError(laneId);
       }
+      // Resolved FIRST, before any pane, event or artifact exists. A family
+      // whose defaults cannot keep the human approval gate refuses here, and
+      // refusing here means nothing was created to clean up. An owner's
+      // explicit `nativeArgs` replaces the defaults whole, and the runtime does
+      // not judge whether that override is safe.
+      const agentKind = lane.agentKind as InteractiveAgentKind;
+      const preassigned =
+        agentKind === "codex" ? null : (this.deps.sessionIdgen?.() ?? null);
+      const nativeArgs =
+        input.nativeArgs ??
+        buildNativeArgs({
+          agentKind,
+          model: lane.model ?? "",
+          effort: lane.effort ?? "",
+          sessionId: preassigned,
+        });
+
       const attemptId = this.deps.idgen();
       assertHandleId("attemptId", attemptId);
       const expectedAgentName = agentNameFor(laneId, attemptId);
@@ -336,17 +353,6 @@ export class InteractiveLaneController {
         },
       });
 
-      const agentKind = lane.agentKind as InteractiveAgentKind;
-      const preassigned =
-        agentKind === "codex" ? null : (this.deps.sessionIdgen?.() ?? null);
-      const nativeArgs =
-        input.nativeArgs ??
-        buildNativeArgs({
-          agentKind,
-          model: lane.model ?? "",
-          effort: lane.effort ?? "",
-          sessionId: preassigned,
-        });
       const name = expectedAgentName;
       const startedAt = this.deps.clock();
       let started;

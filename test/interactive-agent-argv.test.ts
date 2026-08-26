@@ -338,36 +338,11 @@ describe("the production native argv pins the approval boundary", () => {
     expect(argv).not.toContain("--approve-for-me");
   });
 
-  test("grok overrides its host config's always-approve", () => {
-    const argv = buildNativeArgs({
-      agentKind: "grok",
-      model: "grok-4.6",
-      effort: "high",
-      sessionId: SESSION,
-    });
-
-    expect(argv).toEqual([
-      "--no-leader",
-      "--session-id",
-      SESSION,
-      "-m",
-      "grok-4.6",
-      "--reasoning-effort",
-      "high",
-      "--permission-mode",
-      "default",
-    ]);
-    expect(argv).not.toContain("--always-approve");
-    expect(argv).not.toContain("--yolo");
-    expect(argv).not.toContain("bypassPermissions");
-  });
-
   test("every pinned flag carries its value as the next argument", () => {
     // A flag whose value drifted onto the wrong index is argv the CLI rejects.
     const pairs = [
       ["claude", SESSION, ["--model", "--effort", "--permission-mode", "--session-id"]],
       ["codex", null, ["-s", "-a"]],
-      ["grok", SESSION, ["--session-id", "-m", "--reasoning-effort", "--permission-mode"]],
     ] as const;
     for (const [kind, sessionId, flags] of pairs) {
       const argv = buildNativeArgs({
@@ -412,21 +387,5 @@ describe("the production native argv pins the approval boundary", () => {
         sessionId: null,
       }).slice(0, 4),
     ).toEqual(["-c", "model=gpt-x", "-c", "model_reasoning_effort=low"]);
-    expect(
-      buildNativeArgs({
-        agentKind: "grok",
-        model: "grok-9",
-        effort: "low",
-        sessionId: SESSION,
-      }).slice(0, 7),
-    ).toEqual([
-      "--no-leader",
-      "--session-id",
-      SESSION,
-      "-m",
-      "grok-9",
-      "--reasoning-effort",
-      "low",
-    ]);
   });
 });

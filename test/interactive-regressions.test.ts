@@ -18,6 +18,8 @@ import {
   pendingRetries,
 } from "../src/interactive/control-plane.ts";
 import { agentNameFor } from "../src/herdr/agent-argv.ts";
+import { buildNativeArgs } from "../src/interactive/commands.ts";
+import { existsSync } from "node:fs";
 import { RealHerdrAgentControl } from "../src/herdr/real-agent-control.ts";
 
 /** Accepts every worktree; isolation itself is proved against real git. */
@@ -629,5 +631,77 @@ describe("launching a session and briefing it are separate operations", () => {
     expect(outcome.started).toBe(true);
     expect(outcome.startFailure).toBeNull();
     expect(h.control.promptCalls).toEqual([]);
+  });
+});
+
+describe("the default grok interactive write lane fails closed", () => {
+  // Stage 2 measured grok 1.0.10 writing a file in `--permission-mode default`
+  // with no approval UI at all, and its documented `ask` rules cannot be set
+  // per invocation: there is no `--ask` flag and the env overlay silently drops
+  // `permission.*`. A lane whose human approval gate cannot be guaranteed does
+  // not start by default.
+  const GROK_LANE = { ...LANE, agentKind: "grok", model: "grok-4.6" } as const;
+
+  test("buildNativeArgs refuses grok and says why", () => {
+    const build = () =>
+      buildNativeArgs({
+        agentKind: "grok",
+        model: "grok-4.6",
+        effort: "high",
+        sessionId: "11111111-2222-3333-4444-555555555555",
+      });
+
+    expect(build).toThrow(/grok/i);
+    let message = "";
+    try {
+      build();
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    // The three facts an operator needs, in the error itself.
+    expect(message).toContain("interactive write lane");
+    expect(message).toContain("per-invocation");
+    expect(message).toContain("nativeArgs");
+  });
+
+  test("a grok attempt with no override creates nothing at all", async () => {
+    const h = harness();
+    const { runId, laneId } = await h.controller.openLane({ ...GROK_LANE });
+    const panesAfterOpen = h.adapter.splitCwds.length;
+    const eventsAfterOpen = (await h.ledger.load(runId))!.lastAppliedSequence;
+
+    await expect(
+      h.controller.startAttempt(runId, laneId, {
+        authorization: { note: "owner authorized" },
+      }),
+    ).rejects.toThrow(/grok/i);
+
+    const after = (await h.ledger.load(runId))!;
+    // No event, no pane, no agent, no artifact.
+    expect(after.lastAppliedSequence).toBe(eventsAfterOpen);
+    expect(await h.controller.attempts(runId, laneId)).toHaveLength(0);
+    expect(h.adapter.splitCwds).toHaveLength(panesAfterOpen);
+    expect(h.control.startCalls).toHaveLength(0);
+    expect(h.control.promptCalls).toHaveLength(0);
+    expect(existsSync(join(root, runId))).toBe(false);
+  });
+
+  test("an owner nativeArgs override is used whole, with no default mixed in", async () => {
+    const h = harness();
+    const { runId, laneId } = await h.controller.openLane({ ...GROK_LANE });
+    const override = ["--no-leader", "-m", "grok-4.6", "--permission-mode", "plan"];
+
+    const outcome = await h.controller.startAttempt(runId, laneId, {
+      authorization: { note: "owner authorized this override" },
+      nativeArgs: override,
+    });
+
+    expect(outcome.started).toBe(true);
+    expect(h.control.startCalls).toHaveLength(1);
+    // Exactly the operator's array — the refused defaults are not appended.
+    expect(h.control.startCalls[0]!.nativeArgs).toEqual(override);
+    expect(h.control.startCalls[0]!.kind).toBe("grok");
+    const [attempt] = await h.controller.attempts(runId, laneId);
+    expect(attempt!.agentName).not.toBeNull();
   });
 });

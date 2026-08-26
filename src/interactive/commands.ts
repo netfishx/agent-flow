@@ -31,9 +31,12 @@ export interface NativeArgsInput {
  *
  * What the pins guarantee, stated exactly:
  *
- *   - `claude --permission-mode default` and `grok --permission-mode default`
- *     keep each family's own documented human-approval mode. A CLI flag beats
- *     user config for that process, so the lane no longer inherits either.
+ *   - `claude --permission-mode default` keeps claude's own documented
+ *     human-approval mode. A CLI flag beats user config for that process, so
+ *     the lane no longer inherits the host's setting.
+ *   - `grok` has NO default argv here. Stage 2 measured 1.0.10 writing a file
+ *     in `default` mode with no approval UI, and its `ask` rules cannot be set
+ *     per invocation, so the default attempt fails closed instead.
  *   - `codex -a on-request` leaves the MODEL deciding when to raise a request,
  *     and `-c approvals_reviewer=user` sends every raised request to the person
  *     rather than the guardian subagent. `user` is the value that means a human
@@ -83,22 +86,21 @@ export function buildNativeArgs(input: NativeArgsInput): string[] {
         "-c",
         "approvals_reviewer=user",
       ];
-    case "grok": {
-      if (input.sessionId === null) {
-        throw new Error("an interactive grok attempt requires a session id");
-      }
-      return [
-        "--no-leader",
-        "--session-id",
-        input.sessionId,
-        "-m",
-        input.model,
-        "--reasoning-effort",
-        input.effort,
-        "--permission-mode",
-        "default",
-      ];
-    }
+    case "grok":
+      // Stage 2 measured grok 1.0.10 writing a file under
+      // `--permission-mode default` with no approval UI, and its documented
+      // `ask` rules cannot be set per invocation: there is no `--ask` flag, and
+      // the `GROK_CONFIG` / `GROK_CONFIG_PATH` overlay silently drops
+      // `permission.*`. A `--deny` rule is a hard rejection, not a human
+      // approval, so it cannot stand in for the gate. With no way to guarantee
+      // the gate, the default attempt does not start.
+      throw new Error(
+        "the default grok interactive write lane is disabled: grok offers no " +
+          "per-invocation human approval, so a default attempt cannot keep the " +
+          "gate this lane exists to provide. grok remains supported for " +
+          "headless and read-only lanes. An owner may still start one by " +
+          "passing explicit nativeArgs, which replaces these defaults whole.",
+      );
   }
 }
 
