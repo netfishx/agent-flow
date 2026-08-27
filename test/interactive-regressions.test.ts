@@ -705,3 +705,87 @@ describe("the default grok interactive write lane fails closed", () => {
     expect(attempt!.agentName).not.toBeNull();
   });
 });
+
+describe("session identity comes from evidence, never from an unused id", () => {
+  // Stage 9 measured the defect: an owner override launched grok with
+  // `--no-leader -m grok-4.6 --reasoning-effort high --permission-mode default`
+  // and Herdr reported no session, yet the bind recorded the controller's own
+  // generated uuid as `measured`, with evidence naming a `--session-id` flag
+  // that was not in the argv.
+  const GROK_LANE = { ...LANE, agentKind: "grok", model: "grok-4.6" } as const;
+  const OVERRIDE = ["--no-leader", "-m", "grok-4.6", "--permission-mode", "plan"];
+
+  test("an override carrying no --session-id records unavailable, not a minted id", async () => {
+    const h = harness();
+    const { runId, laneId } = await h.controller.openLane({ ...GROK_LANE });
+
+    await h.controller.startAttempt(runId, laneId, {
+      authorization: { note: "owner authorized this override" },
+      nativeArgs: OVERRIDE,
+    });
+
+    const [attempt] = await h.controller.attempts(runId, laneId);
+    expect(attempt!.session.kind).toBe("unavailable");
+    expect(attempt!.session).not.toHaveProperty("id");
+    const reason = (attempt!.session as { reason: string }).reason;
+    expect(reason).toContain("reported no session id");
+    expect(reason).toContain("--session-id");
+    // The generated id must appear nowhere the ledger can be read from: it
+    // never reached the process, so it is evidence of nothing.
+    const run = await h.ledger.load(runId);
+    expect(JSON.stringify(run)).not.toContain("sess-1");
+  });
+
+  test("an override that does carry --session-id records that real value", async () => {
+    const h = harness();
+    const { runId, laneId } = await h.controller.openLane({ ...GROK_LANE });
+
+    await h.controller.startAttempt(runId, laneId, {
+      authorization: { note: "owner authorized this override" },
+      nativeArgs: [...OVERRIDE, "--session-id", "owner-session"],
+    });
+
+    const [attempt] = await h.controller.attempts(runId, laneId);
+    expect(attempt!.session.kind).toBe("measured");
+    expect((attempt!.session as { id: string }).id).toBe("owner-session");
+    expect((attempt!.session as { evidence: string }).evidence).toContain(
+      "actual argv",
+    );
+  });
+
+  test("the claude default still records the id its own argv carried", async () => {
+    const h = harness();
+    const { runId, laneId } = await h.controller.openLane({ ...LANE });
+
+    await h.controller.startAttempt(runId, laneId, START);
+
+    const [attempt] = await h.controller.attempts(runId, laneId);
+    expect(h.control.startCalls[0]!.nativeArgs).toContain("--session-id");
+    expect(attempt!.session.kind).toBe("measured");
+    expect((attempt!.session as { id: string }).id).toBe("sess-1");
+    expect((attempt!.session as { evidence: string }).evidence).toContain(
+      "actual argv",
+    );
+  });
+
+  test("a session Herdr observed outranks the argv fallback", async () => {
+    const h = harness({
+      control: (adapter) =>
+        new FakeHerdrAgentControl({
+          panes: adapter,
+          defaultProgram: { sessionId: "herdr-observed" },
+        }),
+    });
+    const { runId, laneId } = await h.controller.openLane({ ...LANE });
+
+    await h.controller.startAttempt(runId, laneId, START);
+
+    const [attempt] = await h.controller.attempts(runId, laneId);
+    expect(attempt!.session.kind).toBe("measured");
+    // The argv carried "sess-1"; Herdr's own report wins.
+    expect((attempt!.session as { id: string }).id).toBe("herdr-observed");
+    expect((attempt!.session as { evidence: string }).evidence).toContain(
+      "herdr agent surface",
+    );
+  });
+});

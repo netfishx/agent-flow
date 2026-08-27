@@ -149,6 +149,10 @@ describe("agent argv", () => {
     expect(agentGetArgv("flow-l1")).toEqual(["agent", "get", "flow-l1"]);
   });
 
+  // Herdr 0.8.2 rejects these commands outright when the pane id trails the
+  // options: the parser reads `--source`'s value as a stray token and exits 2
+  // with `unknown option: <source>`. Both argvs put the pane id immediately
+  // after the subcommand, before every option.
   test("report-agent publishes advisory state and cannot publish done", () => {
     expect(
       paneReportAgentArgv({
@@ -161,6 +165,7 @@ describe("agent argv", () => {
     ).toEqual([
       "pane",
       "report-agent",
+      "w1:p2",
       "--source",
       "flow-run1",
       "--agent",
@@ -169,7 +174,6 @@ describe("agent argv", () => {
       "working",
       "--message",
       "attempt a1 live",
-      "w1:p2",
     ]);
     expect(
       paneReleaseAgentArgv({
@@ -180,12 +184,42 @@ describe("agent argv", () => {
     ).toEqual([
       "pane",
       "release-agent",
+      "w1:p2",
       "--source",
       "flow-run1",
       "--agent",
       "flow-l1",
-      "w1:p2",
     ]);
+  });
+
+  test("the pane id precedes every option, with and without a message", () => {
+    // Pinned by index, not by membership: a pane id that drifted behind any
+    // option is argv the installed Herdr refuses to parse.
+    const withMessage = paneReportAgentArgv({
+      paneId: "w1:p2",
+      source: "flow-run1",
+      agent: "flow-l1",
+      state: "idle",
+      message: "m",
+    });
+    const withoutMessage = paneReportAgentArgv({
+      paneId: "w1:p2",
+      source: "flow-run1",
+      agent: "flow-l1",
+      state: "idle",
+    });
+    const released = paneReleaseAgentArgv({
+      paneId: "w1:p2",
+      source: "flow-run1",
+      agent: "flow-l1",
+    });
+    for (const argv of [withMessage, withoutMessage, released]) {
+      expect(argv[2]).toBe("w1:p2");
+      const firstOption = argv.findIndex((entry) => entry.startsWith("--"));
+      expect(firstOption).toBeGreaterThan(2);
+      expect(argv.indexOf("w1:p2")).toBeLessThan(firstOption);
+    }
+    expect(withoutMessage).not.toContain("--message");
   });
 });
 

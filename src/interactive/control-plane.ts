@@ -307,17 +307,21 @@ export class InteractiveLaneController {
       // whose defaults cannot keep the human approval gate refuses here, and
       // refusing here means nothing was created to clean up. An owner's
       // explicit `nativeArgs` replaces the defaults whole, and the runtime does
-      // not judge whether that override is safe.
+      // not judge whether that override is safe. A pre-assigned session id
+      // therefore exists only for the DEFAULT argv, which is the argv that
+      // carries it to the process: minting one for an override would invent a
+      // value that never reaches the CLI and could be evidence of nothing.
       const agentKind = lane.agentKind as InteractiveAgentKind;
-      const preassigned =
-        agentKind === "codex" ? null : (this.deps.sessionIdgen?.() ?? null);
       const nativeArgs =
         input.nativeArgs ??
         buildNativeArgs({
           agentKind,
           model: lane.model ?? "",
           effort: lane.effort ?? "",
-          sessionId: preassigned,
+          sessionId:
+            agentKind === "codex"
+              ? null
+              : (this.deps.sessionIdgen?.() ?? null),
         });
 
       const attemptId = this.deps.idgen();
@@ -387,7 +391,7 @@ export class InteractiveLaneController {
           session: sessionIdentityOf(
             agentKind,
             started.agent.sessionId,
-            preassigned,
+            started.argv,
           ),
           argv: started.argv,
           readinessMs: this.deps.clock() - startedAt,
@@ -781,7 +785,7 @@ export class InteractiveLaneController {
             session: sessionIdentityOf(
               attempt.agentKind,
               observed.sessionId,
-              null,
+              [],
             ),
             // Herdr does not report the argv of an agent it did not just
             // start, so this records the adoption rather than inventing one.
@@ -1293,14 +1297,29 @@ function advisorySource(runId: string): string {
 }
 
 /**
- * Session identity in the vocabulary the headless lane already uses. A
- * pre-assigned id counts as measured because the flag that carries it is what
- * ties it to this process; anything else says why it is unavailable.
+ * Read a session id out of an attempt's ACTUAL argv. Only the separate
+ * `--session-id <value>` form counts, because that is the form this runtime
+ * emits and the only one it can vouch for. Anything else is `null`; this is a
+ * one-flag lookup, not a CLI parser.
+ */
+function sessionIdInArgv(argv: readonly string[]): string | null {
+  const flag = argv.indexOf("--session-id");
+  if (flag === -1) return null;
+  const value = argv[flag + 1];
+  if (value === undefined || value.startsWith("-")) return null;
+  return value;
+}
+
+/**
+ * Session identity in the vocabulary the headless lane already uses, recorded
+ * only from evidence causally tied to THIS attempt: what Herdr observed, or a
+ * flag the launched argv actually carried. Anything else says why it is
+ * unavailable rather than naming a value nothing can vouch for.
  */
 function sessionIdentityOf(
   agentKind: InteractiveAgentKind,
   observed: string | null,
-  preassigned: string | null,
+  argv: readonly string[],
 ): SessionIdentity {
   if (observed !== null) {
     return {
@@ -1309,16 +1328,20 @@ function sessionIdentityOf(
       evidence: "herdr agent surface reported the session for this pane",
     };
   }
-  if (preassigned !== null) {
+  // The fallback reads the argv Herdr reported launching, never an internal
+  // value: an id that did not reach the process is evidence of nothing, and an
+  // owner's `nativeArgs` override may carry no session flag at all.
+  const inArgv = sessionIdInArgv(argv);
+  if (inArgv !== null) {
     return {
       kind: "measured",
-      id: preassigned,
-      evidence: "pre-assigned via the session-id flag in this attempt's argv",
+      id: inArgv,
+      evidence: "carried by --session-id in this attempt's actual argv",
     };
   }
   return {
     kind: "unavailable",
-    reason: `${agentKind} accepts no pre-assigned session id, and Herdr reported none for this pane`,
+    reason: `${agentKind} reported no session id, and this attempt's argv carried no --session-id`,
   };
 }
 
