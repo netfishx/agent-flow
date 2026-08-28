@@ -69,6 +69,12 @@ export interface HerdrAgentControl {
   /** Publish advisory state for the UI. Never evidence; released on lane end. */
   reportAgentState(options: PaneReportAgentOptions): Promise<void>;
 
+  /**
+   * Drop a previously published advisory source. Idempotent: an agent Herdr no
+   * longer knows about is already in the state this asks for, so it resolves
+   * rather than throwing. Every other failure is a control-plane failure and is
+   * raised, because a release that broke must not read as a source dropped.
+   */
   releaseAgentState(options: {
     readonly paneId: string;
     readonly source: string;

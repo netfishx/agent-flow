@@ -393,6 +393,31 @@ export interface LaneAdvisoryStateObservedData {
   readonly message: string | null;
 }
 
+/**
+ * A lane's control channel changing hands, recorded so a takeover or release
+ * is readable from the ledger alone — which attempt it covered, on which pane,
+ * through which target, and what the agent surface said at that moment.
+ *
+ * `method` is the whole point of the record: ownership moves by flipping the
+ * ledger's control mode and by nothing else. No prompt, no keys, no signal, no
+ * restart, no rebind — so the value names the mechanism rather than a channel.
+ *
+ * `observedStatus` is one best-effort read. Null means the read did not answer,
+ * which is an absence of observation and never a status; it never blocks the
+ * switch, because ownership is a human's decision, not Herdr's.
+ *
+ * Fields are null when the lane has no attempt to name yet. Ownership is a
+ * property of the LANE, so it can change before the first attempt exists, and
+ * naming a target that does not exist would be worse than saying there is none.
+ */
+export interface LaneOwnershipData {
+  readonly attemptId: string | null;
+  readonly paneId: string | null;
+  readonly target: string | null;
+  readonly method: "ledger-control-mode";
+  readonly observedStatus: AdvisoryAgentStatus | null;
+}
+
 
 export interface InputBundleCapturedData {
   readonly files: readonly BundleFileRecord[];
@@ -539,8 +564,12 @@ export interface RunEventDataByType {
   readonly lane_worktree_disposition: LaneWorktreeDispositionData;
   readonly checkpoint_announced: EmptyEventData;
   readonly human_interrupt: HumanInterruptData;
-  readonly lane_takeover: EmptyEventData;
-  readonly lane_release: EmptyEventData;
+  // The empty arm is the shape every takeover and release carried before the
+  // interactive lane existed, and the shape the headless runtime still writes.
+  // It stays in the union so old ledgers replay unchanged: no migration, no
+  // schema bump, and nothing rewrites what a past run recorded.
+  readonly lane_takeover: EmptyEventData | LaneOwnershipData;
+  readonly lane_release: EmptyEventData | LaneOwnershipData;
   readonly interactive_attempt_started: InteractiveAttemptStartedData;
   readonly interactive_attempt_bound: InteractiveAttemptBoundData;
   readonly interactive_attempt_ended: InteractiveAttemptEndedData;

@@ -25,7 +25,12 @@ import {
   AGENT_START_TIMEOUT_DEFAULT_MS,
 } from "../herdr/agent-argv.ts";
 import type { Ledger } from "../runtime/ledger.ts";
-import type { NewRunEvent, RunEvent, SemanticState } from "../runtime/events.ts";
+import type {
+  LaneOwnershipData,
+  NewRunEvent,
+  RunEvent,
+  SemanticState,
+} from "../runtime/events.ts";
 import { reduce, type LaneView, type RunView } from "../runtime/reducer.ts";
 import {
   assertHandleId,
@@ -47,11 +52,19 @@ import type {
   SteerObservation,
 } from "./types.ts";
 
-/** Raised when a control is attempted on a lane a human has taken over. */
+/**
+ * Raised when a control is attempted on a lane a human has taken over.
+ *
+ * The message names every control the gate covers rather than the two Herdr
+ * surfaces alone: a takeover means the human owns this lane, so an abort that
+ * would end the session under them is refused for the same reason a prompt is.
+ * Read-only observation stays outside the gate — looking at a lane a human is
+ * driving takes nothing away from them.
+ */
 export class LaneTakenOverError extends Error {
   constructor(laneId: string) {
     super(
-      `lane "${laneId}" is under human takeover: the runtime issues no agent prompt and no agent send-keys to it`,
+      `lane "${laneId}" is under human takeover: the runtime issues no control to it — no agent prompt, no agent send-keys, and no abort signal. Read-only observation is unaffected.`,
     );
     this.name = "LaneTakenOverError";
   }
@@ -552,6 +565,11 @@ export class InteractiveLaneController {
   ): Promise<void> {
     await this.mutate(runId, async (commit, run) => {
       const attempt = this.targetAttempt(run, laneId, options.attemptId);
+      // Checked in the same place, and for the same reason, as `steer` and
+      // `cancelTurn`: while a human owns the lane the runtime issues nothing to
+      // it. Ending the session outright is the most invasive control there is,
+      // so it refuses BEFORE the probe — a taken-over lane is not even read.
+      this.assertNotTakenOver(run, laneId);
       this.assertControllable(attempt);
 
       const controlId = this.deps.idgen();
@@ -625,21 +643,44 @@ export class InteractiveLaneController {
             exitCode: null,
           },
         });
+        // The end is durable BEFORE cleanup runs, so a cleanup that throws
+        // cannot cost the ledger the fact that this attempt ended. Cleanup
+        // commits nothing itself: no disposition, checkpoint, runner record or
+        // exit code can move because of it.
+        await this.releasePublishedAdvisory(runId, attempt);
       }
       if (error) throw error;
     });
   }
 
-  /** Human ownership of the lane's input channel. Reuses the shipped events. */
+  /**
+   * Human ownership of the lane's control channel. Reuses the shipped events,
+   * now with a payload that makes the change readable from the ledger alone.
+   *
+   * Nothing is sent to the session: no prompt, no keys, no signal, no restart,
+   * and no rebind. The single Herdr call is one read, and it is best-effort —
+   * ownership is a human's decision, so an unreadable agent records `null` and
+   * the switch happens anyway.
+   */
   async takeover(runId: string, laneId: string): Promise<void> {
-    await this.mutate(runId, (commit) =>
-      commit({ type: "lane_takeover", actor: "human", laneId, data: {} }),
+    await this.mutate(runId, async (commit, run) =>
+      commit({
+        type: "lane_takeover",
+        actor: "human",
+        laneId,
+        data: await this.ownershipData(run, laneId),
+      }),
     );
   }
 
   async release(runId: string, laneId: string): Promise<void> {
-    await this.mutate(runId, (commit) =>
-      commit({ type: "lane_release", actor: "human", laneId, data: {} }),
+    await this.mutate(runId, async (commit, run) =>
+      commit({
+        type: "lane_release",
+        actor: "human",
+        laneId,
+        data: await this.ownershipData(run, laneId),
+      }),
     );
   }
 
@@ -718,14 +759,13 @@ export class InteractiveLaneController {
     });
   }
 
+  /**
+   * Drop this run's advisory source on request. A lane that ends normally does
+   * not need it: `abortSession` releases what it published on its own.
+   */
   async releaseAdvisoryState(runId: string, laneId: string): Promise<void> {
     await this.mutate(runId, async (_commit, run) => {
-      const attempt = this.targetAttempt(run, laneId);
-      await this.deps.agentControl.releaseAgentState({
-        paneId: attempt.paneId,
-        source: advisorySource(runId),
-        agent: this.targetOf(attempt),
-      });
+      await this.releaseAgentSource(runId, this.targetAttempt(run, laneId));
     });
   }
 
@@ -1125,6 +1165,77 @@ export class InteractiveLaneController {
     // Re-resolved on every control call: a name is not a durable handle, so
     // the ledger's paneId is the fallback Herdr also accepts as a target.
     return attempt.agentName ?? attempt.paneId;
+  }
+
+  /**
+   * What a takeover or release records. `method` names the mechanism because
+   * that is the fact worth keeping: ownership moves by flipping the ledger's
+   * control mode, and by nothing that reaches the session.
+   */
+  private async ownershipData(
+    run: RunView,
+    laneId: string,
+  ): Promise<LaneOwnershipData> {
+    // Ownership belongs to the LANE, so it can change before the first attempt
+    // exists. Naming a target that is not there would be worse than none.
+    const attempt = this.attemptsOf(run, laneId).at(-1) ?? null;
+    const target = attempt === null ? null : this.targetOf(attempt);
+    return {
+      attemptId: attempt?.attemptId ?? null,
+      paneId: attempt?.paneId ?? null,
+      target,
+      method: "ledger-control-mode",
+      observedStatus: target === null ? null : await this.observeStatus(target),
+    };
+  }
+
+  /**
+   * One read, best-effort. A read that could not answer records `null`: that is
+   * an absence of observation, never a status, and never a reason to refuse a
+   * human's ownership change.
+   */
+  private async observeStatus(
+    target: string,
+  ): Promise<AdvisoryAgentStatus | null> {
+    try {
+      const observed = await this.deps.agentControl.getAgent(target);
+      return observed?.status ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private releaseAgentSource(
+    runId: string,
+    attempt: InteractiveAttemptView,
+  ): Promise<void> {
+    return this.deps.agentControl.releaseAgentState({
+      paneId: attempt.paneId,
+      source: advisorySource(runId),
+      agent: this.targetOf(attempt),
+    });
+  }
+
+  /**
+   * Clean up the advisory source this run published for an attempt that has
+   * just ended. Two conditions, both load-bearing:
+   *
+   *   - it runs only where something was actually published under this run's
+   *     source, so an attempt that never published is never written about;
+   *   - it runs only from a path that PROVED, moments earlier, that the pane
+   *     still hosts this attempt's agent. A lost or reoccupied pane is left
+   *     alone: the runtime no longer owns it, and whoever holds it now is not
+   *     this attempt.
+   */
+  private async releasePublishedAdvisory(
+    runId: string,
+    attempt: InteractiveAttemptView,
+  ): Promise<void> {
+    const published = attempt.advisory.some(
+      (entry) => entry.source === "runtime-published",
+    );
+    if (!published) return;
+    await this.releaseAgentSource(runId, attempt);
   }
 
   private assertNotTakenOver(run: RunView, laneId: string): void {

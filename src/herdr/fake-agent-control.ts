@@ -65,6 +65,8 @@ export class FakeHerdrAgentControl implements HerdrAgentControl {
   readonly sendKeysCalls: { target: string; keys: readonly string[] }[] = [];
   readonly reportCalls: PaneReportAgentOptions[] = [];
   readonly releaseCalls: { paneId: string; source: string; agent: string }[] = [];
+  /** Every read, so a test can prove a refusal landed BEFORE any probe. */
+  readonly getCalls: string[] = [];
 
   constructor(options: FakeAgentControlOptions = {}) {
     this.programs = options.programs ?? {};
@@ -202,6 +204,7 @@ export class FakeHerdrAgentControl implements HerdrAgentControl {
   }
 
   async getAgent(target: string): Promise<AgentInfoView | null> {
+    this.getCalls.push(target);
     const agent = this.resolve(target);
     if (!agent) return null;
     return this.infoOf(agent, this.nextStatus(agent));

@@ -164,6 +164,24 @@ export class RealHerdrAgentControl implements HerdrAgentControl {
     readonly source: string;
     readonly agent: string;
   }): Promise<void> {
-    await this.runOk(paneReleaseAgentArgv(options));
+    const { stdout, stderr, exitCode } = await this.run(
+      paneReleaseAgentArgv(options),
+    );
+    if (exitCode === 0) return;
+    const error = parseHerdrError(stderr);
+    // Dropping a source from an agent Herdr no longer knows about has already
+    // reached the state the call asks for, so it is a success rather than a
+    // failure — the same reading of the same code `getAgent` makes above, and
+    // what makes cleanup on a lane that just ended its session idempotent.
+    // Every other code stays a control-plane failure and is thrown: a release
+    // that broke for an unknown reason must never read as a source dropped.
+    if (error?.code === AGENT_ABSENT) return;
+    throw new Error(
+      `herdr pane release-agent failed (exit ${exitCode}): ${
+        error
+          ? `${error.code}: ${error.message}`
+          : stderr.trim() || stdout.trim() || "no output"
+      }`,
+    );
   }
 }

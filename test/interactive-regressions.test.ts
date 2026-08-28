@@ -2,18 +2,20 @@
 // 1c25ed7 and is the reason the corresponding fix exists.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FakeHerdrAdapter, createClock } from "../src/herdr/fake-adapter.ts";
 import { FakeHerdrAgentControl } from "../src/herdr/fake-agent-control.ts";
 import type { AgentInfoView } from "../src/herdr/agent-json.ts";
 import { InMemoryLedger, type Ledger } from "../src/runtime/ledger.ts";
+import type { RunEvent } from "../src/runtime/events.ts";
 import { FsLedger } from "../src/runtime/fs-ledger.ts";
 import { attemptDisposition } from "../src/interactive/attempts.ts";
 import {
   AttemptNotControllableError,
   InteractiveLaneController,
+  LaneTakenOverError,
   RetryNotAuthorizedError,
   pendingRetries,
 } from "../src/interactive/control-plane.ts";
@@ -787,5 +789,374 @@ describe("session identity comes from evidence, never from an unused id", () => 
     expect((attempt!.session as { evidence: string }).evidence).toContain(
       "herdr agent surface",
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Revision 14 — the final-audit findings that needed production code.
+// Each test below fails against d111113 and is the reason its fix exists.
+// ---------------------------------------------------------------------------
+
+/** Wraps a ledger so a test can read exactly which events were committed. */
+function recording(base: Ledger) {
+  const committed: RunEvent[] = [];
+  const ledger: Ledger = {
+    commit: async (event) => {
+      committed.push(event);
+      await base.commit(event);
+    },
+    load: (runId) => base.load(runId),
+    list: () => base.list(),
+    acquireLease: (runId, controller) => base.acquireLease(runId, controller),
+  };
+  return { ledger, committed };
+}
+
+function ownershipData(committed: readonly RunEvent[], type: string) {
+  const event = committed.find((candidate) => candidate.type === type);
+  expect(event).toBeDefined();
+  return event!.data as Record<string, unknown>;
+}
+
+/** Seeds one raw event straight into a ledger, the way an old run recorded it. */
+async function seed(
+  ledger: Ledger,
+  runId: string,
+  type: "lane_takeover" | "lane_release",
+  laneId: string,
+): Promise<void> {
+  const run = (await ledger.load(runId))!;
+  await ledger.commit({
+    schemaVersion: 1,
+    eventId: `${runId}#${run.lastAppliedSequence + 1}`,
+    runId,
+    sequence: run.lastAppliedSequence + 1,
+    at: 9_000 + run.lastAppliedSequence,
+    controllerEpoch: 0,
+    type,
+    actor: "human",
+    laneId,
+    // The shape every takeover and release carried before Revision 14.
+    data: {},
+  } as RunEvent);
+}
+
+describe("SP2 takeover and release are distinguishable from the ledger alone", () => {
+  test("both record attempt, pane, target, method, and observed state", async () => {
+    const base = new InMemoryLedger();
+    const { ledger, committed } = recording(base);
+    const h = harness({ ledger });
+    const { runId, laneId, attempt } = await opened(h);
+    committed.length = 0;
+
+    await h.controller.takeover(runId, laneId);
+    await h.controller.release(runId, laneId);
+
+    for (const type of ["lane_takeover", "lane_release"]) {
+      const data = ownershipData(committed, type);
+      expect(data.attemptId).toBe(attempt.attemptId);
+      expect(data.paneId).toBe(attempt.paneId);
+      // The agent this lane is actually controlled through, not the pane.
+      expect(data.target).toBe(attempt.agentName);
+      // A value that says what changed: the ledger's control mode, nothing else.
+      expect(data.method).toBe("ledger-control-mode");
+      expect(data.observedStatus).not.toBeUndefined();
+    }
+    // Actor stays on the envelope, where every other control intent carries it.
+    const takeover = committed.find((e) => e.type === "lane_takeover")!;
+    expect(takeover.actor).toBe("human");
+    expect(takeover.laneId).toBe(laneId);
+  });
+
+  test("ownership never sends a prompt, a key, or a signal", async () => {
+    const h = harness();
+    const { runId, laneId } = await opened(h);
+    const prompts = h.control.promptCalls.length;
+    const keys = h.control.sendKeysCalls.length;
+    const signals = h.adapter.interruptedPaneIds.length;
+
+    await h.controller.takeover(runId, laneId);
+    await h.controller.release(runId, laneId);
+
+    expect(h.control.promptCalls).toHaveLength(prompts);
+    expect(h.control.sendKeysCalls).toHaveLength(keys);
+    expect(h.adapter.interruptedPaneIds).toHaveLength(signals);
+    // The read it does make is exactly that: a read.
+    expect(h.control.startCalls).toHaveLength(1);
+  });
+
+  test("an unreadable agent records null and still switches ownership", async () => {
+    class UnreadableAgent extends FakeHerdrAgentControl {
+      override async getAgent(target: string): Promise<AgentInfoView | null> {
+        this.getCalls.push(target);
+        throw new Error("herdr agent get failed (exit 1): io_error: broken pipe");
+      }
+    }
+    const base = new InMemoryLedger();
+    const { ledger, committed } = recording(base);
+    const h = harness({
+      ledger,
+      control: (adapter) => new UnreadableAgent({ panes: adapter }),
+    });
+    const { runId, laneId } = await opened(h);
+    committed.length = 0;
+
+    // A best-effort observation that cannot answer must not block ownership,
+    // and must never be replaced by a guessed status.
+    await h.controller.takeover(runId, laneId);
+    expect(ownershipData(committed, "lane_takeover").observedStatus).toBeNull();
+    const [held] = await h.controller.attempts(runId, laneId);
+    expect(held!.controlMode).toBe("human_owned");
+
+    await h.controller.release(runId, laneId);
+    expect(ownershipData(committed, "lane_release").observedStatus).toBeNull();
+    const [freed] = await h.controller.attempts(runId, laneId);
+    expect(freed!.controlMode).toBe("managed");
+  });
+
+  test("a lane with no attempt yet records nulls rather than inventing a target", async () => {
+    const base = new InMemoryLedger();
+    const { ledger, committed } = recording(base);
+    const h = harness({ ledger });
+    const { runId, laneId } = await h.controller.openLane({ ...LANE });
+    committed.length = 0;
+
+    await h.controller.takeover(runId, laneId);
+    const data = ownershipData(committed, "lane_takeover");
+    expect(data.attemptId).toBeNull();
+    expect(data.paneId).toBeNull();
+    expect(data.target).toBeNull();
+    expect(data.observedStatus).toBeNull();
+    expect(data.method).toBe("ledger-control-mode");
+  });
+
+  test("a historical empty payload still replays and still gates control", async () => {
+    const h = harness();
+    const { runId, laneId } = await opened(h);
+
+    await seed(h.ledger, runId, "lane_takeover", laneId);
+    const [held] = await h.controller.attempts(runId, laneId);
+    expect(held!.controlMode).toBe("human_owned");
+    await expect(h.controller.steer(runId, laneId, "no")).rejects.toThrow(
+      LaneTakenOverError,
+    );
+
+    await seed(h.ledger, runId, "lane_release", laneId);
+    const [freed] = await h.controller.attempts(runId, laneId);
+    expect(freed!.controlMode).toBe("managed");
+    await h.controller.steer(runId, laneId, "resumed");
+    expect(h.control.promptCalls.at(-1)!.text).toBe("resumed");
+  });
+});
+
+describe("SP7 takeover fails closed for abort, not only for prompt and keys", () => {
+  test("abort under takeover throws before probing or signalling anything", async () => {
+    const base = new InMemoryLedger();
+    const { ledger, committed } = recording(base);
+    const h = harness({ ledger });
+    const { runId, laneId } = await opened(h);
+    await h.controller.takeover(runId, laneId);
+
+    const reads = h.control.getCalls.length;
+    const signals = h.adapter.interruptedPaneIds.length;
+    committed.length = 0;
+
+    await expect(h.controller.abortSession(runId, laneId)).rejects.toThrow(
+      LaneTakenOverError,
+    );
+
+    // Refused before the probe: a taken-over lane is not even looked at.
+    expect(h.control.getCalls).toHaveLength(reads);
+    expect(h.adapter.interruptedPaneIds).toHaveLength(signals);
+    const types = committed.map((event) => event.type);
+    expect(types).not.toContain("lane_abort_session");
+    expect(types).not.toContain("lane_control_delivered");
+    expect(types).not.toContain("interactive_attempt_ended");
+    expect(types).not.toContain("interactive_attempt_reconciled");
+
+    const [attempt] = await h.controller.attempts(runId, laneId);
+    expect(attempt!.endReason).toBeNull();
+  });
+
+  test("release restores abort exactly as it behaved before", async () => {
+    const h = harness();
+    const { runId, laneId } = await opened(h);
+    await h.controller.takeover(runId, laneId);
+    await expect(h.controller.abortSession(runId, laneId)).rejects.toThrow(
+      LaneTakenOverError,
+    );
+
+    await h.controller.release(runId, laneId);
+    await h.controller.abortSession(runId, laneId);
+    const [attempt] = await h.controller.attempts(runId, laneId);
+    expect(attempt!.endReason).toBe("aborted");
+    expect(attempt!.exitCode).toBeNull();
+    expect(attemptDisposition(attempt!)).toBe("aborted");
+  });
+
+  test("the refusal names every control it covers, and no read", async () => {
+    const h = harness();
+    const { runId, laneId } = await opened(h);
+    await h.controller.takeover(runId, laneId);
+    const error = await h.controller
+      .abortSession(runId, laneId)
+      .then(() => null, (caught: Error) => caught);
+    expect(error).toBeInstanceOf(LaneTakenOverError);
+    // The message may not keep claiming the boundary is prompt/send-keys only.
+    expect(error!.message).toContain("abort");
+    expect(error!.message).toContain(laneId);
+  });
+});
+
+describe("SP3 a lane end releases the advisory source it published", () => {
+  test("publish then abort releases exactly once, for that run's source", async () => {
+    const h = harness();
+    const { runId, laneId, attempt } = await opened(h);
+    await h.controller.publishAdvisoryState(runId, laneId, "working", "live");
+    expect(h.control.releaseCalls).toHaveLength(0);
+
+    await h.controller.abortSession(runId, laneId);
+
+    expect(h.control.releaseCalls).toHaveLength(1);
+    expect(h.control.releaseCalls[0]!.source).toBe(`agent-flow-${runId}`);
+    expect(h.control.releaseCalls[0]!.paneId).toBe(attempt.paneId);
+    expect(h.control.releaseCalls[0]!.agent).toBe(attempt.agentName!);
+  });
+
+  test("an attempt that never published is never released", async () => {
+    const h = harness();
+    const { runId, laneId } = await opened(h);
+    await h.controller.abortSession(runId, laneId);
+    expect(h.control.releaseCalls).toHaveLength(0);
+  });
+
+  test("cleanup changes no outcome fact and is not completion evidence", async () => {
+    const h = harness();
+    const { runId, laneId } = await opened(h);
+    await h.controller.publishAdvisoryState(runId, laneId, "working", "live");
+    await h.controller.abortSession(runId, laneId);
+
+    const [attempt] = await h.controller.attempts(runId, laneId);
+    expect(attempt!.endReason).toBe("aborted");
+    expect(attempt!.exitCode).toBeNull();
+    expect(attempt!.agentCheckpoint).toBeNull();
+    expect(attempt!.runnerEvidence).toHaveLength(0);
+    expect(attemptDisposition(attempt!)).toBe("aborted");
+    // The published record stays where it was, on the advisory channel only.
+    const published = attempt!.advisory.filter(
+      (entry) => entry.source === "runtime-published",
+    );
+    expect(published).toHaveLength(1);
+  });
+
+  test("an unclassified cleanup failure surfaces and never erases the end", async () => {
+    class ReleaseBreaks extends FakeHerdrAgentControl {
+      override async releaseAgentState(options: {
+        readonly paneId: string;
+        readonly source: string;
+        readonly agent: string;
+      }): Promise<void> {
+        this.releaseCalls.push(options);
+        throw new Error("herdr pane release-agent failed (exit 1): io_error");
+      }
+    }
+    const h = harness({
+      control: (adapter) => new ReleaseBreaks({ panes: adapter }),
+    });
+    const { runId, laneId } = await opened(h);
+    await h.controller.publishAdvisoryState(runId, laneId, "working", "live");
+
+    await expect(h.controller.abortSession(runId, laneId)).rejects.toThrow(
+      "io_error",
+    );
+    // The attempt still ended. A cleanup that broke is not an attempt that
+    // stayed alive, and it is not a fact the ledger may lose.
+    const [attempt] = await h.controller.attempts(runId, laneId);
+    expect(attempt!.endReason).toBe("aborted");
+    expect(attempt!.exitCode).toBeNull();
+    expect(h.control.releaseCalls).toHaveLength(1);
+  });
+
+  test("a lost pane is never released: the runtime no longer owns it", async () => {
+    const h = harness();
+    const { runId, laneId, attempt } = await opened(h);
+    await h.controller.publishAdvisoryState(runId, laneId, "working", "live");
+    h.control.killAgent(attempt.agentName!);
+    const gone = new FakeHerdrAdapter({ missingPaneIds: [attempt.paneId] });
+    const recovered = harness({
+      adapter: gone,
+      control: () => h.control,
+      ledger: h.ledger,
+    });
+
+    const outcome = await recovered.controller.reconcileAttempt(
+      runId,
+      laneId,
+      attempt.attemptId,
+    );
+    expect(outcome).toBe("missing");
+    const [ended] = await recovered.controller.attempts(runId, laneId);
+    expect(ended!.endReason).toBe("lost");
+    // Nothing is sent to a pane that is gone, or to whoever holds it now.
+    expect(h.control.releaseCalls).toHaveLength(0);
+  });
+
+  test("releasing a source Herdr has no agent for is a success, not a failure", async () => {
+    // Exercises the real port, where the classification lives. A stub binary
+    // stands in for herdr so the documented failure shape is reachable without
+    // a live server, a real agent, or a model call.
+    const stub = join(root, "herdr-absent");
+    await writeFile(
+      stub,
+      "#!/bin/sh\n" +
+        'printf \'{"error":{"code":"agent_not_found","message":"agent target x not found"}}\' 1>&2\n' +
+        "exit 1\n",
+      "utf8",
+    );
+    await chmod(stub, 0o755);
+    const control = new RealHerdrAgentControl({ binary: stub });
+    // Resolves: the source is already off an agent Herdr does not have.
+    await control.releaseAgentState({
+      paneId: "w1:p2",
+      source: "agent-flow-run",
+      agent: "f-lane-1",
+    });
+  });
+
+  test("any other release failure is raised, never read as a source dropped", async () => {
+    const stub = join(root, "herdr-broken");
+    await writeFile(
+      stub,
+      "#!/bin/sh\n" +
+        'printf \'{"error":{"code":"io_error","message":"broken pipe"}}\' 1>&2\n' +
+        "exit 1\n",
+      "utf8",
+    );
+    await chmod(stub, 0o755);
+    const control = new RealHerdrAgentControl({ binary: stub });
+    await expect(
+      control.releaseAgentState({
+        paneId: "w1:p2",
+        source: "agent-flow-run",
+        agent: "f-lane-1",
+      }),
+    ).rejects.toThrow("io_error");
+  });
+
+  test("a reoccupied pane is never released to its new occupant", async () => {
+    const h = harness();
+    const { runId, laneId, attempt } = await opened(h);
+    await h.controller.publishAdvisoryState(runId, laneId, "working", "live");
+    h.control.reoccupy(attempt.agentName!, "amp");
+
+    const outcome = await h.controller.reconcileAttempt(
+      runId,
+      laneId,
+      attempt.attemptId,
+    );
+    expect(outcome).toBe("reoccupied");
+    const [ended] = await h.controller.attempts(runId, laneId);
+    expect(ended!.endReason).toBe("lost");
+    expect(h.control.releaseCalls).toHaveLength(0);
   });
 });

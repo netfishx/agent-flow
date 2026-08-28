@@ -39,6 +39,10 @@ interface GitResult {
   readonly stderr: string;
 }
 
+// Deliberately does not reuse `review/isolation.ts`'s git runner: that module
+// is the accepted read-only review isolation this ticket does not modify, and a
+// write-lane preflight asks a different question of a different boundary, so
+// the fifteen lines are duplicated rather than refactored across it.
 const bunGit = async (
   cwd: string,
   args: readonly string[],

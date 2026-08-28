@@ -636,4 +636,3 @@ async function writeCheckpoint(path: string, status: string): Promise<void> {
     "utf8",
   );
 }
-
