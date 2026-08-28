@@ -1875,7 +1875,7 @@ GAPS:
     });
     await runtime.confirmLaneStarted(handle.runId, "human");
     await runtime.confirmLaneStarted(handle.runId, "sibling");
-    await runtime.takeoverLane(handle.runId, "human");
+    await runtime.takeoverLane(handle.runId, "human", null);
     const checkpointFile = join(
       root,
       "work",
@@ -1945,7 +1945,7 @@ GAPS:
     const runtime = new WorkflowRuntime(deps);
     const handle = await runtime.startWorkflow(config(root));
     await runtime.confirmLaneStarted(handle.runId, "review");
-    await runtime.takeoverLane(handle.runId, "review");
+    await runtime.takeoverLane(handle.runId, "review", null);
     const checkpointFile = join(
       root,
       "work",
@@ -2114,7 +2114,7 @@ GAPS:
       issueTracker: tracker,
     });
     const handle = await runtime.startWorkflow(config(root));
-    await runtime.takeoverLane(handle.runId, "review");
+    await runtime.takeoverLane(handle.runId, "review", null);
     await appendEvent(
       ledger,
       handle.runId,

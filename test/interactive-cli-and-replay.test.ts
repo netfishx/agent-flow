@@ -13,6 +13,8 @@ import {
 import { FakeHerdrAdapter, createClock } from "../src/herdr/fake-adapter.ts";
 import { FakeHerdrAgentControl } from "../src/herdr/fake-agent-control.ts";
 import { FsLedger } from "../src/runtime/fs-ledger.ts";
+import type { Ledger } from "../src/runtime/ledger.ts";
+import { WorkflowRuntime } from "../src/runtime/runtime.ts";
 import { attemptDisposition } from "../src/interactive/attempts.ts";
 import { InteractiveLaneController } from "../src/interactive/control-plane.ts";
 import type { RunEvent } from "../src/runtime/events.ts";
@@ -749,5 +751,73 @@ describe("R2-S2 the operator CLI records ownership in full", () => {
       data: {},
     } as RunEvent;
     expect(reduce(before, legacy).lanes[laneId]!.controlMode).toBe("human_owned");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Revision 16 — R3-1. The CLI no longer decides what kind of lane it is
+// looking at: it assembles the ownership capability and hands it over. The
+// runtime holds the lane, so the run is read once for the decision.
+// ---------------------------------------------------------------------------
+
+describe("R3-1 the operator CLI reads the run once and stays lease-free", () => {
+  test("takeover derives its payload from the run the runtime loaded", async () => {
+    const root = await tempRoot();
+    const { ledger, controller, shared, runId, laneId } = await seedLane(root);
+    const [attempt] = await controller.attempts(runId, laneId);
+    let loads = 0;
+    let leases = 0;
+    const err = new Sink();
+
+    const exitCode = await runFlowCli(
+      ["takeover", runId, laneId],
+      new Sink(),
+      err,
+      {
+        environment: { FLOW_LEDGER_ROOT: root },
+        interactiveFactory: () => controllerOver(ledger, shared, root),
+        runtimeFactory: (cliLedger) => {
+          // Instrumenting the INSTANCE the CLI itself holds: every later read
+          // — the runtime's, the provider's, the render's — goes through it.
+          const load = cliLedger.load.bind(cliLedger);
+          const acquireLease = cliLedger.acquireLease.bind(cliLedger);
+          const instrumented = cliLedger as {
+            load: Ledger["load"];
+            acquireLease: Ledger["acquireLease"];
+          };
+          instrumented.load = (id) => {
+            loads += 1;
+            return load(id);
+          };
+          instrumented.acquireLease = (id, owner) => {
+            leases += 1;
+            return acquireLease(id, owner);
+          };
+          return new WorkflowRuntime({
+            adapter: shared.adapter,
+            ledger: cliLedger,
+            clock: () => 3_000,
+            idgen: () => "unused-run-id",
+            readResultFile: shared.adapter.readResultFile,
+            sleep: async () => {},
+          });
+        },
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(err.text).toBe("");
+    // One read decides the lane kind and feeds the payload; one renders the
+    // result. The pre-Revision-16 chain read the same run twice before that.
+    expect(loads).toBe(2);
+    // Ownership never takes the controller lease, whatever layer decides it.
+    expect(leases).toBe(0);
+    const [owned] = ownershipEvents(await eventsOf(root, runId));
+    expect(owned!.data).toMatchObject({
+      attemptId: attempt!.attemptId,
+      paneId: attempt!.paneId,
+      target: attempt!.agentName!,
+      method: "ledger-control-mode",
+    });
   });
 });

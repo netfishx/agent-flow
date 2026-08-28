@@ -1028,7 +1028,7 @@ describe("flow CLI external behavior", () => {
       lanes: [{ laneId: "owned", steps: 1 }],
     });
     await source.confirmLaneStarted(handle.runId, "owned");
-    await source.takeoverLane(handle.runId, "owned");
+    await source.takeoverLane(handle.runId, "owned", null);
     adapter.finishLane("owned");
     const ownedPaneId = adapter.paneIdForLane("owned")!;
     const processInfoBefore = adapter.processInfoPaneIds.length;
@@ -1122,7 +1122,7 @@ describe("flow CLI external behavior", () => {
       await source.confirmLaneStarted(handle.runId, laneId);
       adapter.finishLane(laneId);
     }
-    await source.takeoverLane(handle.runId, "owned-crashed");
+    await source.takeoverLane(handle.runId, "owned-crashed", null);
     const crashedPaneId = adapter.paneIdForLane("owned-crashed")!;
     const followingPaneId = adapter.paneIdForLane("following")!;
     const processInfoBefore = adapter.processInfoPaneIds.length;
@@ -1214,7 +1214,7 @@ describe("flow CLI external behavior", () => {
       lanes: [{ laneId: "owned-crashed", steps: 1 }],
     });
     await source.confirmLaneStarted(handle.runId, "owned-crashed");
-    await source.takeoverLane(handle.runId, "owned-crashed");
+    await source.takeoverLane(handle.runId, "owned-crashed", null);
     adapter.finishLane("owned-crashed");
     let failuresRemaining = 2;
 

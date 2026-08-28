@@ -25,6 +25,7 @@ import {
   AGENT_START_TIMEOUT_DEFAULT_MS,
 } from "../herdr/agent-argv.ts";
 import type { Ledger } from "../runtime/ledger.ts";
+import { ownershipEvent } from "../runtime/events.ts";
 import type {
   InteractiveRetryAuthorizedData,
   LaneOwnershipData,
@@ -665,35 +666,26 @@ export class InteractiveLaneController {
    */
   async takeover(runId: string, laneId: string): Promise<void> {
     await this.mutate(runId, async (commit, run) =>
-      commitOwnership(
-        commit,
-        "lane_takeover",
-        laneId,
-        await this.ownershipData(run, laneId),
+      commit(
+        ownershipEvent(
+          "lane_takeover",
+          laneId,
+          await this.ownershipFrom(run, laneId),
+        ),
       ),
     );
   }
 
   async release(runId: string, laneId: string): Promise<void> {
     await this.mutate(runId, async (commit, run) =>
-      commitOwnership(
-        commit,
-        "lane_release",
-        laneId,
-        await this.ownershipData(run, laneId),
+      commit(
+        ownershipEvent(
+          "lane_release",
+          laneId,
+          await this.ownershipFrom(run, laneId),
+        ),
       ),
     );
-  }
-
-  /**
-   * The ownership payload for a lane, read-only and WITHOUT the controller
-   * lease. `flow takeover` has to work while a live controller still holds that
-   * lease — a human taking the lane back is exactly the moment one is running —
-   * so this reads the ledger, makes one best-effort observation, and commits
-   * nothing. The caller commits.
-   */
-  async ownershipFor(runId: string, laneId: string): Promise<LaneOwnershipData> {
-    return this.ownershipData(await this.load(runId), laneId);
   }
 
   /**
@@ -1206,8 +1198,16 @@ export class InteractiveLaneController {
    * What a takeover or release records. `method` names the mechanism because
    * that is the fact worth keeping: ownership moves by flipping the ledger's
    * control mode, and by nothing that reaches the session.
+   *
+   * Public because `WorkflowRuntime` — the entry point `flow takeover` goes
+   * through — records the same payload, and ONE derivation is the point: the
+   * latest attempt, the target, the method, and the single best-effort read
+   * live here alone. It takes the RunView the caller already holds, so nothing
+   * reads the run twice; it commits nothing, and it never takes the controller
+   * lease, because `flow takeover` has to work while a live controller holds
+   * that lease — a human taking the lane back is exactly when one is running.
    */
-  private async ownershipData(
+  async ownershipFrom(
     run: RunView,
     laneId: string,
   ): Promise<LaneOwnershipData> {
@@ -1439,24 +1439,17 @@ export class InteractiveLaneController {
 }
 
 /**
- * The ONLY way this control plane commits an ownership change, and the only way
- * it commits a retry authorization.
+ * The ONLY way this control plane commits a retry authorization. An ownership
+ * change is built by `ownershipEvent`, the strict builder this control plane
+ * shares with `WorkflowRuntime`, so the two producers of a carried payload
+ * cannot drift apart.
  *
- * The `data` parameters are the COMPLETE payload types, never the ledger's
- * compatibility unions. Those unions exist so a ledger written before these
- * payloads did still replays; they are not a way back in. A producer here that
+ * The `data` parameter is the COMPLETE payload type, never the ledger's
+ * compatibility union. That union exists so a ledger written before this
+ * payload did still replays; it is not a way back in. A producer here that
  * tried to commit `{}` would not typecheck, because `{}` is missing every
- * required field of these types.
+ * required field of the type.
  */
-function commitOwnership(
-  commit: (input: NewRunEvent) => Promise<RunView>,
-  type: "lane_takeover" | "lane_release",
-  laneId: string,
-  data: LaneOwnershipData,
-): Promise<RunView> {
-  return commit({ type, actor: "human", laneId, data });
-}
-
 function commitRetryAuthorization(
   commit: (input: NewRunEvent) => Promise<RunView>,
   laneId: string,

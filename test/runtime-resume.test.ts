@@ -22,6 +22,7 @@ import type { RunView } from "../src/runtime/reducer.ts";
 import {
   PartialDispatchError,
   WorkflowRuntime,
+  type LaneOwnershipProvider,
 } from "../src/runtime/runtime.ts";
 
 const roots: string[] = [];
@@ -382,7 +383,7 @@ describe("WorkflowRuntime resume", () => {
       ) {
         if (!tookOver) {
           tookOver = true;
-          await takeover.takeoverLane(runId, laneId);
+          await takeover.takeoverLane(runId, laneId, null);
         }
         return super.awaitLane(runId, laneId, timeoutMs);
       }
@@ -478,7 +479,7 @@ describe("WorkflowRuntime resume", () => {
     expect(
       adapter.waitedPaneIds.filter((paneId) => paneId === ownedPaneId),
     ).toHaveLength(1);
-    await takeover.takeoverLane(handle.runId, "owned");
+    await takeover.takeoverLane(handle.runId, "owned", null);
     adapter.releaseTargetWait({ matched: false, timedOut: true });
 
     const status = await resume;
@@ -564,7 +565,7 @@ describe("WorkflowRuntime resume", () => {
       driveSliceMs: 100,
     }).resumeWorkflow(handle.runId, 1_000);
     await adapter.waitStarted.promise;
-    await takeover.takeoverLane(handle.runId, "owned");
+    await takeover.takeoverLane(handle.runId, "owned", null);
     adapter.releaseTargetWait({ matched: true, timedOut: false });
 
     const status = await resume;
@@ -640,7 +641,7 @@ describe("WorkflowRuntime resume", () => {
     const managedPaneId = adapter.paneIdForLane("managed")!;
     adapter.targetPaneId = ownedPaneId;
     adapter.takeover = async () => {
-      await takeover.takeoverLane(handle.runId, "owned");
+      await takeover.takeoverLane(handle.runId, "owned", null);
     };
 
     const status = await new WorkflowRuntime({
@@ -723,7 +724,7 @@ describe("WorkflowRuntime resume", () => {
       driveSliceMs: 100,
     }).resumeWorkflow(handle.runId, 1_000);
     await adapter.waitStarted.promise;
-    await takeover.takeoverLane(handle.runId, "owned");
+    await takeover.takeoverLane(handle.runId, "owned", null);
     adapter.finishLane("owned");
     adapter.releaseTargetWait({ matched: true, timedOut: false });
 
@@ -790,7 +791,7 @@ describe("WorkflowRuntime resume", () => {
       sleep: async () => {},
     });
     interleavingLedger.beforeLaneExitedCommit = async () => {
-      await takeover.takeoverLane(handle.runId, "owned");
+      await takeover.takeoverLane(handle.runId, "owned", null);
     };
 
     const status = await observer.inspectWorkflow(handle.runId);
@@ -855,7 +856,7 @@ describe("WorkflowRuntime resume", () => {
     const ownedPaneId = adapter.paneIdForLane("owned")!;
     const managedPaneId = adapter.paneIdForLane("managed")!;
     await adapter.waitForOutput({ id: managedPaneId }, "ignored", 1);
-    await dispatch.takeoverLane(handle.runId, "owned");
+    await dispatch.takeoverLane(handle.runId, "owned", null);
     const piBefore = adapter.processInfoPaneIds.length;
 
     const status = await new WorkflowRuntime(deps()).resumeWorkflow(
@@ -906,7 +907,7 @@ describe("WorkflowRuntime resume", () => {
     });
     await dispatch.confirmLaneStarted(handle.runId, "owned");
     const ownedPaneId = adapter.paneIdForLane("owned")!;
-    await dispatch.takeoverLane(handle.runId, "owned");
+    await dispatch.takeoverLane(handle.runId, "owned", null);
     await adapter.waitForOutput({ id: ownedPaneId }, "ignored", 1);
     const waitsBeforeResume = adapter.waitedPaneIds.length;
 
@@ -950,10 +951,10 @@ describe("WorkflowRuntime resume", () => {
     });
     await dispatch.confirmLaneStarted(handle.runId, "owned");
     const ownedPaneId = adapter.paneIdForLane("owned")!;
-    await dispatch.takeoverLane(handle.runId, "owned");
+    await dispatch.takeoverLane(handle.runId, "owned", null);
     await new WorkflowRuntime(deps()).resumeWorkflow(handle.runId, 1_000);
 
-    await new WorkflowRuntime(deps()).releaseLane(handle.runId, "owned");
+    await new WorkflowRuntime(deps()).releaseLane(handle.runId, "owned", null);
     const status = await new WorkflowRuntime(deps()).resumeWorkflow(
       handle.runId,
       1_000,
@@ -1003,9 +1004,9 @@ describe("WorkflowRuntime resume", () => {
     });
     const leaseAcquisitions = ledger.leaseAcquisitions;
 
-    await runtime.takeoverLane(handle.runId, "owned");
-    await runtime.takeoverLane(handle.runId, "owned");
-    await runtime.releaseLane(handle.runId, "managed");
+    await runtime.takeoverLane(handle.runId, "owned", null);
+    await runtime.takeoverLane(handle.runId, "owned", null);
+    await runtime.releaseLane(handle.runId, "managed", null);
 
     expect(
       ledger.committedTypes.filter((type) => type === "lane_takeover"),
@@ -1023,14 +1024,57 @@ describe("WorkflowRuntime resume", () => {
     // And ownership stays LEASE-FREE: a human takes a lane over exactly when a
     // controller is running and holding the run's lease.
     expect(ledger.leaseAcquisitions).toBe(leaseAcquisitions);
-    await expect(runtime.takeoverLane("missing", "owned")).rejects.toThrow(
+    await expect(runtime.takeoverLane("missing", "owned", null)).rejects.toThrow(
       'run not found: "missing"',
     );
     await expect(
-      runtime.takeoverLane(handle.runId, "unknown"),
+      runtime.takeoverLane(handle.runId, "unknown", null),
     ).rejects.toThrow(
       `unknown laneId "unknown" in run "${handle.runId}"`,
     );
+  });
+
+  test("a headless lane keeps the empty shape and never calls an ownership provider", async () => {
+    const cwd = await tempWork();
+    const clock = createClock(9_000);
+    const adapter = new FakeHerdrAdapter({
+      clock,
+      lanes: [{ laneId: "owned", exitCode: 0 }],
+    });
+    const ledger = new ObservedLedger();
+    const runtime = new WorkflowRuntime({
+      adapter,
+      ledger,
+      clock: clock.now,
+      idgen: () => "run-headless-ownership",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+    const handle = await runtime.startWorkflow({
+      workflow: "cross-review",
+      workspace: "w1",
+      cwd,
+      lanes: [{ laneId: "owned", steps: 1 }],
+    });
+    let calls = 0;
+    // A headless lane has no attempt to name. A provider offered for one is
+    // never invoked, nothing is observed, and the event keeps the shape it has
+    // carried since before any payload existed.
+    const provider: LaneOwnershipProvider = async () => {
+      calls += 1;
+      throw new Error("a headless lane must not derive an ownership payload");
+    };
+
+    await runtime.takeoverLane(handle.runId, "owned", provider);
+    await runtime.releaseLane(handle.runId, "owned", provider);
+
+    expect(calls).toBe(0);
+    const ownership = ledger.committedEvents.filter(
+      (event) =>
+        event.type === "lane_takeover" || event.type === "lane_release",
+    );
+    expect(ownership).toHaveLength(2);
+    for (const event of ownership) expect(event.data).toEqual({});
   });
 
   test("reconciles the unobserved window, reattaches live lanes, and finishes runtime outcomes", async () => {

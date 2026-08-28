@@ -29,6 +29,7 @@ import {
 } from "../review/verification.ts";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { ownershipEvent } from "./events.ts";
 import type {
   IssueRef,
   LaneOwnershipData,
@@ -236,6 +237,20 @@ export class PartialDispatchError extends Error {
     this.name = "PartialDispatchError";
   }
 }
+
+/**
+ * How an INTERACTIVE lane's ownership payload is produced.
+ *
+ * A capability, not a decision: the caller assembles one, and the runtime — the
+ * layer that holds the lane — decides whether the lane has a payload to record
+ * at all. It is handed the RunView the runtime already loaded, so deriving the
+ * payload costs no second read, and it must not take the controller lease: a
+ * human takes a lane over exactly while a controller is holding it.
+ */
+export type LaneOwnershipProvider = (
+  run: RunView,
+  laneId: string,
+) => Promise<LaneOwnershipData>;
 
 export class WorkflowRuntime {
   protected readonly runs = new Map<string, RunView>();
@@ -764,55 +779,81 @@ export class WorkflowRuntime {
    * requiring that lease here would make the command fail exactly when it is
    * needed. It loads, decides, and appends conditionally.
    *
-   * `ownership` is how an INTERACTIVE lane records what changed hands — which
-   * attempt, on which pane, through which target, and what the agent surface
-   * said at that moment. A headless lane has no such attempt, so it passes
-   * `null` and the event stays the empty shape it has always had. The branch is
-   * explicit: nothing gets `{}` by defaulting into it.
+   * `ownership` is a CAPABILITY, never a decision: an INTERACTIVE lane records
+   * which attempt, on which pane, through which target, and what the agent
+   * surface said at that moment, and this method calls the provider to derive
+   * it. A headless lane has no such attempt and keeps the empty shape it has
+   * always had, whatever the caller supplied. The argument is required, so a
+   * caller states its intent and nothing gets `{}` by defaulting into it.
    */
   async takeoverLane(
     runId: string,
     laneId: string,
-    ownership: LaneOwnershipData | null = null,
+    ownership: LaneOwnershipProvider | null,
   ): Promise<WorkflowStatus> {
-    const loaded = await this.deps.ledger.load(runId);
-    if (!loaded) throw new Error(`run not found: "${runId}"`);
-    this.registerReducedView(loaded);
-    await this.commitEventConditionally(runId, (current) => {
-      if (!current) throw new Error(`unknown runId "${runId}"`);
-      const lane = this.getLane(current, laneId);
-      if (lane.controlMode === "human_owned") return null;
-      return {
-        type: "lane_takeover",
-        actor: "human",
-        laneId,
-        data: ownership ?? {},
-      };
-    });
-    return this.workflowStatus(this.getRun(runId));
+    return this.changeOwnership(runId, laneId, "lane_takeover", ownership);
   }
 
   /** The other half of `takeoverLane`; same lease-free contract, same shapes. */
   async releaseLane(
     runId: string,
     laneId: string,
-    ownership: LaneOwnershipData | null = null,
+    ownership: LaneOwnershipProvider | null,
+  ): Promise<WorkflowStatus> {
+    return this.changeOwnership(runId, laneId, "lane_release", ownership);
+  }
+
+  private async changeOwnership(
+    runId: string,
+    laneId: string,
+    type: "lane_takeover" | "lane_release",
+    ownership: LaneOwnershipProvider | null,
   ): Promise<WorkflowStatus> {
     const loaded = await this.deps.ledger.load(runId);
     if (!loaded) throw new Error(`run not found: "${runId}"`);
     this.registerReducedView(loaded);
+    // Decided BEFORE the conditional commit, and from the run just loaded: a
+    // lane's kind is fixed at registration, and deriving the payload here keeps
+    // the single observation out of a block that may retry.
+    const event = await this.ownershipEventFor(loaded, laneId, type, ownership);
+    const held = type === "lane_takeover" ? "human_owned" : "managed";
     await this.commitEventConditionally(runId, (current) => {
       if (!current) throw new Error(`unknown runId "${runId}"`);
-      const lane = this.getLane(current, laneId);
-      if (lane.controlMode === "managed") return null;
-      return {
-        type: "lane_release",
-        actor: "human",
-        laneId,
-        data: ownership ?? {},
-      };
+      if (this.getLane(current, laneId).controlMode === held) return null;
+      return event;
     });
     return this.workflowStatus(this.getRun(runId));
+  }
+
+  /**
+   * What a lane's ownership change records, decided HERE — the layer that
+   * already holds the lane and makes every other lane-kind decision.
+   *
+   * An INTERACTIVE lane must produce its full payload. No provider means the
+   * runtime refuses: recording an empty event would claim nothing identifiable
+   * changed hands, which is exactly the shape the payload replaced. The check
+   * is a runtime one because the type alone cannot stop a JavaScript caller.
+   *
+   * A HEADLESS lane has no attempt to name, so it keeps the empty shape it has
+   * always had. A provider offered for one is never invoked and nothing is
+   * observed — the lane kind decides, not the caller.
+   */
+  private async ownershipEventFor(
+    run: RunView,
+    laneId: string,
+    type: "lane_takeover" | "lane_release",
+    ownership: LaneOwnershipProvider | null,
+  ): Promise<NewRunEvent> {
+    const lane = this.getLane(run, laneId);
+    if (lane.kind !== "interactive") {
+      return { type, actor: "human", laneId, data: {} };
+    }
+    if (typeof ownership !== "function") {
+      throw new Error(
+        `lane "${laneId}" in run "${run.runId}" is interactive and requires an ownership provider: refusing to record ${type} with an empty payload`,
+      );
+    }
+    return ownershipEvent(type, laneId, await ownership(run, laneId));
   }
 
   async recordOwnerDecision(

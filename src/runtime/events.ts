@@ -709,3 +709,26 @@ export type NewRunEvent = RunEvent extends infer E
       >
     : never
   : never;
+
+/**
+ * Builds an ownership event that CARRIES a payload — the shape a takeover or a
+ * release has whenever there is an attempt to name.
+ *
+ * `data` is the complete payload type, never the ledger's compatibility union:
+ * a producer that tried to build one from `{}` here would not typecheck. Both
+ * producers of a carried payload — the interactive control plane and
+ * `WorkflowRuntime`'s interactive branch — go through this function, so the
+ * payload cannot regress in one of them alone.
+ *
+ * The empty legacy shape has a single home: the HEADLESS branch of
+ * `WorkflowRuntime`'s ownership commit, where there is no attempt to describe.
+ * The union in `EventData` beyond that exists so ledgers written before these
+ * payloads did still replay.
+ */
+export function ownershipEvent(
+  type: "lane_takeover" | "lane_release",
+  laneId: string,
+  data: LaneOwnershipData,
+): NewRunEvent {
+  return { type, actor: "human", laneId, data };
+}

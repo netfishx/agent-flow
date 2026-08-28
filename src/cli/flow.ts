@@ -18,14 +18,13 @@ import {
   unresolvedControls,
 } from "../interactive/control-plane.ts";
 import { GitWriteLaneIsolation } from "../interactive/isolation.ts";
-import type {
-  IssueRef,
-  LaneOwnershipData,
-  OwnerDecision,
-} from "../runtime/events.ts";
+import type { IssueRef, OwnerDecision } from "../runtime/events.ts";
 import type { Ledger } from "../runtime/ledger.ts";
 import { projectRunState, type RunView } from "../runtime/reducer.ts";
-import { WorkflowRuntime } from "../runtime/runtime.ts";
+import {
+  WorkflowRuntime,
+  type LaneOwnershipProvider,
+} from "../runtime/runtime.ts";
 import type { RuntimeDeps } from "../runtime/types.ts";
 import { stat } from "node:fs/promises";
 
@@ -652,24 +651,23 @@ async function runInteractiveCli(
 }
 
 /**
- * The ownership payload for `flow takeover` / `flow release`, or null when the
- * lane is not interactive. Read-only: it loads the run and makes one
- * best-effort agent observation, and it never takes the controller lease.
+ * The ownership capability `flow takeover` / `flow release` hand to the
+ * runtime. The CLI does not decide whether it is needed — the runtime holds the
+ * lane and decides by its kind — so this builds a controller only when the
+ * runtime actually asks, and derives the payload from the run the runtime has
+ * already loaded. Read-only: one best-effort agent observation, no commit, and
+ * never the controller lease.
  */
-async function interactiveOwnership(
+function ownershipCapability(
   ledger: Ledger,
   ledgerRoot: string,
-  runId: string,
-  laneId: string,
   options: FlowCliOptions,
-): Promise<LaneOwnershipData | null> {
-  const run = await ledger.load(runId);
-  const lane = run?.lanes[laneId];
-  if (!lane || lane.kind !== "interactive") return null;
-  const controller =
-    options.interactiveFactory?.(ledger) ??
-    realInteractiveController(ledger, ledgerRoot);
-  return controller.ownershipFor(runId, laneId);
+): LaneOwnershipProvider {
+  return (run, laneId) =>
+    (
+      options.interactiveFactory?.(ledger) ??
+      realInteractiveController(ledger, ledgerRoot)
+    ).ownershipFrom(run, laneId);
 }
 
 export async function runFlowCli(
@@ -740,16 +738,11 @@ export async function runFlowCli(
     } else if (command === "takeover" || command === "release") {
       const runtime = runtimeFor(null);
       // An interactive lane records WHAT changed hands; a headless lane has no
-      // attempt to name and keeps the empty shape. The payload is built without
-      // the controller lease, because a human takes a lane over exactly when a
-      // controller is running and holding it.
-      const ownership = await interactiveOwnership(
-        ledger,
-        root,
-        runId!,
-        laneId!,
-        options,
-      );
+      // attempt to name and keeps the empty shape. The runtime decides which,
+      // because it is the layer that holds the lane. The payload is derived
+      // without the controller lease, because a human takes a lane over exactly
+      // when a controller is running and holding it.
+      const ownership = ownershipCapability(ledger, root, options);
       if (command === "takeover") {
         await runtime.takeoverLane(runId!, laneId!, ownership);
       } else {

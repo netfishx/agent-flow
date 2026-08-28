@@ -10,6 +10,11 @@ import { FakeHerdrAgentControl } from "../src/herdr/fake-agent-control.ts";
 import type { AgentInfoView } from "../src/herdr/agent-json.ts";
 import { InMemoryLedger, type Ledger } from "../src/runtime/ledger.ts";
 import type { RunEvent } from "../src/runtime/events.ts";
+import type { RunView } from "../src/runtime/reducer.ts";
+import {
+  WorkflowRuntime,
+  type LaneOwnershipProvider,
+} from "../src/runtime/runtime.ts";
 import { FsLedger } from "../src/runtime/fs-ledger.ts";
 import { attemptDisposition } from "../src/interactive/attempts.ts";
 import {
@@ -1436,5 +1441,141 @@ describe("SP3 an ended attempt cannot publish a new advisory source", () => {
     // operator drops a source the terminal path could not reach.
     await h.controller.releaseAdvisoryState(runId, laneId);
     expect(h.control.releaseCalls).toHaveLength(afterAbort + 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Revision 16 — R3-1. `WorkflowRuntime.takeoverLane` / `releaseLane` are the
+// entry point `flow takeover` actually goes through, and they used to trust a
+// payload the caller had already computed: a two-argument call on an
+// INTERACTIVE lane committed `data: {}`, the very shape the payload exists to
+// replace. The decision now lives in the layer that already holds `lane.kind`.
+// ---------------------------------------------------------------------------
+
+/** Records commits, reads, and lease acquisitions, so a second one cannot hide. */
+function observing(base: Ledger) {
+  const committed: RunEvent[] = [];
+  let loads = 0;
+  let leases = 0;
+  const ledger: Ledger = {
+    commit: async (event) => {
+      committed.push(event);
+      await base.commit(event);
+    },
+    load: (runId) => {
+      loads += 1;
+      return base.load(runId);
+    },
+    list: () => base.list(),
+    acquireLease: (runId, controller) => {
+      leases += 1;
+      return base.acquireLease(runId, controller);
+    },
+  };
+  return { ledger, committed, loads: () => loads, leases: () => leases };
+}
+
+function runtimeOver(h: ReturnType<typeof harness>): WorkflowRuntime {
+  return new WorkflowRuntime({
+    adapter: h.adapter,
+    ledger: h.ledger,
+    clock: () => 5_000,
+    idgen: () => "unused-run-id",
+    readResultFile: h.adapter.readResultFile,
+    sleep: async () => {},
+  });
+}
+
+describe("R3-1 the runtime entry point decides ownership by lane kind", () => {
+  test("a two-argument call on an interactive lane is refused, not emptied", async () => {
+    const observed = observing(new InMemoryLedger());
+    const h = harness({ ledger: observed.ledger });
+    const { runId, laneId } = await opened(h);
+    const runtime = runtimeOver(h);
+    observed.committed.length = 0;
+    const reads = h.control.getCalls.length;
+    // A JavaScript caller — or any `any` — reaches the two-argument form that
+    // the type system alone cannot stop. The runtime has to refuse it itself.
+    const untyped = runtime as unknown as {
+      takeoverLane(runId: string, laneId: string): Promise<unknown>;
+      releaseLane(runId: string, laneId: string): Promise<unknown>;
+    };
+
+    // The third argument is REQUIRED: a default would let a caller omit it and
+    // still be served, which is how the empty payload got in.
+    expect(runtime.takeoverLane).toHaveLength(3);
+    expect(runtime.releaseLane).toHaveLength(3);
+    await expect(untyped.takeoverLane(runId, laneId)).rejects.toThrow(
+      /requires an ownership provider/,
+    );
+    await expect(untyped.releaseLane(runId, laneId)).rejects.toThrow(
+      /requires an ownership provider/,
+    );
+
+    // Nothing was written and nothing was asked of the agent surface: refusing
+    // is the whole behaviour, and an empty event is not a lesser version of it.
+    expect(observed.committed).toHaveLength(0);
+    expect(h.control.getCalls).toHaveLength(reads);
+    const [attempt] = await h.controller.attempts(runId, laneId);
+    expect(attempt!.controlMode).toBe("managed");
+  });
+
+  test("an explicit null provider on an interactive lane is refused too", async () => {
+    const observed = observing(new InMemoryLedger());
+    const h = harness({ ledger: observed.ledger });
+    const { runId, laneId } = await opened(h);
+    const runtime = runtimeOver(h);
+    observed.committed.length = 0;
+
+    await expect(runtime.takeoverLane(runId, laneId, null)).rejects.toThrow(
+      /requires an ownership provider/,
+    );
+    await expect(runtime.releaseLane(runId, laneId, null)).rejects.toThrow(
+      /requires an ownership provider/,
+    );
+    expect(observed.committed).toHaveLength(0);
+  });
+
+  test("the provider runs once, on the run the runtime already loaded", async () => {
+    const observed = observing(new InMemoryLedger());
+    const h = harness({ ledger: observed.ledger });
+    const { runId, laneId, attempt } = await opened(h);
+    const runtime = runtimeOver(h);
+    observed.committed.length = 0;
+    const reads = h.control.getCalls.length;
+    const leases = observed.leases();
+    const seen: { run: RunView; laneId: string }[] = [];
+    const loadsInsideProvider: number[] = [];
+    const provider: LaneOwnershipProvider = async (run, providedLaneId) => {
+      seen.push({ run, laneId: providedLaneId });
+      const before = observed.loads();
+      const data = await h.controller.ownershipFrom(run, providedLaneId);
+      loadsInsideProvider.push(observed.loads() - before);
+      return data;
+    };
+    const loadsBefore = observed.loads();
+
+    await runtime.takeoverLane(runId, laneId, provider);
+
+    // One read decides the lane kind AND feeds the provider: the run the
+    // runtime holds is the run the payload is derived from, so the old
+    // CLI -> controller -> runtime chain of loads collapses to one.
+    expect(observed.loads() - loadsBefore).toBe(1);
+    expect(loadsInsideProvider).toEqual([0]);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.run.runId).toBe(runId);
+    expect(seen[0]!.laneId).toBe(laneId);
+    // Exactly one observation, exactly one event, and never the lease: a human
+    // takes a lane over precisely while a controller is holding it.
+    expect(h.control.getCalls).toHaveLength(reads + 1);
+    expect(observed.leases()).toBe(leases);
+    expect(observed.committed).toHaveLength(1);
+    expect(observed.committed[0]!.data).toEqual({
+      attemptId: attempt.attemptId,
+      paneId: attempt.paneId,
+      target: attempt.agentName,
+      method: "ledger-control-mode",
+      observedStatus: expect.any(String),
+    });
   });
 });
