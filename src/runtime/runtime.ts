@@ -31,6 +31,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type {
   IssueRef,
+  LaneOwnershipData,
   NewRunEvent,
   OwnerDecision,
   RunEvent,
@@ -755,9 +756,24 @@ export class WorkflowRuntime {
   // Ownership flips intentionally commit lease-free so a human can take control
   // from a live managed controller. Use takeover -> controller loss -> resume;
   // concurrent controller commits may race ledger state (issue #20).
+  /**
+   * Hand a lane's control channel to a human, or take it back.
+   *
+   * Deliberately LEASE-FREE, and it stays that way: a human takes a lane over
+   * precisely when a controller is running and holding the run's lease, so
+   * requiring that lease here would make the command fail exactly when it is
+   * needed. It loads, decides, and appends conditionally.
+   *
+   * `ownership` is how an INTERACTIVE lane records what changed hands — which
+   * attempt, on which pane, through which target, and what the agent surface
+   * said at that moment. A headless lane has no such attempt, so it passes
+   * `null` and the event stays the empty shape it has always had. The branch is
+   * explicit: nothing gets `{}` by defaulting into it.
+   */
   async takeoverLane(
     runId: string,
     laneId: string,
+    ownership: LaneOwnershipData | null = null,
   ): Promise<WorkflowStatus> {
     const loaded = await this.deps.ledger.load(runId);
     if (!loaded) throw new Error(`run not found: "${runId}"`);
@@ -770,15 +786,17 @@ export class WorkflowRuntime {
         type: "lane_takeover",
         actor: "human",
         laneId,
-        data: {},
+        data: ownership ?? {},
       };
     });
     return this.workflowStatus(this.getRun(runId));
   }
 
+  /** The other half of `takeoverLane`; same lease-free contract, same shapes. */
   async releaseLane(
     runId: string,
     laneId: string,
+    ownership: LaneOwnershipData | null = null,
   ): Promise<WorkflowStatus> {
     const loaded = await this.deps.ledger.load(runId);
     if (!loaded) throw new Error(`run not found: "${runId}"`);
@@ -791,7 +809,7 @@ export class WorkflowRuntime {
         type: "lane_release",
         actor: "human",
         laneId,
-        data: {},
+        data: ownership ?? {},
       };
     });
     return this.workflowStatus(this.getRun(runId));

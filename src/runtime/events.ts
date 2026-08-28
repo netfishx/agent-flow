@@ -301,9 +301,35 @@ export interface InteractiveAttemptReconciledData {
   readonly detail: string | null;
 }
 
-export interface InteractiveRetryAuthorizedData {
+/**
+ * The shape a retry authorization carried before it recorded its own evidence.
+ * Kept so old ledgers replay unchanged; no new producer writes it.
+ */
+export interface LegacyRetryAuthorizedData {
   /** The attempt being retried past; the new attempt records it as parent. */
   readonly parentAttemptId: string;
+  readonly note: string;
+}
+
+/**
+ * A human authorizing exactly one further attempt past a named parent, recorded
+ * so the authorization is readable from the ledger alone rather than by
+ * inferring it from the attempt that followed.
+ *
+ * `method` names the mechanism, as it does for a takeover: an authorization is
+ * a ledger fact and nothing else — no prompt, no keys, no signal, no restart,
+ * no rebind reaches the parent's session. `observedStatus` is a single
+ * best-effort read of that session at the moment of authorization; `null` means
+ * the read did not answer, which is an absence of observation and never a
+ * reason to refuse a human's decision. `paneId` and `target` describe the
+ * PARENT attempt, and are null only when it never bound an agent.
+ */
+export interface InteractiveRetryAuthorizedData {
+  readonly parentAttemptId: string;
+  readonly paneId: string | null;
+  readonly target: string | null;
+  readonly method: "ledger-retry-authorization";
+  readonly observedStatus: AdvisoryAgentStatus | null;
   readonly note: string;
 }
 
@@ -574,7 +600,13 @@ export interface RunEventDataByType {
   readonly interactive_attempt_bound: InteractiveAttemptBoundData;
   readonly interactive_attempt_ended: InteractiveAttemptEndedData;
   readonly interactive_attempt_reconciled: InteractiveAttemptReconciledData;
-  readonly interactive_retry_authorized: InteractiveRetryAuthorizedData;
+  // The legacy arm is the shape retries carried before Revision 15. It stays in
+  // the union so old ledgers replay unchanged — no migration, no schema bump —
+  // and the interactive producer is held to the complete shape by the seam it
+  // must commit through, not by this union.
+  readonly interactive_retry_authorized:
+    | LegacyRetryAuthorizedData
+    | InteractiveRetryAuthorizedData;
   readonly interactive_runner_evidence: InteractiveRunnerEvidenceData;
   readonly lane_steer_submitted: LaneSteerSubmittedData;
   readonly lane_steer_observed: LaneSteerObservedData;

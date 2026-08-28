@@ -1101,34 +1101,44 @@ describe("SP3 a lane end releases the advisory source it published", () => {
     expect(h.control.releaseCalls).toHaveLength(0);
   });
 
-  test("releasing a source Herdr has no agent for is a success, not a failure", async () => {
-    // Exercises the real port, where the classification lives. A stub binary
-    // stands in for herdr so the documented failure shape is reachable without
-    // a live server, a real agent, or a model call.
+  test("releasing a source for an absent agent succeeds, and is idempotent", async () => {
+    // Models what Herdr 0.8.2 was MEASURED to do for this verb on a real pane
+    // with no such agent: exit 0, empty stdout, empty stderr — twice.
+    // (Evidence: agent-flow-af49r15-evidence/04-release-agent-probe.txt.)
     const stub = join(root, "herdr-absent");
+    const calls = join(root, "herdr-absent.calls");
     await writeFile(
       stub,
-      "#!/bin/sh\n" +
-        'printf \'{"error":{"code":"agent_not_found","message":"agent target x not found"}}\' 1>&2\n' +
-        "exit 1\n",
+      "#!/bin/sh\n" + `printf '%s\\n' "$*" >> ${calls}\n` + "exit 0\n",
       "utf8",
     );
     await chmod(stub, 0o755);
     const control = new RealHerdrAgentControl({ binary: stub });
-    // Resolves: the source is already off an agent Herdr does not have.
-    await control.releaseAgentState({
+    const target = {
       paneId: "w1:p2",
       source: "agent-flow-run",
       agent: "f-lane-1",
-    });
+    };
+    await expect(control.releaseAgentState(target)).resolves.toBeUndefined();
+    await expect(control.releaseAgentState(target)).resolves.toBeUndefined();
+    // Proof the stub really ran, twice, with the pane id leading the argv.
+    const recorded = (await Bun.file(calls).text()).trim().split("\n");
+    expect(recorded).toHaveLength(2);
+    for (const line of recorded) {
+      expect(line.startsWith("pane release-agent w1:p2 ")).toBe(true);
+      expect(line).toContain("--source agent-flow-run");
+      expect(line).toContain("--agent f-lane-1");
+    }
   });
 
-  test("any other release failure is raised, never read as a source dropped", async () => {
+  test("a pane that does not resolve is raised, never read as a source dropped", async () => {
+    // The other MEASURED answer: a nonexistent pane returns pane_not_found on
+    // exit 1, and that is a different fact from an absent agent.
     const stub = join(root, "herdr-broken");
     await writeFile(
       stub,
       "#!/bin/sh\n" +
-        'printf \'{"error":{"code":"io_error","message":"broken pipe"}}\' 1>&2\n' +
+        'printf \'{"error":{"code":"pane_not_found","message":"pane wZ:p999 not found"}}\' 1>&2\n' +
         "exit 1\n",
       "utf8",
     );
@@ -1136,11 +1146,11 @@ describe("SP3 a lane end releases the advisory source it published", () => {
     const control = new RealHerdrAgentControl({ binary: stub });
     await expect(
       control.releaseAgentState({
-        paneId: "w1:p2",
+        paneId: "wZ:p999",
         source: "agent-flow-run",
         agent: "f-lane-1",
       }),
-    ).rejects.toThrow("io_error");
+    ).rejects.toThrow("pane_not_found");
   });
 
   test("a reoccupied pane is never released to its new occupant", async () => {
@@ -1158,5 +1168,273 @@ describe("SP3 a lane end releases the advisory source it published", () => {
     const [ended] = await h.controller.attempts(runId, laneId);
     expect(ended!.endReason).toBe("lost");
     expect(h.control.releaseCalls).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Revision 15 — R2-S4 (retry evidence), SP3 (post-end publication), R2-S6.
+// ---------------------------------------------------------------------------
+
+/** Seeds a SECOND interactive lane, with one bound attempt, onto the same run. */
+async function seedSecondLane(
+  ledger: Ledger,
+  runId: string,
+  laneId: string,
+  attemptId: string,
+): Promise<void> {
+  const base = (await ledger.load(runId))!;
+  let sequence = base.lastAppliedSequence;
+  const commit = async (
+    type: RunEvent["type"],
+    actor: string,
+    data: unknown,
+  ): Promise<void> => {
+    sequence += 1;
+    await ledger.commit({
+      schemaVersion: 1,
+      eventId: `${runId}#${sequence}`,
+      runId,
+      sequence,
+      at: 7_000 + sequence,
+      controllerEpoch: 0,
+      type,
+      actor,
+      laneId,
+      data,
+    } as RunEvent);
+  };
+  await commit("lane_registered", "runtime", {
+    kind: "interactive",
+    laneId,
+    paneId: "wf:p80",
+    agentKind: "claude",
+    model: "sonnet",
+    effort: "high",
+    worktreePath: "/tmp/repo-wt",
+    repoRoot: "/tmp/repo",
+    artifactRoot: "/tmp/artifacts",
+  });
+  await commit("interactive_attempt_started", "runtime", {
+    attemptId,
+    ordinal: 1,
+    parentAttemptId: null,
+    agentKind: "claude",
+    model: "sonnet",
+    effort: "high",
+    paneId: "wf:p81",
+    expectedAgentName: "f-other-1-aaaaaaaaaaaaaaaa",
+    worktreePath: "/tmp/repo-wt",
+    briefFile: "/tmp/b.md",
+    checkpointFile: "/tmp/c.md",
+    resultPointer: "/tmp/r.md",
+    authorization: { actor: "human", note: "seeded" },
+  });
+}
+
+describe("R2-S4 a retry authorization is readable from the ledger alone", () => {
+  test("it records parent, pane, target, method, observed state, and note", async () => {
+    const base = new InMemoryLedger();
+    const { ledger, committed } = recording(base);
+    const h = harness({ ledger });
+    const { runId, laneId, attempt } = await opened(h);
+    committed.length = 0;
+
+    await h.controller.authorizeRetry(
+      runId,
+      laneId,
+      attempt.attemptId,
+      "owner authorizes exactly one retry",
+    );
+
+    const event = committed.find(
+      (candidate) => candidate.type === "interactive_retry_authorized",
+    );
+    expect(event).toBeDefined();
+    expect(event!.actor).toBe("human");
+    expect(event!.laneId).toBe(laneId);
+    const data = event!.data as unknown as Record<string, unknown>;
+    expect(data.parentAttemptId).toBe(attempt.attemptId);
+    expect(data.paneId).toBe(attempt.paneId);
+    expect(data.target).toBe(attempt.agentName!);
+    expect(data.method).toBe("ledger-retry-authorization");
+    expect(data.note).toBe("owner authorizes exactly one retry");
+    // A live read at the moment of authorization, not a guess.
+    expect(data.observedStatus).not.toBeUndefined();
+    expect(data.observedStatus).not.toBeNull();
+  });
+
+  test("an unreadable agent records null and still authorizes", async () => {
+    class UnreadableAgent extends FakeHerdrAgentControl {
+      override async getAgent(target: string): Promise<AgentInfoView | null> {
+        this.getCalls.push(target);
+        throw new Error("herdr agent get failed (exit 1): io_error");
+      }
+    }
+    const base = new InMemoryLedger();
+    const { ledger, committed } = recording(base);
+    const h = harness({
+      ledger,
+      control: (adapter) => new UnreadableAgent({ panes: adapter }),
+    });
+    const { runId, laneId, attempt } = await opened(h);
+    committed.length = 0;
+
+    await h.controller.authorizeRetry(runId, laneId, attempt.attemptId, "note");
+    const event = committed.find(
+      (c) => c.type === "interactive_retry_authorized",
+    )!;
+    expect(
+      (event.data as unknown as Record<string, unknown>).observedStatus,
+    ).toBeNull();
+    // The authorization is a human act; a failed read may not veto it.
+    expect(pendingRetries(await h.controller.inspect(runId), attempt.attemptId)).toBe(1);
+  });
+
+  test("an unknown parent is refused before any event or Herdr read", async () => {
+    const base = new InMemoryLedger();
+    const { ledger, committed } = recording(base);
+    const h = harness({ ledger });
+    const { runId, laneId } = await opened(h);
+    const reads = h.control.getCalls.length;
+    committed.length = 0;
+
+    await expect(
+      h.controller.authorizeRetry(runId, laneId, "att-does-not-exist", "note"),
+    ).rejects.toThrow("att-does-not-exist");
+
+    expect(committed).toHaveLength(0);
+    expect(h.control.getCalls).toHaveLength(reads);
+  });
+
+  test("a parent from another lane is refused before any event or Herdr read", async () => {
+    const base = new InMemoryLedger();
+    const { ledger, committed } = recording(base);
+    const h = harness({ ledger });
+    const { runId, laneId, attempt } = await opened(h);
+    await seedSecondLane(h.ledger, runId, "other-1", "att-other-1");
+    const reads = h.control.getCalls.length;
+    committed.length = 0;
+
+    // The attempt exists, but it belongs to a different lane.
+    await expect(
+      h.controller.authorizeRetry(runId, laneId, "att-other-1", "note"),
+    ).rejects.toThrow(laneId);
+    expect(committed).toHaveLength(0);
+    expect(h.control.getCalls).toHaveLength(reads);
+
+    // And the reverse direction is refused too.
+    await expect(
+      h.controller.authorizeRetry(runId, "other-1", attempt.attemptId, "note"),
+    ).rejects.toThrow("other-1");
+    expect(committed).toHaveLength(0);
+  });
+
+  test("authorizing sends no prompt, no key, and no signal", async () => {
+    const h = harness();
+    const { runId, laneId, attempt } = await opened(h);
+    const prompts = h.control.promptCalls.length;
+    const keys = h.control.sendKeysCalls.length;
+    const signals = h.adapter.interruptedPaneIds.length;
+
+    await h.controller.authorizeRetry(runId, laneId, attempt.attemptId, "note");
+
+    expect(h.control.promptCalls).toHaveLength(prompts);
+    expect(h.control.sendKeysCalls).toHaveLength(keys);
+    expect(h.adapter.interruptedPaneIds).toHaveLength(signals);
+  });
+
+  test("a historical retry payload still replays and still buys one attempt", async () => {
+    const h = harness();
+    const { runId, laneId, attempt } = await opened(h);
+    const before = (await h.ledger.load(runId))!;
+    await h.ledger.commit({
+      schemaVersion: 1,
+      eventId: `${runId}#${before.lastAppliedSequence + 1}`,
+      runId,
+      sequence: before.lastAppliedSequence + 1,
+      at: 9_000,
+      controllerEpoch: 0,
+      type: "interactive_retry_authorized",
+      actor: "human",
+      laneId,
+      // The shape every retry authorization carried before Revision 15.
+      data: { parentAttemptId: attempt.attemptId, note: "legacy" },
+    } as RunEvent);
+
+    const run = await h.controller.inspect(runId);
+    expect(pendingRetries(run, attempt.attemptId)).toBe(1);
+    const child = await h.controller.startAttempt(runId, laneId, {
+      ...START,
+      parentAttemptId: attempt.attemptId,
+    });
+    expect(child.started).toBe(true);
+  });
+});
+
+describe("SP3 an ended attempt cannot publish a new advisory source", () => {
+  test("an aborted attempt is refused before reportAgentState", async () => {
+    const base = new InMemoryLedger();
+    const { ledger, committed } = recording(base);
+    const h = harness({ ledger });
+    const { runId, laneId } = await opened(h);
+    await h.controller.abortSession(runId, laneId);
+    const reports = h.control.reportCalls.length;
+    committed.length = 0;
+
+    await expect(
+      h.controller.publishAdvisoryState(runId, laneId, "working", "late"),
+    ).rejects.toThrow(AttemptNotControllableError);
+
+    // Refused before the Herdr call, and nothing was appended.
+    expect(h.control.reportCalls).toHaveLength(reports);
+    expect(committed.map((event) => event.type)).not.toContain(
+      "lane_advisory_state_observed",
+    );
+  });
+
+  test("a lost attempt is refused too", async () => {
+    const h = harness();
+    const { runId, laneId, attempt } = await opened(h);
+    h.control.killAgent(attempt.agentName!);
+    const gone = new FakeHerdrAdapter({ missingPaneIds: [attempt.paneId] });
+    const recovered = harness({
+      adapter: gone,
+      control: () => h.control,
+      ledger: h.ledger,
+    });
+    await recovered.controller.reconcileAttempt(runId, laneId, attempt.attemptId);
+    const reports = h.control.reportCalls.length;
+
+    await expect(
+      recovered.controller.publishAdvisoryState(runId, laneId, "working", "late"),
+    ).rejects.toThrow(AttemptNotControllableError);
+    expect(h.control.reportCalls).toHaveLength(reports);
+  });
+
+  test("a live attempt still publishes, and takeover does not block it", async () => {
+    const h = harness();
+    const { runId, laneId } = await opened(h);
+    await h.controller.publishAdvisoryState(runId, laneId, "working", "live");
+    expect(h.control.reportCalls).toHaveLength(1);
+
+    // Advisory publication is not a control: a human holding the lane does not
+    // stop the runtime describing what it sees.
+    await h.controller.takeover(runId, laneId);
+    await h.controller.publishAdvisoryState(runId, laneId, "blocked", "held");
+    expect(h.control.reportCalls).toHaveLength(2);
+  });
+
+  test("explicit release still works after the attempt ended", async () => {
+    const h = harness();
+    const { runId, laneId } = await opened(h);
+    await h.controller.publishAdvisoryState(runId, laneId, "working", "live");
+    await h.controller.abortSession(runId, laneId);
+    const afterAbort = h.control.releaseCalls.length;
+    expect(afterAbort).toBe(1);
+
+    // The explicit cleanup verb keeps working on an ended attempt: it is how an
+    // operator drops a source the terminal path could not reach.
+    await h.controller.releaseAdvisoryState(runId, laneId);
+    expect(h.control.releaseCalls).toHaveLength(afterAbort + 1);
   });
 });

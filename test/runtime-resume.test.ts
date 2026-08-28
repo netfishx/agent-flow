@@ -1013,6 +1013,15 @@ describe("WorkflowRuntime resume", () => {
     expect(
       ledger.committedTypes.filter((type) => type === "lane_release"),
     ).toHaveLength(0);
+    // A headless lane has no attempt to name, so its ownership event keeps the
+    // empty shape it has always had. Only an interactive lane carries a payload.
+    const owned = ledger.committedEvents.filter(
+      (event) => event.type === "lane_takeover",
+    );
+    expect(owned[0]!.data).toEqual({});
+    expect(owned[0]!.actor).toBe("human");
+    // And ownership stays LEASE-FREE: a human takes a lane over exactly when a
+    // controller is running and holding the run's lease.
     expect(ledger.leaseAcquisitions).toBe(leaseAcquisitions);
     await expect(runtime.takeoverLane("missing", "owned")).rejects.toThrow(
       'run not found: "missing"',

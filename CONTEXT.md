@@ -117,8 +117,10 @@ and design records.
   advisory state contributes.
 - **Advisory state** — Herdr's live classification of a pane, recorded with the
   source that produced it: detected by Herdr, or published by the runtime. It
-  serves wait edges, human control, and the UI, is released when the lane ends,
-  and never enters the evidence chain.
+  serves wait edges, human control, and the UI, and never enters the evidence
+  chain. A source the runtime published is released when the runtime ends the
+  session it still owns; a pane that was lost or reoccupied is no longer the
+  runtime's to touch, so it is left alone.
 - **Control mode** — who owns a lane's control channel: `managed`, where the
   runtime may issue controls, or `human_owned`, where a human has taken over
   and the runtime issues none until release.

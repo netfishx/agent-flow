@@ -70,10 +70,12 @@ export interface HerdrAgentControl {
   reportAgentState(options: PaneReportAgentOptions): Promise<void>;
 
   /**
-   * Drop a previously published advisory source. Idempotent: an agent Herdr no
-   * longer knows about is already in the state this asks for, so it resolves
-   * rather than throwing. Every other failure is a control-plane failure and is
-   * raised, because a release that broke must not read as a source dropped.
+   * Drop a previously published advisory source. Measured on Herdr 0.8.2:
+   * releasing a source for an agent it has no record of simply succeeds, and
+   * repeating the call succeeds again, so this is idempotent through Herdr's
+   * own behaviour rather than through an error this port reinterprets. A
+   * failure — a pane that does not resolve, for instance — is raised, because a
+   * release that broke must not read as a source dropped.
    */
   releaseAgentState(options: {
     readonly paneId: string;

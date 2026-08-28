@@ -16,6 +16,8 @@ import { FsLedger } from "../src/runtime/fs-ledger.ts";
 import { attemptDisposition } from "../src/interactive/attempts.ts";
 import { InteractiveLaneController } from "../src/interactive/control-plane.ts";
 import type { RunEvent } from "../src/runtime/events.ts";
+import type { AgentInfoView } from "../src/herdr/agent-json.ts";
+import { reduce } from "../src/runtime/reducer.ts";
 
 /** Accepts every worktree; isolation itself is proved against real git. */
 const permissiveIsolation = {
@@ -610,5 +612,142 @@ describe("the production entry point is reachable", () => {
         "start-attempt", "r1", "l1", "--note", "ok", "--brief-file", "/b",
       ]),
     ).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Revision 15 — R2-S2. `flow takeover` / `flow release` are the only shipped
+// operator verbs for ownership, and on an interactive lane they used to commit
+// `data: {}`. These drive the real CLI, not the controller.
+// ---------------------------------------------------------------------------
+
+/** Reads the raw events a run's durable ledger holds, in order. */
+async function eventsOf(root: string, runId: string): Promise<RunEvent[]> {
+  const text = await Bun.file(join(root, "runs", runId, "events.jsonl")).text();
+  return text
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as RunEvent);
+}
+
+function ownershipEvents(events: readonly RunEvent[]) {
+  return events.filter(
+    (event) => event.type === "lane_takeover" || event.type === "lane_release",
+  );
+}
+
+describe("R2-S2 the operator CLI records ownership in full", () => {
+  test("takeover and release each commit a complete payload", async () => {
+    const root = await tempRoot();
+    const { ledger, controller, shared, runId, laneId } = await seedLane(root);
+    const [attempt] = await controller.attempts(runId, laneId);
+    const options = {
+      environment: { FLOW_LEDGER_ROOT: root },
+      interactiveFactory: () => controllerOver(ledger, shared, root),
+    };
+
+    const out1 = new Sink();
+    const err1 = new Sink();
+    expect(
+      await runFlowCli(["takeover", runId, laneId], out1, err1, options),
+    ).toBe(0);
+    expect(err1.text).toBe("");
+
+    const out2 = new Sink();
+    const err2 = new Sink();
+    expect(
+      await runFlowCli(["release", runId, laneId], out2, err2, options),
+    ).toBe(0);
+    expect(err2.text).toBe("");
+
+    const owned = ownershipEvents(await eventsOf(root, runId));
+    // Exactly one event per command, no duplicates.
+    expect(owned).toHaveLength(2);
+    expect(owned[0]!.type).toBe("lane_takeover");
+    expect(owned[1]!.type).toBe("lane_release");
+    for (const event of owned) {
+      // Actor stays on the envelope, where every control intent carries it.
+      expect(event.actor).toBe("human");
+      expect(event.laneId).toBe(laneId);
+      const data = event.data as Record<string, unknown>;
+      expect(data.attemptId).toBe(attempt!.attemptId);
+      expect(data.paneId).toBe(attempt!.paneId);
+      expect(data.target).toBe(attempt!.agentName!);
+      expect(data.method).toBe("ledger-control-mode");
+      // Observed from the live agent surface, not guessed.
+      expect(data.observedStatus).not.toBeUndefined();
+      expect(data.observedStatus).not.toBeNull();
+    }
+  });
+
+  test("an unreadable agent records null and the command still succeeds", async () => {
+    const root = await tempRoot();
+    const { ledger, controller, shared, runId, laneId } = await seedLane(root);
+    await controller.attempts(runId, laneId);
+    class Unreadable extends FakeHerdrAgentControl {
+      override async getAgent(): Promise<AgentInfoView | null> {
+        throw new Error("herdr agent get failed (exit 1): io_error");
+      }
+    }
+    const blind: Seams = {
+      adapter: shared.adapter,
+      agentControl: new Unreadable(),
+      next: shared.next,
+    };
+    const out = new Sink();
+    const err = new Sink();
+    expect(
+      await runFlowCli(["takeover", runId, laneId], out, err, {
+        environment: { FLOW_LEDGER_ROOT: root },
+        interactiveFactory: () => controllerOver(ledger, blind, root),
+      }),
+    ).toBe(0);
+    expect(err.text).toBe("");
+
+    const [owned] = ownershipEvents(await eventsOf(root, runId));
+    const data = owned!.data as Record<string, unknown>;
+    expect(data.observedStatus).toBeNull();
+    // The switch happened anyway: ownership is the human's call, not Herdr's.
+    const replayed = (await ledger.load(runId))!;
+    expect(replayed.lanes[laneId]!.controlMode).toBe("human_owned");
+  });
+
+  test("ownership sends no prompt, no key, and no signal", async () => {
+    const root = await tempRoot();
+    const { ledger, shared, runId, laneId } = await seedLane(root);
+    const options = {
+      environment: { FLOW_LEDGER_ROOT: root },
+      interactiveFactory: () => controllerOver(ledger, shared, root),
+    };
+    const prompts = shared.agentControl.promptCalls.length;
+    const keys = shared.agentControl.sendKeysCalls.length;
+    const signals = shared.adapter.interruptedPaneIds.length;
+
+    await runFlowCli(["takeover", runId, laneId], new Sink(), new Sink(), options);
+    await runFlowCli(["release", runId, laneId], new Sink(), new Sink(), options);
+
+    expect(shared.agentControl.promptCalls).toHaveLength(prompts);
+    expect(shared.agentControl.sendKeysCalls).toHaveLength(keys);
+    expect(shared.adapter.interruptedPaneIds).toHaveLength(signals);
+  });
+
+  test("a historical empty payload still replays through the same projection", async () => {
+    const root = await tempRoot();
+    const { ledger, runId, laneId } = await seedLane(root);
+    const before = (await ledger.load(runId))!;
+    // The shape every takeover carried before the payload existed.
+    const legacy = {
+      schemaVersion: 1,
+      eventId: `${runId}#${before.lastAppliedSequence + 1}`,
+      runId,
+      sequence: before.lastAppliedSequence + 1,
+      at: 9_000,
+      controllerEpoch: 0,
+      type: "lane_takeover",
+      actor: "human",
+      laneId,
+      data: {},
+    } as RunEvent;
+    expect(reduce(before, legacy).lanes[laneId]!.controlMode).toBe("human_owned");
   });
 });

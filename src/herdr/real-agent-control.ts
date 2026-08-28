@@ -164,24 +164,12 @@ export class RealHerdrAgentControl implements HerdrAgentControl {
     readonly source: string;
     readonly agent: string;
   }): Promise<void> {
-    const { stdout, stderr, exitCode } = await this.run(
-      paneReleaseAgentArgv(options),
-    );
-    if (exitCode === 0) return;
-    const error = parseHerdrError(stderr);
-    // Dropping a source from an agent Herdr no longer knows about has already
-    // reached the state the call asks for, so it is a success rather than a
-    // failure — the same reading of the same code `getAgent` makes above, and
-    // what makes cleanup on a lane that just ended its session idempotent.
-    // Every other code stays a control-plane failure and is thrown: a release
-    // that broke for an unknown reason must never read as a source dropped.
-    if (error?.code === AGENT_ABSENT) return;
-    throw new Error(
-      `herdr pane release-agent failed (exit ${exitCode}): ${
-        error
-          ? `${error.code}: ${error.message}`
-          : stderr.trim() || stdout.trim() || "no output"
-      }`,
-    );
+    // MEASURED on the installed 0.8.2, not inferred from `agent get`: releasing
+    // a source for an agent Herdr has no record of exits 0 with empty stdout
+    // and empty stderr, and repeating it exits 0 again. So the idempotence this
+    // needs is the plain success path, and there is no absent-agent error code
+    // to classify. A nonexistent PANE is a different answer and stays a
+    // failure: it returns `pane_not_found`, which this must not swallow.
+    await this.runOk(paneReleaseAgentArgv(options));
   }
 }

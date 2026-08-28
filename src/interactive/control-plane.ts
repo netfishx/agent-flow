@@ -26,6 +26,7 @@ import {
 } from "../herdr/agent-argv.ts";
 import type { Ledger } from "../runtime/ledger.ts";
 import type {
+  InteractiveRetryAuthorizedData,
   LaneOwnershipData,
   NewRunEvent,
   RunEvent,
@@ -664,29 +665,46 @@ export class InteractiveLaneController {
    */
   async takeover(runId: string, laneId: string): Promise<void> {
     await this.mutate(runId, async (commit, run) =>
-      commit({
-        type: "lane_takeover",
-        actor: "human",
+      commitOwnership(
+        commit,
+        "lane_takeover",
         laneId,
-        data: await this.ownershipData(run, laneId),
-      }),
+        await this.ownershipData(run, laneId),
+      ),
     );
   }
 
   async release(runId: string, laneId: string): Promise<void> {
     await this.mutate(runId, async (commit, run) =>
-      commit({
-        type: "lane_release",
-        actor: "human",
+      commitOwnership(
+        commit,
+        "lane_release",
         laneId,
-        data: await this.ownershipData(run, laneId),
-      }),
+        await this.ownershipData(run, laneId),
+      ),
     );
   }
 
   /**
+   * The ownership payload for a lane, read-only and WITHOUT the controller
+   * lease. `flow takeover` has to work while a live controller still holds that
+   * lease — a human taking the lane back is exactly the moment one is running —
+   * so this reads the ledger, makes one best-effort observation, and commits
+   * nothing. The caller commits.
+   */
+  async ownershipFor(runId: string, laneId: string): Promise<LaneOwnershipData> {
+    return this.ownershipData(await this.load(runId), laneId);
+  }
+
+  /**
    * Record a human's authorization to retry. It stands alone in the ledger so
-   * it survives a controller that dies before the new attempt starts.
+   * it survives a controller that dies before the new attempt starts, and it
+   * carries its own evidence so a reader never has to infer the authorization
+   * from the attempt that followed it.
+   *
+   * The parent is checked FIRST — it must exist and it must belong to this lane
+   * — so a wrong-lane or unknown parent is refused before any event is
+   * committed and before Herdr is asked anything at all.
    */
   async authorizeRetry(
     runId: string,
@@ -694,14 +712,23 @@ export class InteractiveLaneController {
     parentAttemptId: string,
     note: string,
   ): Promise<void> {
-    await this.mutate(runId, (commit) =>
-      commit({
-        type: "interactive_retry_authorized",
-        actor: "human",
-        laneId,
-        data: { parentAttemptId, note },
-      }),
-    );
+    await this.mutate(runId, async (commit, run) => {
+      const parent = this.attempt(run, parentAttemptId);
+      if (parent.laneId !== laneId) {
+        throw new Error(
+          `attempt "${parentAttemptId}" belongs to lane "${parent.laneId}", not "${laneId}": a retry is authorized within one lane`,
+        );
+      }
+      const target = this.targetOf(parent);
+      return commitRetryAuthorization(commit, laneId, {
+        parentAttemptId,
+        paneId: parent.paneId,
+        target,
+        method: "ledger-retry-authorization",
+        observedStatus: await this.observeStatus(target),
+        note,
+      });
+    });
   }
 
   // ------------------------------------------------------------- observations
@@ -740,6 +767,14 @@ export class InteractiveLaneController {
   ): Promise<void> {
     await this.mutate(runId, async (commit, run) => {
       const attempt = this.targetAttempt(run, laneId);
+      // The same gate every control passes, and for the same reason: an
+      // attempt that ended, or whose pane is gone or held by a stranger, is not
+      // something this runtime may describe. Checked BEFORE the Herdr call, so
+      // a refusal reaches neither the pane nor the ledger. Takeover is
+      // deliberately NOT checked — publishing is a description, not a control,
+      // and a human holding the lane does not stop the runtime saying what it
+      // sees.
+      this.assertControllable(attempt);
       await this.deps.agentControl.reportAgentState({
         paneId: attempt.paneId,
         source: advisorySource(runId),
@@ -1401,6 +1436,38 @@ export class InteractiveLaneController {
     if (this.deps.readDurable) return this.deps.readDurable(path);
     return Bun.file(path).text();
   }
+}
+
+/**
+ * The ONLY way this control plane commits an ownership change, and the only way
+ * it commits a retry authorization.
+ *
+ * The `data` parameters are the COMPLETE payload types, never the ledger's
+ * compatibility unions. Those unions exist so a ledger written before these
+ * payloads did still replays; they are not a way back in. A producer here that
+ * tried to commit `{}` would not typecheck, because `{}` is missing every
+ * required field of these types.
+ */
+function commitOwnership(
+  commit: (input: NewRunEvent) => Promise<RunView>,
+  type: "lane_takeover" | "lane_release",
+  laneId: string,
+  data: LaneOwnershipData,
+): Promise<RunView> {
+  return commit({ type, actor: "human", laneId, data });
+}
+
+function commitRetryAuthorization(
+  commit: (input: NewRunEvent) => Promise<RunView>,
+  laneId: string,
+  data: InteractiveRetryAuthorizedData,
+): Promise<RunView> {
+  return commit({
+    type: "interactive_retry_authorized",
+    actor: "human",
+    laneId,
+    data,
+  });
 }
 
 function advisorySource(runId: string): string {

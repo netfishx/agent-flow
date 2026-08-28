@@ -20,6 +20,7 @@ import {
 import { GitWriteLaneIsolation } from "../interactive/isolation.ts";
 import type {
   IssueRef,
+  LaneOwnershipData,
   OwnerDecision,
 } from "../runtime/events.ts";
 import type { Ledger } from "../runtime/ledger.ts";
@@ -650,6 +651,27 @@ async function runInteractiveCli(
   }
 }
 
+/**
+ * The ownership payload for `flow takeover` / `flow release`, or null when the
+ * lane is not interactive. Read-only: it loads the run and makes one
+ * best-effort agent observation, and it never takes the controller lease.
+ */
+async function interactiveOwnership(
+  ledger: Ledger,
+  ledgerRoot: string,
+  runId: string,
+  laneId: string,
+  options: FlowCliOptions,
+): Promise<LaneOwnershipData | null> {
+  const run = await ledger.load(runId);
+  const lane = run?.lanes[laneId];
+  if (!lane || lane.kind !== "interactive") return null;
+  const controller =
+    options.interactiveFactory?.(ledger) ??
+    realInteractiveController(ledger, ledgerRoot);
+  return controller.ownershipFor(runId, laneId);
+}
+
 export async function runFlowCli(
   args: readonly string[],
   stdout: TextSink = process.stdout,
@@ -715,12 +737,24 @@ export async function runFlowCli(
       );
       const runtime = runtimeFor(authorizedTarget);
       await runtime.resumeWorkflow(runId!, laneTimeout(environment));
-    } else if (command === "takeover") {
+    } else if (command === "takeover" || command === "release") {
       const runtime = runtimeFor(null);
-      await runtime.takeoverLane(runId!, laneId!);
-    } else if (command === "release") {
-      const runtime = runtimeFor(null);
-      await runtime.releaseLane(runId!, laneId!);
+      // An interactive lane records WHAT changed hands; a headless lane has no
+      // attempt to name and keeps the empty shape. The payload is built without
+      // the controller lease, because a human takes a lane over exactly when a
+      // controller is running and holding it.
+      const ownership = await interactiveOwnership(
+        ledger,
+        root,
+        runId!,
+        laneId!,
+        options,
+      );
+      if (command === "takeover") {
+        await runtime.takeoverLane(runId!, laneId!, ownership);
+      } else {
+        await runtime.releaseLane(runId!, laneId!, ownership);
+      }
     } else if (command === "decide") {
       const authorizedTarget = await deliveryTargetFor(
         ledger,
