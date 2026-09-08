@@ -29,8 +29,10 @@ import {
 } from "../review/verification.ts";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { ownershipEvent } from "./events.ts";
 import type {
   IssueRef,
+  LaneOwnershipData,
   NewRunEvent,
   OwnerDecision,
   RunEvent,
@@ -164,6 +166,26 @@ function laneState(lane: LaneView): LaneState {
   }
 }
 
+/**
+ * A dispatched lane's durable artifacts and sentinel. They are nullable on
+ * `LaneView` only because an INTERACTIVE lane registers without them — it has
+ * no captured stdout and no sentinel. This runtime dispatches no interactive
+ * lane, so a null here is a programming error, and it fails loudly rather than
+ * silently reading or writing an empty path.
+ */
+function dispatchArtifact(
+  lane: LaneView,
+  field: "logFile" | "stderrFile" | "sentinelToken",
+): string {
+  const value = lane[field];
+  if (value === null) {
+    throw new Error(
+      `lane "${lane.laneId}" has no ${field}: this runtime dispatches no interactive lanes`,
+    );
+  }
+  return value;
+}
+
 function rejectionMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
@@ -215,6 +237,20 @@ export class PartialDispatchError extends Error {
     this.name = "PartialDispatchError";
   }
 }
+
+/**
+ * How an INTERACTIVE lane's ownership payload is produced.
+ *
+ * A capability, not a decision: the caller assembles one, and the runtime — the
+ * layer that holds the lane — decides whether the lane has a payload to record
+ * at all. It is handed the RunView the runtime already loaded, so deriving the
+ * payload costs no second read, and it must not take the controller lease: a
+ * human takes a lane over exactly while a controller is holding it.
+ */
+export type LaneOwnershipProvider = (
+  run: RunView,
+  laneId: string,
+) => Promise<LaneOwnershipData>;
 
 export class WorkflowRuntime {
   protected readonly runs = new Map<string, RunView>();
@@ -394,7 +430,18 @@ export class WorkflowRuntime {
         startedAt,
       );
     } catch (error) {
-      await this.releaseControllerLease(runId);
+      // A failed release must not erase why the start failed. The pre-dispatch
+      // path below already combines both errors; this uses the shape the rest
+      // of the codebase settled on — the start error stays primary and keeps
+      // its identity in `cause`, the release failure rides in the message.
+      try {
+        await this.releaseControllerLease(runId);
+      } catch (releaseError) {
+        throw new Error(
+          `run start failed: ${rejectionMessage(error)}; controller lease release failed: ${rejectionMessage(releaseError)}`,
+          { cause: error },
+        );
+      }
       throw error;
     }
     try {
@@ -724,46 +771,89 @@ export class WorkflowRuntime {
   // Ownership flips intentionally commit lease-free so a human can take control
   // from a live managed controller. Use takeover -> controller loss -> resume;
   // concurrent controller commits may race ledger state (issue #20).
+  /**
+   * Hand a lane's control channel to a human, or take it back.
+   *
+   * Deliberately LEASE-FREE, and it stays that way: a human takes a lane over
+   * precisely when a controller is running and holding the run's lease, so
+   * requiring that lease here would make the command fail exactly when it is
+   * needed. It loads, decides, and appends conditionally.
+   *
+   * `ownership` is a CAPABILITY, never a decision: an INTERACTIVE lane records
+   * which attempt, on which pane, through which target, and what the agent
+   * surface said at that moment, and this method calls the provider to derive
+   * it. A headless lane has no such attempt and keeps the empty shape it has
+   * always had, whatever the caller supplied. The argument is required, so a
+   * caller states its intent and nothing gets `{}` by defaulting into it.
+   */
   async takeoverLane(
     runId: string,
     laneId: string,
+    ownership: LaneOwnershipProvider | null,
+  ): Promise<WorkflowStatus> {
+    return this.changeOwnership(runId, laneId, "lane_takeover", ownership);
+  }
+
+  /** The other half of `takeoverLane`; same lease-free contract, same shapes. */
+  async releaseLane(
+    runId: string,
+    laneId: string,
+    ownership: LaneOwnershipProvider | null,
+  ): Promise<WorkflowStatus> {
+    return this.changeOwnership(runId, laneId, "lane_release", ownership);
+  }
+
+  private async changeOwnership(
+    runId: string,
+    laneId: string,
+    type: "lane_takeover" | "lane_release",
+    ownership: LaneOwnershipProvider | null,
   ): Promise<WorkflowStatus> {
     const loaded = await this.deps.ledger.load(runId);
     if (!loaded) throw new Error(`run not found: "${runId}"`);
     this.registerReducedView(loaded);
+    // Decided BEFORE the conditional commit, and from the run just loaded: a
+    // lane's kind is fixed at registration, and deriving the payload here keeps
+    // the single observation out of a block that may retry.
+    const event = await this.ownershipEventFor(loaded, laneId, type, ownership);
+    const held = type === "lane_takeover" ? "human_owned" : "managed";
     await this.commitEventConditionally(runId, (current) => {
       if (!current) throw new Error(`unknown runId "${runId}"`);
-      const lane = this.getLane(current, laneId);
-      if (lane.controlMode === "human_owned") return null;
-      return {
-        type: "lane_takeover",
-        actor: "human",
-        laneId,
-        data: {},
-      };
+      if (this.getLane(current, laneId).controlMode === held) return null;
+      return event;
     });
     return this.workflowStatus(this.getRun(runId));
   }
 
-  async releaseLane(
-    runId: string,
+  /**
+   * What a lane's ownership change records, decided HERE — the layer that
+   * already holds the lane and makes every other lane-kind decision.
+   *
+   * An INTERACTIVE lane must produce its full payload. No provider means the
+   * runtime refuses: recording an empty event would claim nothing identifiable
+   * changed hands, which is exactly the shape the payload replaced. The check
+   * is a runtime one because the type alone cannot stop a JavaScript caller.
+   *
+   * A HEADLESS lane has no attempt to name, so it keeps the empty shape it has
+   * always had. A provider offered for one is never invoked and nothing is
+   * observed — the lane kind decides, not the caller.
+   */
+  private async ownershipEventFor(
+    run: RunView,
     laneId: string,
-  ): Promise<WorkflowStatus> {
-    const loaded = await this.deps.ledger.load(runId);
-    if (!loaded) throw new Error(`run not found: "${runId}"`);
-    this.registerReducedView(loaded);
-    await this.commitEventConditionally(runId, (current) => {
-      if (!current) throw new Error(`unknown runId "${runId}"`);
-      const lane = this.getLane(current, laneId);
-      if (lane.controlMode === "managed") return null;
-      return {
-        type: "lane_release",
-        actor: "human",
-        laneId,
-        data: {},
-      };
-    });
-    return this.workflowStatus(this.getRun(runId));
+    type: "lane_takeover" | "lane_release",
+    ownership: LaneOwnershipProvider | null,
+  ): Promise<NewRunEvent> {
+    const lane = this.getLane(run, laneId);
+    if (lane.kind !== "interactive") {
+      return { type, actor: "human", laneId, data: {} };
+    }
+    if (typeof ownership !== "function") {
+      throw new Error(
+        `lane "${laneId}" in run "${run.runId}" is interactive and requires an ownership provider: refusing to record ${type} with an empty payload`,
+      );
+    }
+    return ownershipEvent(type, laneId, await ownership(run, laneId));
   }
 
   async recordOwnerDecision(
@@ -838,6 +928,7 @@ export class WorkflowRuntime {
 
       const leaseAlreadyHeld = this.leases.has(runId);
       if (!leaseAlreadyHeld) await this.acquireControllerLease(runId);
+      let deliveryError: unknown;
       try {
         const authoritative = await this.deps.ledger.load(runId);
         if (!authoritative) throw new Error(`run not found: "${runId}"`);
@@ -859,8 +950,23 @@ export class WorkflowRuntime {
         });
         await this.reconcileBoundIssue(runId);
         return this.workflowStatus(this.getRun(runId));
+      } catch (error) {
+        deliveryError = error;
+        throw error;
       } finally {
-        if (!leaseAlreadyHeld) await this.releaseControllerLease(runId);
+        if (!leaseAlreadyHeld) {
+          try {
+            await this.releaseControllerLease(runId);
+          } catch (releaseError) {
+            if (deliveryError !== undefined) {
+              throw new Error(
+                `delivery resume failed: ${rejectionMessage(deliveryError)}; controller lease release failed: ${rejectionMessage(releaseError)}`,
+                { cause: deliveryError },
+              );
+            }
+            throw releaseError;
+          }
+        }
       }
     }
 
@@ -905,7 +1011,7 @@ export class WorkflowRuntime {
           continue;
         }
 
-        const output = await this.readDurable(lane.logFile);
+        const output = await this.readDurable(dispatchArtifact(lane, "logFile"));
         const exitCode = parseExitFromSentinel(runId, laneId, output);
         await this.recordPostFlightIsolation(runId, laneId);
         if (exitCode !== null) {
@@ -1039,7 +1145,7 @@ export class WorkflowRuntime {
     const run = this.getRun(runId);
     const lane = this.getLane(run, laneId);
     const output =
-      lane.dispatchedAt === null ? "" : await this.readDurable(lane.logFile);
+      lane.dispatchedAt === null ? "" : await this.readDurable(dispatchArtifact(lane, "logFile"));
     const parsedExit = parseExitFromSentinel(runId, laneId, output);
     const tail = output
       .trim()
@@ -1052,7 +1158,7 @@ export class WorkflowRuntime {
       exitCode: lane.exitCode ?? parsedExit,
       waitMatched: lane.waitMatched,
       timedOut: false,
-      sentinelToken: lane.sentinelToken,
+      sentinelToken: dispatchArtifact(lane, "sentinelToken"),
       outputTail: tail,
     };
   }
@@ -1470,7 +1576,7 @@ export class WorkflowRuntime {
     // Post-flight isolation must precede the terminal event (see the note on
     // recordPostFlightIsolation); the lane's process is already gone here.
     await this.recordPostFlightIsolation(runId, laneId);
-    const output = await this.readDurable(lane.logFile);
+    const output = await this.readDurable(dispatchArtifact(lane, "logFile"));
     const exitCode = parseExitFromSentinel(runId, laneId, output);
     if (exitCode === null) {
       await this.commitEventConditionally(
@@ -1699,8 +1805,8 @@ export class WorkflowRuntime {
       runId,
       laneId,
       command: terminalLane.dispatchedCommand,
-      stdoutArtifact: terminalLane.logFile,
-      stderrArtifact: terminalLane.stderrFile,
+      stdoutArtifact: dispatchArtifact(terminalLane, "logFile"),
+      stderrArtifact: dispatchArtifact(terminalLane, "stderrFile"),
       dispatchedAt: terminalLane.dispatchedAt,
       liveAt: terminalLane.liveAt,
       completedAt: terminalLane.completedAt,
@@ -1814,7 +1920,7 @@ export class WorkflowRuntime {
     }
     let stderrText: string | null = null;
     try {
-      stderrText = await readFile(lane.stderrFile, "utf8");
+      stderrText = await readFile(dispatchArtifact(lane, "stderrFile"), "utf8");
     } catch {
       stderrText = null;
     }

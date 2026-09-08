@@ -946,7 +946,7 @@ describe("human ownership and recovery", () => {
       agentLane("claude-standards", "claude", "standards"),
     ]);
     await runtime.confirmLaneStarted(handle.runId, "claude-standards");
-    await runtime.takeoverLane(handle.runId, "claude-standards");
+    await runtime.takeoverLane(handle.runId, "claude-standards", null);
 
     // Automatic drive is suspended: awaiting returns without driving, and
     // the ledger still shows a live, undriven lane.

@@ -283,7 +283,7 @@ async function setupRun(): Promise<string> {
     const live = await runtime.confirmLaneStarted(handle.runId, laneId);
     if (!live) throw new Error(`lane "${laneId}" did not become live`);
   }
-  await runtime.takeoverLane(handle.runId, c.releaseLaneId);
+  await runtime.takeoverLane(handle.runId, c.releaseLaneId, null);
   const loaded = await ledger.load(handle.runId);
   if (!loaded) throw new Error(`run "${handle.runId}" disappeared`);
   return loaded.tabId;

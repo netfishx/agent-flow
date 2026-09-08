@@ -103,3 +103,33 @@ and design records.
 - **`invalid`** — the run finish status when an agent lane that ran to a
   terminal state lacks a passing post-flight verification; an invalid run is
   never carried forward, and a rerun gets a new run id.
+- **Interactive write lane** — a lane hosting a native CLI session a human can
+  steer, cancel, interrupt, retry, and take over while it runs. Unlike an agent
+  lane, the runtime captures no stdout for it, so nothing durable may depend on
+  pane scrollback.
+- **Attempt** — one launch of an interactive write lane's session, with its own
+  pane, agent name, session identity, and declared brief/checkpoint/result
+  paths. A lane may have several, ordered by `ordinal`; an attempt is never
+  resumed, impersonated, or reused.
+- **Disposition** — an attempt's outcome, projected from objective facts alone:
+  `running`, `completed`, `interrupted`, `aborted`, `superseded`, or `unknown`.
+  A reconciliation that did not find the attempt live forces `unknown`, and no
+  advisory state contributes.
+- **Advisory state** — Herdr's live classification of a pane, recorded with the
+  source that produced it: detected by Herdr, or published by the runtime. It
+  serves wait edges, human control, and the UI, and never enters the evidence
+  chain. A source the runtime published is released when the runtime ends the
+  session it still owns; a pane that was lost or reoccupied is no longer the
+  runtime's to touch, so it is left alone.
+- **Control mode** — who owns a lane's control channel: `managed`, where the
+  runtime may issue controls, or `human_owned`, where a human has taken over
+  and the runtime issues none until release.
+- **Retry authorization** — a recorded human act permitting exactly one further
+  attempt past a named parent attempt. One authorization is consumed by one
+  attempt, so there is no path from a failure to a new attempt that does not
+  pass through a human.
+- **Runner evidence** — an interactive attempt's objective verification record,
+  produced by an ordinary command in its own pane rather than inside the agent
+  session: exact command, durable log, and the real exit code read from that
+  log's sentinel. Recorded under the `runner` actor, distinct from the Agent's
+  own checkpoint.

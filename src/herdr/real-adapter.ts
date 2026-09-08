@@ -143,8 +143,16 @@ export class RealHerdrAdapter implements HerdrAdapter {
     try {
       this.signalGroup(pgid, "SIGINT");
       return { signal: "SIGINT", processGroupId: pgid, delivered: true };
-    } catch {
-      return { signal: "SIGINT", processGroupId: pgid, delivered: false };
+    } catch (error) {
+      // The reason is the only thing that distinguishes "the group is already
+      // gone" from "we are not allowed to signal it", and the caller cannot
+      // guess it. Carried out rather than swallowed.
+      return {
+        signal: "SIGINT",
+        processGroupId: pgid,
+        delivered: false,
+        detail: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 }

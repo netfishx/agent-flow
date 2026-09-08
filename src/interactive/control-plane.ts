@@ -1,0 +1,1657 @@
+// The interactive write lane's control plane.
+//
+// It is a peer of `WorkflowRuntime`, not an extension of it: the read-only
+// runtime accepted in #7 is untouched, and this class reuses the mechanisms
+// rather than the code path — the same Herdr adapter for pane topology and
+// process facts, the same ledger and reducer, the same controller lease, the
+// same takeover events, and the same sentinel contract from `runtime/ids.ts`.
+//
+// Four rules run through every method here:
+//
+//   - a control is a HUMAN act. Nothing on this class issues a steer, cancel,
+//     abort, or retry on its own, and no method retries anything.
+//   - every mutating operation holds the run's controller lease and is
+//     serialized per run, so a check and the commit it authorizes cannot be
+//     split by a concurrent caller.
+//   - a control records its INTENT before the Herdr call and its DELIVERY
+//     after. A failed observation never erases either.
+//   - advisory Herdr state is recorded, never consumed as an outcome.
+
+import { join } from "node:path";
+import type { HerdrAdapter } from "../herdr/adapter.ts";
+import type { HerdrAgentControl } from "../herdr/agent-control.ts";
+import {
+  agentNameFor,
+  AGENT_START_TIMEOUT_DEFAULT_MS,
+} from "../herdr/agent-argv.ts";
+import type { Ledger } from "../runtime/ledger.ts";
+import { ownershipEvent } from "../runtime/events.ts";
+import type {
+  InteractiveRetryAuthorizedData,
+  LaneOwnershipData,
+  NewRunEvent,
+  RunEvent,
+  SemanticState,
+} from "../runtime/events.ts";
+import { reduce, type LaneView, type RunView } from "../runtime/reducer.ts";
+import {
+  assertHandleId,
+  sentinelRegex,
+  parseSentinelExit,
+} from "../runtime/ids.ts";
+import type { SessionIdentity } from "../review/types.ts";
+import { buildNativeArgs, buildRunnerCommand } from "./commands.ts";
+import type { WriteLaneIsolationPort } from "./isolation.ts";
+import type { AgentInfoView } from "../herdr/agent-json.ts";
+import type {
+  AdvisoryAgentStatus,
+  AttemptEndReason,
+  ControlDeliveryState,
+  ControlRecord,
+  DeliveredControl,
+  InteractiveAgentKind,
+  InteractiveAttemptView,
+  ReconciliationOutcome,
+  SteerObservation,
+} from "./types.ts";
+
+/**
+ * Raised when a control is attempted on a lane a human has taken over.
+ *
+ * The message names every control the gate covers rather than the two Herdr
+ * surfaces alone: a takeover means the human owns this lane, so an abort that
+ * would end the session under them is refused for the same reason a prompt is.
+ * Read-only observation stays outside the gate — looking at a lane a human is
+ * driving takes nothing away from them.
+ */
+export class LaneTakenOverError extends Error {
+  constructor(laneId: string) {
+    super(
+      `lane "${laneId}" is under human takeover: the runtime issues no control to it — no agent prompt, no agent send-keys, and no abort signal. Read-only observation is unaffected.`,
+    );
+    this.name = "LaneTakenOverError";
+  }
+}
+
+/** Raised when a retry is requested without an unconsumed human authorization. */
+export class RetryNotAuthorizedError extends Error {
+  constructor(laneId: string) {
+    super(
+      `lane "${laneId}" has no unconsumed retry authorization: one authorization creates one attempt`,
+    );
+    this.name = "RetryNotAuthorizedError";
+  }
+}
+
+/**
+ * Raised when a control is attempted on an attempt that registered but has not
+ * bound an agent yet — the window a controller crash between `started` and
+ * `bound` leaves behind. Nothing is probed and nothing is reconciled: a pane
+ * whose agent has not started is not evidence that the agent is gone.
+ */
+export class WriteLaneIsolationError extends Error {
+  constructor(worktreePath: string, reason: string) {
+    super(`write lane worktree "${worktreePath}" is not isolated: ${reason}`);
+    this.name = "WriteLaneIsolationError";
+  }
+}
+
+export class AttemptNotBoundError extends Error {
+  constructor(attemptId: string) {
+    super(
+      `attempt "${attemptId}" has not bound an agent yet: it is starting, so it is neither controllable nor probeable`,
+    );
+    this.name = "AttemptNotBoundError";
+  }
+}
+
+/**
+ * Raised when a control is attempted on an attempt that may not be controlled:
+ * it has ended, or its pane is gone, occupied by a stranger, or unprobeable.
+ * Thrown BEFORE any Herdr side effect, so nothing reaches a pane the runtime
+ * does not own and nothing reaches a session that already finished.
+ */
+export class AttemptNotControllableError extends Error {
+  constructor(attemptId: string, reason: string) {
+    super(`attempt "${attemptId}" is not controllable: ${reason}`);
+    this.name = "AttemptNotControllableError";
+  }
+}
+
+export interface InteractiveDeps {
+  /** Pane topology, process facts, and the abort signal path. */
+  readonly adapter: HerdrAdapter;
+  readonly agentControl: HerdrAgentControl;
+  readonly ledger: Ledger;
+  /** Write-lane preflight: proves the worktree is this repository's, and linked. */
+  readonly isolation: WriteLaneIsolationPort;
+  /** Root each attempt's declared brief/checkpoint/result paths hang under. */
+  readonly artifactRoot: string;
+  readonly clock: () => number;
+  readonly idgen: () => string;
+  /** Pre-assigned session UUIDs for claude/grok attempts. */
+  readonly sessionIdgen?: () => string;
+  readonly readDurable?: (path: string) => Promise<string>;
+  /** How long `agent start` may take to report readiness. */
+  readonly startTimeoutMs?: number;
+  /** Window for the post-submission observation of a steer. */
+  readonly steerWaitMs?: number;
+  /** Window for the runner's sentinel wait. */
+  readonly runnerTimeoutMs?: number;
+}
+
+export interface OpenLaneConfig {
+  readonly workflow: string;
+  readonly workspace: string;
+  readonly cwd: string;
+  readonly laneId: string;
+  readonly agentKind: InteractiveAgentKind;
+  readonly model: string;
+  readonly effort: string;
+  /** The lane's isolated implementation worktree. Verified before anything. */
+  readonly worktreePath: string;
+  /** The repository the worktree must belong to. */
+  readonly repoRoot: string;
+  readonly role?: string;
+}
+
+export interface StartAttemptInput {
+  /** The human act that authorized this attempt. */
+  readonly authorization: { readonly note: string };
+  /** Override the rehearsal-pending native argv for this attempt. */
+  readonly nativeArgs?: readonly string[];
+  readonly parentAttemptId?: string | null;
+}
+
+export interface StartAttemptOutcome {
+  readonly attemptId: string;
+  readonly started: boolean;
+  /** Populated on failure; a start failure is never an implicit retry. */
+  readonly startFailure: string | null;
+}
+
+export interface RunnerRequest {
+  readonly argv: readonly string[];
+  /** Defaults to a path under the attempt's artifact directory. */
+  readonly logFile?: string;
+  /** Defaults to the attempt's worktree. */
+  readonly cwd?: string;
+}
+
+/** The declared paths an attempt writes to. Derived, never caller-supplied. */
+export function attemptArtifactPaths(
+  artifactRoot: string,
+  attemptId: string,
+): {
+  readonly briefFile: string;
+  readonly checkpointFile: string;
+  readonly resultPointer: string;
+  readonly runnerLog: (evidenceId: string) => string;
+} {
+  const dir = join(artifactRoot, "attempts", attemptId);
+  return {
+    briefFile: join(dir, "brief.md"),
+    checkpointFile: join(dir, "checkpoint.md"),
+    resultPointer: join(dir, "result.md"),
+    runnerLog: (evidenceId) => join(dir, `runner-${evidenceId}.log`),
+  };
+}
+
+/** What a pane probe concluded, plus the record that proved it when live. */
+interface ProbeResult {
+  readonly outcome: ReconciliationOutcome;
+  readonly paneId: string;
+  readonly detail: string | null;
+  readonly observed: AgentInfoView | null;
+}
+
+const DEFAULT_STEER_WAIT_MS = 5_000;
+const DEFAULT_RUNNER_TIMEOUT_MS = 300_000;
+
+/**
+ * What an effect can report about its own delivery. Returning nothing means
+ * "it landed unless it threw", which is all a fire-and-forget call can say.
+ */
+interface EffectOutcome {
+  readonly delivered: boolean;
+  readonly detail: string | null;
+}
+
+export class InteractiveLaneController {
+  private readonly runs = new Map<string, RunView>();
+  /** One chain per run: every read and every mutation queues on it. */
+  private readonly runTails = new Map<string, Promise<unknown>>();
+
+  constructor(private readonly deps: InteractiveDeps) {}
+
+  // ---------------------------------------------------------------- lifecycle
+
+  /**
+   * Provision the lane: a dedicated tab, a controller pane, and a registered
+   * interactive lane. No agent is started here — an attempt does that, so the
+   * lane can outlive any number of them.
+   */
+  async openLane(config: OpenLaneConfig): Promise<{
+    readonly runId: string;
+    readonly laneId: string;
+  }> {
+    assertHandleId("laneId", config.laneId);
+    // Preflight FIRST: no tab, no pane, no event, no agent until the worktree
+    // is proved to be a linked worktree of the declared repository. A write
+    // lane is handed permission to change that directory.
+    const isolation = await this.deps.isolation.verifyWriteWorktree({
+      repoRoot: config.repoRoot,
+      worktreePath: config.worktreePath,
+    });
+    if (!isolation.ok) {
+      throw new WriteLaneIsolationError(config.worktreePath, isolation.reason);
+    }
+    // From here the caller's path is never used again. Verification resolved
+    // symlinks to reach its verdict, so recording or executing against the
+    // unresolved path would let a later re-point move the Agent somewhere
+    // nothing was ever checked.
+    const worktreePath = isolation.canonicalWorktreePath;
+    const repoRoot = isolation.canonicalRepoRoot;
+    const runId = this.deps.idgen();
+    assertHandleId("runId", runId);
+    const created = await this.deps.adapter.createTab({
+      workspace: config.workspace,
+      cwd: config.cwd,
+      label: config.workflow,
+    });
+    return this.mutate(runId, async (commit) => {
+      await commit({
+        type: "run_started",
+        actor: "runtime",
+        data: {
+          workflow: config.workflow,
+          workspace: config.workspace,
+          cwd: config.cwd,
+          splitDirection: "right",
+          tabId: created.tab.id,
+          controllerPaneId: created.controllerPane.id,
+          fixedPoint: null,
+          issue: null,
+        },
+      });
+      await commit({
+        type: "lane_registered",
+        actor: "runtime",
+        laneId: config.laneId,
+        data: {
+          kind: "interactive",
+          laneId: config.laneId,
+          paneId: created.controllerPane.id,
+          agentKind: config.agentKind,
+          model: config.model,
+          effort: config.effort,
+          worktreePath,
+          repoRoot,
+          artifactRoot: join(this.deps.artifactRoot, runId, config.laneId),
+          ...(config.role === undefined ? {} : { role: config.role }),
+        },
+      });
+      return { runId, laneId: config.laneId };
+    }, { creates: true });
+  }
+
+  /**
+   * LAUNCH one attempt, and only launch it: the RUNTIME provisions the pane,
+   * then Herdr starts or recognizes the interactive agent in it. `herdr agent
+   * start` never creates, splits, or moves layout, so pane topology stays this
+   * side of the seam.
+   *
+   * Success means a session exists and is bound. It does NOT mean the session
+   * can be told anything: Herdr's readiness is advisory, and 0.8.2 reports a
+   * vendor update modal as `idle` with `interactive_ready: true`. A human looks
+   * at the visible pane, clears any trust/update/login dialog, and then submits
+   * the first instruction through `steer` — the same path every later
+   * instruction takes, with the same intent/delivery/observation evidence.
+   *
+   * The authorization check, the pane, and the attempt record are committed
+   * inside ONE lease-held critical section, so two concurrent retries on one
+   * authorization cannot both pass the check.
+   */
+  async startAttempt(
+    runId: string,
+    laneId: string,
+    input: StartAttemptInput,
+  ): Promise<StartAttemptOutcome> {
+    const parentAttemptId = input.parentAttemptId ?? null;
+    return this.mutate(runId, async (commit, run) => {
+      const lane = this.lane(run, laneId);
+      if (lane.kind !== "interactive") {
+        throw new Error(`lane "${laneId}" is not an interactive write lane`);
+      }
+      // Checked INSIDE the critical section, immediately before the commit
+      // that consumes it. One authorization can therefore buy one attempt.
+      if (parentAttemptId !== null && pendingRetries(run, parentAttemptId) <= 0) {
+        throw new RetryNotAuthorizedError(laneId);
+      }
+      // Resolved FIRST, before any pane, event or artifact exists. A family
+      // whose defaults cannot keep the human approval gate refuses here, and
+      // refusing here means nothing was created to clean up. An owner's
+      // explicit `nativeArgs` replaces the defaults whole, and the runtime does
+      // not judge whether that override is safe. A pre-assigned session id
+      // therefore exists only for the DEFAULT argv, which is the argv that
+      // carries it to the process: minting one for an override would invent a
+      // value that never reaches the CLI and could be evidence of nothing.
+      const agentKind = lane.agentKind as InteractiveAgentKind;
+      const nativeArgs =
+        input.nativeArgs ??
+        buildNativeArgs({
+          agentKind,
+          model: lane.model ?? "",
+          effort: lane.effort ?? "",
+          sessionId:
+            agentKind === "codex"
+              ? null
+              : (this.deps.sessionIdgen?.() ?? null),
+        });
+
+      const attemptId = this.deps.idgen();
+      assertHandleId("attemptId", attemptId);
+      const expectedAgentName = agentNameFor(laneId, attemptId);
+
+      // A NEW pane per attempt: a retry never resumes, impersonates, or
+      // replaces a prior session, so it never reuses that session's pane.
+      const pane = await this.deps.adapter.splitPane({
+        from: { id: run.controllerPaneId },
+        direction: "right",
+        cwd: lane.worktreePath ?? run.cwd,
+      });
+      const paths = attemptArtifactPaths(lane.artifactRoot!, attemptId);
+      await commit({
+        type: "interactive_attempt_started",
+        actor: "runtime",
+        laneId,
+        data: {
+          attemptId,
+          ordinal: this.attemptsOf(run, laneId).length + 1,
+          parentAttemptId,
+          agentKind: lane.agentKind as InteractiveAgentKind,
+          model: lane.model ?? "",
+          effort: lane.effort ?? "",
+          paneId: pane.id,
+          expectedAgentName,
+          worktreePath: lane.worktreePath ?? run.cwd,
+          briefFile: paths.briefFile,
+          checkpointFile: paths.checkpointFile,
+          resultPointer: paths.resultPointer,
+          authorization: { actor: "human", note: input.authorization.note },
+        },
+      });
+
+      const name = expectedAgentName;
+      const startedAt = this.deps.clock();
+      let started;
+      try {
+        started = await this.deps.agentControl.startAgent({
+          name,
+          kind: agentKind,
+          paneId: pane.id,
+          timeoutMs: this.deps.startTimeoutMs ?? AGENT_START_TIMEOUT_DEFAULT_MS,
+          nativeArgs,
+        });
+      } catch (error) {
+        const cause = error instanceof Error ? error.message : String(error);
+        // A start failure is an END, with its cause. It is never a retry: only
+        // a human authorization creates another attempt.
+        await commit({
+          type: "interactive_attempt_ended",
+          actor: "runtime",
+          laneId,
+          data: { attemptId, endReason: "start-failed", cause, exitCode: null },
+        });
+        return { attemptId, started: false, startFailure: cause };
+      }
+
+      await commit({
+        type: "interactive_attempt_bound",
+        actor: "runtime",
+        laneId,
+        data: {
+          attemptId,
+          agentName: started.agent.name ?? name,
+          session: sessionIdentityOf(
+            agentKind,
+            started.agent.sessionId,
+            started.argv,
+          ),
+          argv: started.argv,
+          readinessMs: this.deps.clock() - startedAt,
+        },
+      });
+
+      // Launched and bound — and that is ALL this returns. Herdr's readiness
+      // is advisory: 0.8.2 reports a Codex update modal as `idle` with
+      // `interactive_ready: true`, so a session that exists may still be
+      // showing a trust, update, or login dialog. Submitting here would fire
+      // the first instruction at whatever owns the screen. A human looks at
+      // the pane and then submits the brief through `steer`.
+      return { attemptId, started: true, startFailure: null };
+    });
+  }
+
+  // ------------------------------------------------------------------ controls
+
+  /**
+   * Submit an instruction to a live session, as TWO facts.
+   *
+   * The submission is recorded BEFORE the call, so a controller that dies
+   * mid-call still leaves the intent in the ledger. The transition afterwards
+   * is recorded as an observation. Neither says the steer was applied and
+   * neither says the work finished — `--wait` tracks lifecycle state, not
+   * turns, so an already-working agent's active turn can satisfy it.
+   */
+  async steer(
+    runId: string,
+    laneId: string,
+    text: string,
+    options: { readonly attemptId?: string } = {},
+  ): Promise<SteerObservation> {
+    return this.mutate(runId, async (commit, run) => {
+      const attempt = this.targetAttempt(run, laneId, options.attemptId);
+      this.assertNotTakenOver(run, laneId);
+      this.assertControllable(attempt);
+      return this.submitSteer(commit, laneId, attempt, text);
+    });
+  }
+
+  /**
+   * The one steer path. Every instruction an Agent receives arrives here,
+   * including the first one after a launch. Submission is recorded BEFORE the
+   * call, so a controller that dies mid-call still leaves the intent in the
+   * ledger; the transition afterwards
+   * is a separate observation. Neither says the steer was applied and neither
+   * says the work finished — `--wait` tracks lifecycle state, not turns.
+   */
+  private async submitSteer(
+    commit: (input: NewRunEvent) => Promise<RunView>,
+    laneId: string,
+    attempt: InteractiveAttemptView,
+    text: string,
+  ): Promise<SteerObservation> {
+    const target = this.targetOf(attempt);
+    await commit({
+      type: "lane_steer_submitted",
+      actor: "human",
+      laneId,
+      data: {
+        attemptId: attempt.attemptId,
+        text,
+        paneId: attempt.paneId,
+        target,
+        method: "agent-prompt",
+      },
+    });
+    const result = await this.deps.agentControl.promptAgent(target, text, {
+      waitMs: this.deps.steerWaitMs ?? DEFAULT_STEER_WAIT_MS,
+    });
+    const observedStatus = result.agent?.status ?? null;
+    await commit({
+      type: "lane_steer_observed",
+      actor: "runtime",
+      laneId,
+      data: {
+        attemptId: attempt.attemptId,
+        outcome: result.outcome,
+        observedStatus,
+        source: observedStatus === null ? null : "herdr-detection",
+      },
+    });
+    return {
+      outcome: result.outcome,
+      observed:
+        observedStatus === null
+          ? null
+          : {
+              status: observedStatus,
+              source: "herdr-detection" as const,
+              paneId: attempt.paneId,
+              at: this.deps.clock(),
+            },
+    };
+  }
+
+  /**
+   * Cancel the current turn and KEEP the session alive and steerable. This is
+   * the default interrupt for a write lane; the signal path would end the
+   * session, which is a different act with a different record.
+   */
+  async cancelTurn(
+    runId: string,
+    laneId: string,
+    options: {
+      readonly attemptId?: string;
+      readonly keys?: readonly string[];
+    } = {},
+  ): Promise<AdvisoryAgentStatus | null> {
+    return this.mutate(runId, async (commit, run) => {
+      const attempt = this.targetAttempt(run, laneId, options.attemptId);
+      this.assertNotTakenOver(run, laneId);
+      this.assertControllable(attempt);
+      const target = this.targetOf(attempt);
+      const keys = options.keys ?? ["esc"];
+      const controlId = this.deps.idgen();
+
+      await commit({
+        type: "lane_cancel_turn",
+        actor: "human",
+        laneId,
+        data: {
+          attemptId: attempt.attemptId,
+          controlId,
+          target,
+          method: "send-keys",
+          keys: [...keys],
+        },
+      });
+
+      const { error, ...delivery } = await this.deliver(
+        () => this.deps.agentControl.sendKeys(target, keys),
+        target,
+      );
+      await commit({
+        type: "lane_control_delivered",
+        actor: "runtime",
+        laneId,
+        data: {
+          attemptId: attempt.attemptId,
+          controlId,
+          control: "cancel-turn",
+          method: "send-keys",
+          ...delivery,
+        },
+      });
+      if (error) throw error;
+      return delivery.observedStatus;
+    });
+  }
+
+  /**
+   * End the session by signalling the pane's foreground process group — the
+   * existing interrupt path, reused unchanged.
+   *
+   * The pane is PROBED first: an attempt whose pane is gone, reoccupied, or
+   * unprobeable is refused before any signal is sent, because that signal
+   * would reach a process group the runtime does not own.
+   */
+  async abortSession(
+    runId: string,
+    laneId: string,
+    options: { readonly attemptId?: string } = {},
+  ): Promise<void> {
+    await this.mutate(runId, async (commit, run) => {
+      const attempt = this.targetAttempt(run, laneId, options.attemptId);
+      // Checked in the same place, and for the same reason, as `steer` and
+      // `cancelTurn`: while a human owns the lane the runtime issues nothing to
+      // it. Ending the session outright is the most invasive control there is,
+      // so it refuses BEFORE the probe — a taken-over lane is not even read.
+      this.assertNotTakenOver(run, laneId);
+      this.assertControllable(attempt);
+
+      const controlId = this.deps.idgen();
+      const target = this.targetOf(attempt);
+      const probe = await this.probePane(attempt);
+      if (probe.outcome !== "live") {
+        await commit({
+          type: "interactive_attempt_reconciled",
+          actor: "runtime",
+          laneId,
+          data: {
+            attemptId: attempt.attemptId,
+            outcome: probe.outcome,
+            paneId: probe.paneId,
+            detail: probe.detail,
+          },
+        });
+        throw new AttemptNotControllableError(
+          attempt.attemptId,
+          probe.detail ?? `pane probed ${probe.outcome}`,
+        );
+      }
+
+      await commit({
+        type: "lane_abort_session",
+        actor: "human",
+        laneId,
+        data: {
+          attemptId: attempt.attemptId,
+          controlId,
+          target,
+          method: "signal-process-group",
+        },
+      });
+
+      // `delivered: false` from the adapter has two different meanings, and
+      // only one of them is an ending. The adapter distinguishes them by
+      // `processGroupId`, so this reads that rather than writing one sentence
+      // over both:
+      //
+      //   - null    — the pane's foreground group IS its shell, so nothing was
+      //               running and the session had already gone. The attempt
+      //               ends, but as `session-exit`: no signal was sent, and
+      //               `aborted` would credit this human act with an ending it
+      //               did not cause.
+      //   - a pgid  — a live foreground group was signalled and the signal did
+      //               not land. Whether the session survived is unknown — the
+      //               group may be gone, or unsignalable — so NOTHING ends
+      //               here. The failed intent and its failed delivery both stay
+      //               in the ledger, the adapter's own reason is carried into
+      //               the record, and the attempt stays controllable.
+      //
+      // Either way the delivery record says `delivered: false`, because that
+      // field means the effect landed.
+      const ending: { reason: AttemptEndReason | null; cause: string | null } = {
+        reason: null,
+        cause: null,
+      };
+      const { error, ...delivery } = await this.deliver(async () => {
+        const evidence = await this.deps.adapter.interruptPane({
+          id: attempt.paneId,
+        });
+        if (evidence.delivered) {
+          ending.reason = "aborted";
+          return { delivered: true, detail: null };
+        }
+        ending.cause =
+          evidence.processGroupId === null
+            ? `${evidence.signal} was not sent: the pane's foreground process group was its own shell, so the session had already ended`
+            : `${evidence.signal} could not be delivered to process group ${evidence.processGroupId}${
+                evidence.detail === undefined ? "" : `: ${evidence.detail}`
+              }; whether the session is still running is unknown`;
+        if (evidence.processGroupId === null) ending.reason = "session-exit";
+        return { delivered: false, detail: ending.cause };
+      }, target);
+      await commit({
+        type: "lane_control_delivered",
+        actor: "runtime",
+        laneId,
+        data: {
+          attemptId: attempt.attemptId,
+          controlId,
+          control: "abort-session",
+          method: "signal-process-group",
+          ...delivery,
+        },
+      });
+      if (ending.reason !== null) {
+        await commit({
+          type: "interactive_attempt_ended",
+          actor: "runtime",
+          laneId,
+          data: {
+            attemptId: attempt.attemptId,
+            endReason: ending.reason,
+            cause: ending.cause,
+            // No exit code is invented: the signal went to a process group,
+            // and Herdr exposes no exit code on any surface.
+            exitCode: null,
+          },
+        });
+        // The end is durable BEFORE cleanup runs, so a cleanup that throws
+        // cannot cost the ledger the fact that this attempt ended. Cleanup
+        // commits nothing itself: no disposition, checkpoint, runner record or
+        // exit code can move because of it.
+        await this.releasePublishedAdvisory(runId, attempt);
+      }
+      if (error) throw error;
+    });
+  }
+
+  /**
+   * Human ownership of the lane's control channel. Reuses the shipped events,
+   * now with a payload that makes the change readable from the ledger alone.
+   *
+   * Nothing is sent to the session: no prompt, no keys, no signal, no restart,
+   * and no rebind. The single Herdr call is one read, and it is best-effort —
+   * ownership is a human's decision, so an unreadable agent records `null` and
+   * the switch happens anyway.
+   */
+  async takeover(runId: string, laneId: string): Promise<void> {
+    await this.mutate(runId, async (commit, run) =>
+      commit(
+        ownershipEvent(
+          "lane_takeover",
+          laneId,
+          await this.ownershipFrom(run, laneId),
+        ),
+      ),
+    );
+  }
+
+  async release(runId: string, laneId: string): Promise<void> {
+    await this.mutate(runId, async (commit, run) =>
+      commit(
+        ownershipEvent(
+          "lane_release",
+          laneId,
+          await this.ownershipFrom(run, laneId),
+        ),
+      ),
+    );
+  }
+
+  /**
+   * Record a human's authorization to retry. It stands alone in the ledger so
+   * it survives a controller that dies before the new attempt starts, and it
+   * carries its own evidence so a reader never has to infer the authorization
+   * from the attempt that followed it.
+   *
+   * The parent is checked FIRST — it must exist and it must belong to this lane
+   * — so a wrong-lane or unknown parent is refused before any event is
+   * committed and before Herdr is asked anything at all.
+   */
+  async authorizeRetry(
+    runId: string,
+    laneId: string,
+    parentAttemptId: string,
+    note: string,
+  ): Promise<void> {
+    await this.mutate(runId, async (commit, run) => {
+      const parent = this.attempt(run, parentAttemptId);
+      if (parent.laneId !== laneId) {
+        throw new Error(
+          `attempt "${parentAttemptId}" belongs to lane "${parent.laneId}", not "${laneId}": a retry is authorized within one lane`,
+        );
+      }
+      const target = this.targetOf(parent);
+      return commitRetryAuthorization(commit, laneId, {
+        parentAttemptId,
+        paneId: parent.paneId,
+        target,
+        method: "ledger-retry-authorization",
+        observedStatus: await this.observeStatus(target),
+        note,
+      });
+    });
+  }
+
+  // ------------------------------------------------------------- observations
+
+  /**
+   * Wait for Herdr to classify the pane as showing an approval or question UI.
+   * Consumed as a wait edge only: answering the approval is a human act,
+   * performed in the pane or through `steer`, and no approval-UI parser exists
+   * for any CLI.
+   */
+  async waitForBlocked(
+    runId: string,
+    laneId: string,
+    timeoutMs: number,
+    options: { readonly attemptId?: string } = {},
+  ): Promise<boolean> {
+    return this.mutate(runId, async (commit, run) => {
+      const attempt = this.targetAttempt(run, laneId, options.attemptId);
+      const observed = await this.deps.agentControl.waitForState(
+        this.targetOf(attempt),
+        ["blocked"],
+        timeoutMs,
+      );
+      if (observed === null) return false;
+      await commit(this.advisoryEvent(laneId, attempt, observed.status, null));
+      return observed.status === "blocked";
+    });
+  }
+
+  /** Publish runtime-owned advisory state for the UI. Optional, never evidence. */
+  async publishAdvisoryState(
+    runId: string,
+    laneId: string,
+    state: "idle" | "working" | "blocked" | "unknown",
+    message?: string,
+  ): Promise<void> {
+    await this.mutate(runId, async (commit, run) => {
+      const attempt = this.targetAttempt(run, laneId);
+      // The same gate every control passes, and for the same reason: an
+      // attempt that ended, or whose pane is gone or held by a stranger, is not
+      // something this runtime may describe. Checked BEFORE the Herdr call, so
+      // a refusal reaches neither the pane nor the ledger. Takeover is
+      // deliberately NOT checked — publishing is a description, not a control,
+      // and a human holding the lane does not stop the runtime saying what it
+      // sees.
+      this.assertControllable(attempt);
+      await this.deps.agentControl.reportAgentState({
+        paneId: attempt.paneId,
+        source: advisorySource(runId),
+        agent: this.targetOf(attempt),
+        state,
+        ...(message === undefined ? {} : { message }),
+      });
+      await commit(
+        this.advisoryEvent(
+          laneId,
+          attempt,
+          state,
+          message ?? null,
+          "runtime-published",
+        ),
+      );
+    });
+  }
+
+  /**
+   * Drop this run's advisory source on request. A lane that ends normally does
+   * not need it: `abortSession` releases what it published on its own — but
+   * only when the abort ended the attempt. An abort whose signal did not land
+   * ends nothing and releases nothing, which is exactly when this is the way
+   * out.
+   */
+  async releaseAdvisoryState(runId: string, laneId: string): Promise<void> {
+    await this.mutate(runId, async (_commit, run) => {
+      await this.releaseAgentSource(runId, this.targetAttempt(run, laneId));
+    });
+  }
+
+  // ------------------------------------------------------------------ recovery
+
+  /**
+   * Reconcile one attempt against the world. Four honest outcomes:
+   *
+   *   - `live`     — the pane hosts the expected kind; the attempt continues;
+   *   - `reoccupied` — the pane hosts something else; fail closed;
+   *   - `missing`  — the pane could not be resolved; fail closed, no exit code;
+   *   - `unknown-probe` — the probe itself failed, so nothing is known.
+   *
+   * Repeating this on a LIVE attempt is fine: it is an observation, the
+   * projection keeps the latest, and the event log keeps the history. It never
+   * revives an ended attempt — the end is what `assertControllable` reads.
+   */
+  async reconcileAttempt(
+    runId: string,
+    laneId: string,
+    attemptId: string,
+  ): Promise<ReconciliationOutcome> {
+    return this.mutate(runId, async (commit, run) => {
+      const attempt = this.attempt(run, attemptId);
+      const probe =
+        attempt.agentName === null
+          ? await this.probeStartingAttempt(attempt)
+          : await this.probePane(attempt);
+      await commit({
+        type: "interactive_attempt_reconciled",
+        actor: "runtime",
+        laneId,
+        data: {
+          attemptId,
+          outcome: probe.outcome,
+          // Re-read rather than assumed: a pane moved between workspaces gets
+          // a new workspace-qualified id.
+          paneId: probe.paneId,
+          detail: probe.detail,
+        },
+      });
+
+      // ADOPTION. A controller can die after `agent start` returned and before
+      // the bind landed, leaving a real Agent alive under an attempt that has
+      // no name. The probe above just proved, by strict pane + kind + expected
+      // deterministic name match, that the live agent IS this attempt's — so
+      // the attempt is bound from that evidence rather than orphaned.
+      if (probe.outcome === "live" && attempt.agentName === null) {
+        const observed = probe.observed!;
+        await commit({
+          type: "interactive_attempt_bound",
+          actor: "runtime",
+          laneId,
+          data: {
+            attemptId,
+            agentName: observed.name ?? attempt.expectedAgentName,
+            session: sessionIdentityOf(
+              attempt.agentKind,
+              observed.sessionId,
+              [],
+            ),
+            // Herdr does not report the argv of an agent it did not just
+            // start, so this records the adoption rather than inventing one.
+            argv: [],
+            readinessMs: 0,
+          },
+        });
+        // Adoption restores the BINDING, never a conversation. The adopted
+        // session may be sitting on a startup dialog, and recovery can no more
+        // read that pane than a launch can — so it submits nothing, and an
+        // existing unconfirmed submission is likewise never replayed.
+      }
+
+      // Only a POSITIVE finding ends an attempt. `unknown-probe` means the
+      // control plane failed, which is not evidence about the Agent.
+      const ends = probe.outcome === "reoccupied" || probe.outcome === "missing";
+      if (ends && attempt.endReason === null) {
+        await commit({
+          type: "interactive_attempt_ended",
+          actor: "runtime",
+          laneId,
+          data: {
+            attemptId,
+            endReason: "lost",
+            cause: probe.detail,
+            exitCode: null,
+          },
+        });
+      }
+      return probe.outcome;
+    });
+  }
+
+  // -------------------------------------------------------------------- runner
+
+  /**
+   * Run a verification command in its OWN pane, as an ordinary command. Never
+   * inside the agent session and never through the agent surface: an agent's
+   * claim that it ran a command is a claim, and this exit code is the evidence.
+   */
+  async recordRunnerEvidence(
+    runId: string,
+    laneId: string,
+    attemptId: string,
+    request: RunnerRequest,
+  ): Promise<{ readonly evidenceId: string; readonly exitCode: number | null }> {
+    return this.mutate(runId, async (commit, run) => {
+      const attempt = this.attempt(run, attemptId);
+      const lane = this.lane(run, laneId);
+      const evidenceId = this.deps.idgen();
+      assertHandleId("evidenceId", evidenceId);
+      const logFile =
+        request.logFile ??
+        attemptArtifactPaths(lane.artifactRoot!, attemptId).runnerLog(evidenceId);
+      const cwd = request.cwd ?? attempt.worktreePath;
+      const pane = await this.deps.adapter.splitPane({
+        from: { id: run.controllerPaneId },
+        direction: "down",
+        cwd,
+      });
+      const command = buildRunnerCommand({
+        runId,
+        evidenceId,
+        cwd,
+        logFile,
+        argv: request.argv,
+      });
+      const startedAt = this.deps.clock();
+      await this.deps.adapter.runInPane(pane, command);
+      await this.deps.adapter.waitForOutput(
+        pane,
+        sentinelRegex(runId, "RUNNER", evidenceId),
+        this.deps.runnerTimeoutMs ?? DEFAULT_RUNNER_TIMEOUT_MS,
+      );
+      const output = await this.read(logFile);
+      // The real exit code comes from the durable log's sentinel, never from
+      // the wait: a matched pattern says the line was printed, nothing more.
+      const exitCode = parseSentinelExit(runId, "RUNNER", evidenceId, output);
+      await commit({
+        type: "interactive_runner_evidence",
+        actor: "runner",
+        laneId,
+        data: {
+          evidenceId,
+          attemptId,
+          command,
+          logFile,
+          paneId: pane.id,
+          exitCode,
+          startedAt,
+          endedAt: this.deps.clock(),
+        },
+      });
+      return { evidenceId, exitCode };
+    });
+  }
+
+  /**
+   * Record the Agent's own checkpoint, read from the declared path. Nothing
+   * durable comes from scrollback: an alternate-screen TUI's departed rows
+   * never enter host scrollback and cannot be recovered with more lines.
+   */
+  async collectAgentCheckpoint(
+    runId: string,
+    laneId: string,
+    attemptId: string,
+  ): Promise<"agent" | "unknown"> {
+    return this.mutate(runId, async (commit, run) => {
+      const attempt = this.attempt(run, attemptId);
+      let text: string | null = null;
+      try {
+        text = await this.read(attempt.checkpointFile);
+      } catch {
+        text = null;
+      }
+      const parsed = text === null ? null : parseAgentStatus(text);
+      // No checkpoint: the runtime records `unknown` under its OWN actor and
+      // invents no Agent claim.
+      await commit({
+        type: "lane_checkpoint",
+        actor: parsed === null ? "runtime" : "agent",
+        laneId,
+        data: {
+          semanticState: parsed ?? "unknown",
+          checkpointFile: attempt.checkpointFile,
+          attemptId,
+        },
+      });
+      return parsed === null ? "unknown" : "agent";
+    });
+  }
+
+  // ------------------------------------------------------------------ readers
+
+  async inspect(runId: string): Promise<RunView> {
+    return this.load(runId);
+  }
+
+  async attempts(
+    runId: string,
+    laneId: string,
+  ): Promise<readonly InteractiveAttemptView[]> {
+    return this.attemptsOf(await this.load(runId), laneId);
+  }
+
+  // ---------------------------------------------------------------- internals
+
+  /**
+   * Probe the attempt's pane. Distinguishes a Herdr answer ("no such agent")
+   * from a Herdr failure ("the probe broke"): only the first is evidence.
+   */
+  private async probePane(attempt: InteractiveAttemptView): Promise<ProbeResult> {
+    let observed;
+    try {
+      observed = await this.deps.agentControl.getAgent(this.targetOf(attempt));
+    } catch (error) {
+      return {
+        outcome: "unknown-probe",
+        paneId: attempt.paneId,
+        detail: `the pane could not be probed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        observed: null,
+      };
+    }
+    if (observed !== null) {
+      return observed.agent === attempt.agentKind
+        ? { outcome: "live", paneId: observed.paneId, detail: null, observed }
+        : {
+            outcome: "reoccupied",
+            paneId: observed.paneId,
+            detail: `pane hosts ${observed.agent ?? "an unrecognized occupant"}, expected ${attempt.agentKind}`,
+            observed: null,
+          };
+    }
+    try {
+      await this.deps.adapter.processInfo({ id: attempt.paneId });
+    } catch {
+      return {
+        outcome: "missing",
+        paneId: attempt.paneId,
+        detail: "pane could not be resolved",
+        observed: null,
+      };
+    }
+    return {
+      outcome: "reoccupied",
+      paneId: attempt.paneId,
+      detail: "the pane no longer hosts the expected agent",
+      observed: null,
+    };
+  }
+
+  /**
+   * Probe an attempt that registered but never bound.
+   *
+   * The lookup is by the DETERMINISTIC name recorded at registration, and the
+   * result is accepted only when pane, kind and name all match. Anything else
+   * is a stranger's session or a pane that never ran one — never adopted,
+   * never prompted, never signalled.
+   */
+  private async probeStartingAttempt(
+    attempt: InteractiveAttemptView,
+  ): Promise<ProbeResult> {
+    let observed;
+    try {
+      observed = await this.deps.agentControl.getAgent(
+        attempt.expectedAgentName,
+      );
+    } catch (error) {
+      return {
+        outcome: "unknown-probe",
+        paneId: attempt.paneId,
+        detail: `the expected agent could not be looked up: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        observed: null,
+      };
+    }
+    if (observed === null) {
+      // No agent under this attempt's own name. Ask the pane itself before
+      // concluding: something else may be running there, and that is a
+      // different fact from nothing having started.
+      let occupant;
+      try {
+        occupant = await this.deps.agentControl.getAgent(attempt.paneId);
+      } catch (error) {
+        return {
+          outcome: "unknown-probe",
+          paneId: attempt.paneId,
+          detail: `the pane could not be probed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          observed: null,
+        };
+      }
+      if (occupant !== null) {
+        return {
+          outcome: "reoccupied",
+          paneId: occupant.paneId,
+          detail: `pane hosts agent "${occupant.name ?? "unnamed"}" (${occupant.agent ?? "unrecognized"}), expected "${attempt.expectedAgentName}"`,
+          observed: null,
+        };
+      }
+      // Nothing there. Saying the pane "no longer hosts" this attempt's Agent
+      // would describe something that never happened.
+      return {
+        outcome: "missing",
+        paneId: attempt.paneId,
+        detail: "the expected agent never started in this pane",
+        observed: null,
+      };
+    }
+    if (observed.paneId !== attempt.paneId) {
+      return {
+        outcome: "reoccupied",
+        paneId: attempt.paneId,
+        detail: `the expected agent name resolves to pane ${observed.paneId}, not ${attempt.paneId}`,
+        observed: null,
+      };
+    }
+    if (observed.agent !== attempt.agentKind) {
+      return {
+        outcome: "reoccupied",
+        paneId: observed.paneId,
+        detail: `pane hosts ${observed.agent ?? "an unrecognized occupant"}, expected ${attempt.agentKind}`,
+        observed: null,
+      };
+    }
+    // No further name check: the lookup was BY `expectedAgentName`, so a
+    // record returned here is that name's by construction. A pane running
+    // under some OTHER name is caught above, where the name lookup finds
+    // nothing and the pane itself is asked who is there.
+    return { outcome: "live", paneId: observed.paneId, detail: null, observed };
+  }
+
+  /**
+   * Carry out a control's effect and then try to observe it. The observation
+   * is best-effort by construction: a failed read yields `observedStatus: null`
+   * and never prevents the delivery fact from being recorded.
+   */
+  private async deliver(
+    effect: () => Promise<void | EffectOutcome>,
+    target: string,
+  ): Promise<{
+    readonly delivered: boolean;
+    readonly detail: string | null;
+    readonly observedStatus: AdvisoryAgentStatus | null;
+    readonly target: string;
+    readonly error?: Error;
+  }> {
+    let outcome: void | EffectOutcome;
+    try {
+      outcome = await effect();
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      return {
+        delivered: false,
+        detail: failure.message,
+        observedStatus: null,
+        target,
+        error: failure,
+      };
+    }
+    // An effect that returns nothing landed by not throwing — that is all
+    // `send-keys` can say. An effect that returns its own evidence is believed:
+    // a signal the OS refused is not a delivery, however cleanly the call
+    // returned.
+    const landed = outcome?.delivered ?? true;
+    const effectDetail = outcome?.detail ?? null;
+    try {
+      const observed = await this.deps.agentControl.getAgent(target);
+      return {
+        delivered: landed,
+        detail: effectDetail,
+        observedStatus: observed?.status ?? null,
+        target,
+      };
+    } catch (error) {
+      const why = error instanceof Error ? error.message : String(error);
+      return {
+        delivered: landed,
+        detail:
+          effectDetail === null
+            ? `delivered, but not observed: ${why}`
+            : `${effectDetail}; observation failed: ${why}`,
+        observedStatus: null,
+        target,
+      };
+    }
+  }
+
+  private advisoryEvent(
+    laneId: string,
+    attempt: InteractiveAttemptView,
+    status: AdvisoryAgentStatus,
+    message: string | null,
+    source: "herdr-detection" | "runtime-published" = "herdr-detection",
+  ): NewRunEvent {
+    return {
+      type: "lane_advisory_state_observed",
+      actor: "runtime",
+      laneId,
+      data: {
+        attemptId: attempt.attemptId,
+        status,
+        source,
+        paneId: attempt.paneId,
+        message,
+      },
+    };
+  }
+
+  private targetOf(attempt: InteractiveAttemptView): string {
+    // Re-resolved on every control call: a name is not a durable handle, so
+    // the ledger's paneId is the fallback Herdr also accepts as a target.
+    return attempt.agentName ?? attempt.paneId;
+  }
+
+  /**
+   * What a takeover or release records. `method` names the mechanism because
+   * that is the fact worth keeping: ownership moves by flipping the ledger's
+   * control mode, and by nothing that reaches the session.
+   *
+   * Public because `WorkflowRuntime` — the entry point `flow takeover` goes
+   * through — records the same payload, and ONE derivation is the point: the
+   * latest attempt, the target, the method, and the single best-effort read
+   * live here alone. It takes the RunView the caller already holds, so nothing
+   * reads the run twice; it commits nothing, and it never takes the controller
+   * lease, because `flow takeover` has to work while a live controller holds
+   * that lease — a human taking the lane back is exactly when one is running.
+   */
+  async ownershipFrom(
+    run: RunView,
+    laneId: string,
+  ): Promise<LaneOwnershipData> {
+    // Ownership belongs to the LANE, so it can change before the first attempt
+    // exists. Naming a target that is not there would be worse than none.
+    const attempt = this.attemptsOf(run, laneId).at(-1) ?? null;
+    const target = attempt === null ? null : this.targetOf(attempt);
+    return {
+      attemptId: attempt?.attemptId ?? null,
+      paneId: attempt?.paneId ?? null,
+      target,
+      method: "ledger-control-mode",
+      observedStatus: target === null ? null : await this.observeStatus(target),
+    };
+  }
+
+  /**
+   * One read, best-effort. A read that could not answer records `null`: that is
+   * an absence of observation, never a status, and never a reason to refuse a
+   * human's ownership change.
+   */
+  private async observeStatus(
+    target: string,
+  ): Promise<AdvisoryAgentStatus | null> {
+    try {
+      const observed = await this.deps.agentControl.getAgent(target);
+      return observed?.status ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private releaseAgentSource(
+    runId: string,
+    attempt: InteractiveAttemptView,
+  ): Promise<void> {
+    return this.deps.agentControl.releaseAgentState({
+      paneId: attempt.paneId,
+      source: advisorySource(runId),
+      agent: this.targetOf(attempt),
+    });
+  }
+
+  /**
+   * Clean up the advisory source this run published for an attempt that has
+   * just ended. Two conditions, both load-bearing:
+   *
+   *   - it runs only where something was actually published under this run's
+   *     source, so an attempt that never published is never written about;
+   *   - it runs only from a path that PROVED, moments earlier, that the pane
+   *     still hosts this attempt's agent. A lost or reoccupied pane is left
+   *     alone: the runtime no longer owns it, and whoever holds it now is not
+   *     this attempt.
+   */
+  private async releasePublishedAdvisory(
+    runId: string,
+    attempt: InteractiveAttemptView,
+  ): Promise<void> {
+    const published = attempt.advisory.some(
+      (entry) => entry.source === "runtime-published",
+    );
+    if (!published) return;
+    await this.releaseAgentSource(runId, attempt);
+  }
+
+  private assertNotTakenOver(run: RunView, laneId: string): void {
+    if (this.lane(run, laneId).controlMode === "human_owned") {
+      throw new LaneTakenOverError(laneId);
+    }
+  }
+
+  /**
+   * The single control gate. Terminality is checked FIRST and is permanent: a
+   * later `live` observation is still recorded, but it never restores control
+   * over an attempt that already ended.
+   */
+  private assertControllable(attempt: InteractiveAttemptView): void {
+    // A registered-but-unbound attempt is STARTING. It is not probed and not
+    // reconciled: no agent has been detected there yet, so "the pane does not
+    // host the expected agent" would be a conclusion about a race, not a fact.
+    if (attempt.agentName === null && attempt.endReason === null) {
+      throw new AttemptNotBoundError(attempt.attemptId);
+    }
+    if (attempt.endReason !== null) {
+      throw new AttemptNotControllableError(
+        attempt.attemptId,
+        `it ended as "${attempt.endReason}"${attempt.endCause === null ? "" : ` (${attempt.endCause})`}`,
+      );
+    }
+    const reconciliation = attempt.reconciliation;
+    if (reconciliation !== null && reconciliation.outcome !== "live") {
+      throw new AttemptNotControllableError(
+        attempt.attemptId,
+        reconciliation.detail ?? `pane reconciled ${reconciliation.outcome}`,
+      );
+    }
+  }
+
+  private attemptsOf(
+    run: RunView,
+    laneId: string,
+  ): readonly InteractiveAttemptView[] {
+    return run.interactiveAttemptOrder
+      .map((id) => run.interactiveAttempts[id]!)
+      .filter((attempt) => attempt.laneId === laneId);
+  }
+
+  private attempt(run: RunView, attemptId: string): InteractiveAttemptView {
+    const attempt = run.interactiveAttempts[attemptId];
+    if (!attempt) throw new Error(`unknown attemptId "${attemptId}"`);
+    return attempt;
+  }
+
+  private targetAttempt(
+    run: RunView,
+    laneId: string,
+    attemptId?: string,
+  ): InteractiveAttemptView {
+    if (attemptId !== undefined) return this.attempt(run, attemptId);
+    const current = this.attemptsOf(run, laneId).at(-1);
+    if (!current) throw new Error(`lane "${laneId}" has no attempt`);
+    return current;
+  }
+
+  private lane(run: RunView, laneId: string): LaneView {
+    const lane = run.lanes[laneId];
+    if (!lane) throw new Error(`unknown laneId "${laneId}"`);
+    return lane;
+  }
+
+  /**
+   * Every mutating operation runs here: queued on the run's single chain, and
+   * holding the run's controller lease for its whole duration. The `commit` it
+   * hands the body appends without re-queueing, so a check and the commit it
+   * authorizes are one indivisible step.
+   */
+  private mutate<T>(
+    runId: string,
+    body: (
+      commit: (input: NewRunEvent) => Promise<RunView>,
+      run: RunView,
+    ) => Promise<T>,
+    options: { readonly creates?: boolean } = {},
+  ): Promise<T> {
+    return this.serialize(runId, async () => {
+      const lease = await this.deps.ledger.acquireLease(runId, {
+        controllerId: `interactive-${process.pid}`,
+        pid: process.pid,
+      });
+      let bodyError: unknown;
+      try {
+        const loaded = await this.deps.ledger.load(runId);
+        if (loaded === null && options.creates !== true) {
+          throw new Error(`run not found: "${runId}"`);
+        }
+        if (loaded) this.runs.set(runId, loaded);
+        else this.runs.delete(runId);
+        const commit = (input: NewRunEvent) => this.append(runId, input);
+        return await body(commit, loaded as RunView);
+      } catch (error) {
+        bodyError = error;
+        throw error;
+      } finally {
+        // A failed release must not erase why the mutation failed. Same shape
+        // as `FsLedger.withCommitLock`: the body error stays primary and keeps
+        // its identity in `cause`, the release failure rides in the message,
+        // and neither is swallowed.
+        try {
+          await lease.release();
+        } catch (releaseError) {
+          if (bodyError !== undefined) {
+            throw new Error(
+              `interactive mutation failed: ${bodyError instanceof Error ? bodyError.message : String(bodyError)}; controller lease release failed: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`,
+              { cause: bodyError },
+            );
+          }
+          throw releaseError;
+        }
+      }
+    });
+  }
+
+  private serialize<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+    const prior = this.runTails.get(runId) ?? Promise.resolve();
+    const next = prior.then(fn, fn);
+    const tail = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.runTails.set(runId, tail);
+    void tail.then(() => {
+      if (this.runTails.get(runId) === tail) this.runTails.delete(runId);
+    });
+    return next;
+  }
+
+  /** Append one event. Only called from inside a `mutate` critical section. */
+  private async append(runId: string, input: NewRunEvent): Promise<RunView> {
+    const current = this.runs.get(runId);
+    const sequence = (current?.lastAppliedSequence ?? 0) + 1;
+    const event = {
+      schemaVersion: 1,
+      eventId: `${runId}#${sequence}`,
+      runId,
+      sequence,
+      at: this.deps.clock(),
+      controllerEpoch: current?.controllerEpoch ?? 0,
+      ...input,
+    } as RunEvent;
+    await this.deps.ledger.commit(event);
+    const next = reduce(current, event);
+    this.runs.set(runId, next);
+    return next;
+  }
+
+  private load(runId: string): Promise<RunView> {
+    return this.serialize(runId, async () => {
+      const loaded = await this.deps.ledger.load(runId);
+      if (!loaded) throw new Error(`run not found: "${runId}"`);
+      this.runs.set(runId, loaded);
+      return loaded;
+    });
+  }
+
+  private async read(path: string): Promise<string> {
+    if (this.deps.readDurable) return this.deps.readDurable(path);
+    return Bun.file(path).text();
+  }
+}
+
+/**
+ * The ONLY way this control plane commits a retry authorization. An ownership
+ * change is built by `ownershipEvent`, the strict builder this control plane
+ * shares with `WorkflowRuntime`, so the two producers of a carried payload
+ * cannot drift apart.
+ *
+ * The `data` parameter is the COMPLETE payload type, never the ledger's
+ * compatibility union. That union exists so a ledger written before this
+ * payload did still replays; it is not a way back in. A producer here that
+ * tried to commit `{}` would not typecheck, because `{}` is missing every
+ * required field of the type.
+ */
+function commitRetryAuthorization(
+  commit: (input: NewRunEvent) => Promise<RunView>,
+  laneId: string,
+  data: InteractiveRetryAuthorizedData,
+): Promise<RunView> {
+  return commit({
+    type: "interactive_retry_authorized",
+    actor: "human",
+    laneId,
+    data,
+  });
+}
+
+function advisorySource(runId: string): string {
+  return `agent-flow-${runId}`;
+}
+
+/**
+ * Read a session id out of an attempt's ACTUAL argv. Only the separate
+ * `--session-id <value>` form counts, because that is the form this runtime
+ * emits and the only one it can vouch for. Anything else is `null`; this is a
+ * one-flag lookup, not a CLI parser.
+ */
+function sessionIdInArgv(argv: readonly string[]): string | null {
+  const flag = argv.indexOf("--session-id");
+  if (flag === -1) return null;
+  const value = argv[flag + 1];
+  if (value === undefined || value.startsWith("-")) return null;
+  return value;
+}
+
+/**
+ * Session identity in the vocabulary the headless lane already uses, recorded
+ * only from evidence causally tied to THIS attempt: what Herdr observed, or a
+ * flag the launched argv actually carried. Anything else says why it is
+ * unavailable rather than naming a value nothing can vouch for.
+ */
+function sessionIdentityOf(
+  agentKind: InteractiveAgentKind,
+  observed: string | null,
+  argv: readonly string[],
+): SessionIdentity {
+  if (observed !== null) {
+    return {
+      kind: "measured",
+      id: observed,
+      evidence: "herdr agent surface reported the session for this pane",
+    };
+  }
+  // The fallback reads the argv Herdr reported launching, never an internal
+  // value: an id that did not reach the process is evidence of nothing, and an
+  // owner's `nativeArgs` override may carry no session flag at all.
+  const inArgv = sessionIdInArgv(argv);
+  if (inArgv !== null) {
+    return {
+      kind: "measured",
+      id: inArgv,
+      evidence: "carried by --session-id in this attempt's actual argv",
+    };
+  }
+  return {
+    kind: "unavailable",
+    reason: `${agentKind} reported no session id, and this attempt's argv carried no --session-id`,
+  };
+}
+
+/**
+ * How many retries a human has authorized past `parentAttemptId` that no
+ * attempt has consumed yet. One authorization buys exactly one attempt, so a
+ * second retry needs a second authorization — there is no path from a failure
+ * to a new attempt that does not pass through a human.
+ */
+export function pendingRetries(run: RunView, parentAttemptId: string): number {
+  const authorized = run.retryAuthorizations.filter(
+    (id) => id === parentAttemptId,
+  ).length;
+  const consumed = Object.values(run.interactiveAttempts).filter(
+    (attempt) => attempt.parentAttemptId === parentAttemptId,
+  ).length;
+  return authorized - consumed;
+}
+
+const SEMANTIC_STATES: readonly SemanticState[] = [
+  "working",
+  "complete",
+  "partial",
+  "blocked",
+  "unknown",
+];
+
+/** Read STATUS from an agent-authored checkpoint; null when it has none. */
+function parseAgentStatus(text: string): SemanticState | null {
+  const status = text.match(/^STATUS:\s*(\w+)/m)?.[1];
+  return SEMANTIC_STATES.find((value) => value === status) ?? null;
+}
+
+
+/**
+ * What is known about an attempt's latest control. Derived from the intent and
+ * its delivery, never stored:
+ *
+ *   - `none`         — no control was ever requested;
+ *   - `unconfirmed`  — a request is recorded and no delivery is; the effect may
+ *                      or may not have reached the session, and NOTHING may
+ *                      replay it on that basis;
+ *   - `delivered`    — the effect landed;
+ *   - `failed`       — the effect was attempted and did not land.
+ */
+export function controlDeliveryState(
+  record: ControlRecord,
+): ControlDeliveryState {
+  if (record.delivery === null) return "unconfirmed";
+  return record.delivery.delivered ? "delivered" : "failed";
+}
+
+/**
+ * Controls whose delivery never landed. They are kept, never replayed, and
+ * never erased by a later control: the effect may have reached the session,
+ * and only a human can decide what to do about that.
+ *
+ * Both shapes count. `unconfirmed` is a request with no delivery recorded at
+ * all; `failed` is a delivery that says the effect did not land — which an
+ * abort whose signal was refused now produces without throwing, so it would
+ * otherwise leave the operator's view the moment any later control landed.
+ */
+export function unresolvedControls(
+  attempt: InteractiveAttemptView,
+): readonly ControlRecord[] {
+  return attempt.controls.filter(
+    (record) => controlDeliveryState(record) !== "delivered",
+  );
+}
+
+/** The most recent control, or null when none was ever requested. */
+export function latestControl(
+  attempt: InteractiveAttemptView,
+): ControlRecord | null {
+  return attempt.controls.at(-1) ?? null;
+}

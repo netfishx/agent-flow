@@ -57,6 +57,38 @@ interface CommitLockRecord {
 type Sleep = (milliseconds: number) => Promise<void>;
 
 let snapshotSequence = 0;
+
+/**
+ * How many times a lease acquire re-races a lock file that disappeared while
+ * it was being read. Bounded so genuine contention still ends in a clean
+ * "already held" rather than spinning.
+ */
+const LEASE_ACQUIRE_ATTEMPTS = 8;
+
+/** The lock file was gone when read: contention, not corruption. */
+class LeaseVanishedError extends Error {
+  constructor(runId: string) {
+    super(`controller lease for run "${runId}" vanished while being read`);
+    this.name = "LeaseVanishedError";
+  }
+}
+
+/**
+ * The lock file exists but carries no readable owner. New locks are published
+ * atomically, so this can only be a legacy lock left by the old
+ * create-then-write sequence, or genuine damage. Either way nobody can prove
+ * who holds it, so it is re-read a few times and then surfaced as corrupt —
+ * never waited on forever, and never deleted on this process's say-so.
+ */
+class LeaseUnreadableError extends Error {
+  constructor(runId: string) {
+    super(`controller lease for run "${runId}" has no readable owner`);
+    this.name = "LeaseUnreadableError";
+  }
+}
+
+/** How many times an unreadable lock is re-read before it is called corrupt. */
+const LEASE_STABILITY_READS = 3;
 let commitStateSequence = 0;
 let leaseSequence = 0;
 let commitLockSequence = 0;
@@ -393,36 +425,88 @@ export class FsLedger implements Ledger {
       epoch,
       acquiredAt: Date.now(),
     });
-    let handle: FileHandle | undefined;
-    try {
-      handle = await open(lockFile, "wx");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const holder = await this.readControllerLease(lockFile, runId);
+    // Publish atomically. A lock is never visible half-written: the record is
+    // written to a private temp file, flushed, and then `link`ed onto the lock
+    // path, which fails rather than replacing an existing holder. The old
+    // create-then-write sequence could leave a public empty lock on a crash.
+    let owned: ControllerLeaseRecord | undefined;
+    for (let attempt = 0; ; attempt++) {
+      const mine = record(0);
+      const temp = join(
+        runDir,
+        `.controller.lock.tmp-${process.pid}-${++leaseSequence}`,
+      );
+      let published = false;
+      try {
+        const handle = await open(temp, "wx");
+        try {
+          await handle.writeFile(`${JSON.stringify(mine)}\n`, "utf8");
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        await link(temp, lockFile);
+        published = true;
+        // The link is only durable once the directory entry is flushed, which
+        // is the same promise `replaceControllerLease` makes after its rename.
+        await this.syncDirectory(runDir);
+        owned = mine;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+          // A link that cannot be made durable is not a lease. Losing the race
+          // is the only failure that leaves the lock standing.
+          if (published) await unlink(lockFile).catch(() => {});
+          throw error;
+        }
+      } finally {
+        // The temp file is ours in every outcome — published, lost the race,
+        // or thrown — and never outlives this call.
+        await unlink(temp).catch(() => {});
+      }
+      if (owned) break;
+
+      let holder: ControllerLeaseRecord;
+      try {
+        holder = await this.readLeaseWithStability(lockFile, runId);
+      } catch (error) {
+        if (
+          error instanceof LeaseVanishedError &&
+          attempt < LEASE_ACQUIRE_ATTEMPTS - 1
+        ) {
+          continue;
+        }
+        if (error instanceof LeaseVanishedError) {
+          throw new ControllerLeaseHeldError(
+            `controller lease for run "${runId}" is already held`,
+          );
+        }
+        if (error instanceof LeaseUnreadableError) {
+          throw new Error(`corrupt controller lease for run "${runId}"`, {
+            cause: error,
+          });
+        }
+        throw error;
+      }
       if (this.isPidAlive(holder.pid)) {
         throw new ControllerLeaseHeldError(
           `controller lease for run "${runId}" is already held`,
         );
       }
-      await this.takeOverControllerLease(
+      owned = await this.takeOverControllerLease(
         runDir,
         lockFile,
         runId,
         holder,
         record(holder.epoch + 1),
       );
+      break;
     }
-    if (handle) {
-      try {
-        await handle.writeFile(`${JSON.stringify(record(0))}\n`, "utf8");
-        await handle.sync();
-      } catch (error) {
-        await handle.close();
-        await unlink(lockFile).catch(() => {});
-        throw error;
-      }
-      await handle.close();
+    if (!owned) {
+      // Unreachable: every exit from the loop above either assigns the record
+      // this call published, or throws.
+      throw new Error(`controller lease for run "${runId}" was not acquired`);
     }
+    const held = owned;
 
     let released = false;
     let releaseInFlight: Promise<void> | null = null;
@@ -430,7 +514,12 @@ export class FsLedger implements Ledger {
       release: () => {
         if (released) return Promise.resolve();
         if (releaseInFlight) return releaseInFlight;
-        releaseInFlight = unlink(lockFile)
+        releaseInFlight = this.releaseControllerLease(
+          runDir,
+          lockFile,
+          runId,
+          held,
+        )
           .then(() => {
             released = true;
           })
@@ -442,17 +531,93 @@ export class FsLedger implements Ledger {
     };
   }
 
+  /**
+   * Delete the lock only while it still carries the record this handle
+   * published. A controller whose PID was judged dead keeps its handle, and
+   * that handle must never unlink the lock of the controller that took over —
+   * doing so would hand a third controller a lease the second still holds.
+   *
+   * The read and the unlink are not one atomic step, so this only holds under
+   * the production liveness premises: `realPidIsAlive` calls a PID dead ONLY
+   * on ESRCH, and every caller acquires with its own live `process.pid`. A
+   * live holder is therefore never judged dead, which bounds the residual
+   * stale-release window to a holder that has already exited. Crossing hosts,
+   * crossing PID namespaces, or changing liveness semantics voids that premise
+   * and requires re-deciding the lock protocol itself — not patching here.
+   */
+  private async releaseControllerLease(
+    runDir: string,
+    lockFile: string,
+    runId: string,
+    held: ControllerLeaseRecord,
+  ): Promise<void> {
+    let current: ControllerLeaseRecord;
+    try {
+      current = await this.readControllerLease(lockFile, runId);
+    } catch (error) {
+      // Already gone: there is nothing left to release.
+      if (error instanceof LeaseVanishedError) return;
+      // Nobody can prove this lock is ours, so it stays where it is.
+      if (error instanceof LeaseUnreadableError) {
+        throw new Error(`corrupt controller lease for run "${runId}"`, {
+          cause: error,
+        });
+      }
+      throw error;
+    }
+    if (!isDeepStrictEqual(current, held)) return;
+    try {
+      await unlink(lockFile);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    await this.syncDirectory(runDir);
+  }
+
+  /**
+   * Read the lock, re-reading an unreadable one a few times before calling it
+   * corrupt. A lock mid-publish is never unreadable — publication is atomic —
+   * so a lock that stays unreadable is a legacy or damaged one, and saying so
+   * is better than waiting on an owner nobody can name.
+   */
+  private async readLeaseWithStability(
+    lockFile: string,
+    runId: string,
+  ): Promise<ControllerLeaseRecord> {
+    let lastUnreadable: unknown = null;
+    for (let read = 0; read < LEASE_STABILITY_READS; read++) {
+      try {
+        return await this.readControllerLease(lockFile, runId);
+      } catch (error) {
+        if (!(error instanceof LeaseUnreadableError)) throw error;
+        lastUnreadable = error;
+      }
+    }
+    throw lastUnreadable;
+  }
+
   private async readControllerLease(
     lockFile: string,
     runId: string,
   ): Promise<ControllerLeaseRecord> {
+    let raw: string;
+    try {
+      raw = await readFile(lockFile, "utf8");
+    } catch (error) {
+      // The holder released between our failed create and this read, or has
+      // not flushed yet. That is contention, not corruption — real permission
+      // and I/O errors keep propagating untouched.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new LeaseVanishedError(runId);
+      }
+      throw error;
+    }
+    if (raw.trim().length === 0) throw new LeaseUnreadableError(runId);
     let parsed: unknown;
     try {
-      parsed = JSON.parse(await readFile(lockFile, "utf8"));
-    } catch (error) {
-      throw new Error(`corrupt controller lease for run "${runId}"`, {
-        cause: error,
-      });
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new LeaseUnreadableError(runId);
     }
     if (
       typeof parsed !== "object" ||
@@ -465,7 +630,7 @@ export class FsLedger implements Ledger {
       (parsed as { epoch: number }).epoch < 0 ||
       !Number.isFinite((parsed as { acquiredAt?: unknown }).acquiredAt)
     ) {
-      throw new Error(`corrupt controller lease for run "${runId}"`);
+      throw new LeaseUnreadableError(runId);
     }
     return parsed as ControllerLeaseRecord;
   }
@@ -480,6 +645,7 @@ export class FsLedger implements Ledger {
       `.controller.lock.tmp-${process.pid}-${++leaseSequence}`,
     );
     let handle: FileHandle | undefined;
+    let published = false;
     try {
       handle = await open(temp, "wx");
       await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
@@ -487,26 +653,28 @@ export class FsLedger implements Ledger {
       await handle.close();
       handle = undefined;
       await rename(temp, lockFile);
-      const directory = await open(runDir, "r");
-      try {
-        await directory.sync();
-      } finally {
-        await directory.close();
-      }
+      published = true;
+      await this.syncDirectory(runDir);
     } catch (error) {
       await handle?.close().catch(() => {});
       await unlink(temp).catch(() => {});
+      // A lock that cannot be made durable is not a lease. The rename already
+      // made this record public, and the caller is about to throw, so leaving
+      // it there would strand a lock no controller holds and no takeover can
+      // reclaim while its PID is alive. Cleanup never masks the real error.
+      if (published) await unlink(lockFile).catch(() => {});
       throw error;
     }
   }
 
+  /** Returns the record actually published, whose epoch the loop may advance. */
   private async takeOverControllerLease(
     runDir: string,
     lockFile: string,
     runId: string,
     observed: ControllerLeaseRecord,
     replacement: ControllerLeaseRecord,
-  ): Promise<void> {
+  ): Promise<ControllerLeaseRecord> {
     let holder = observed;
     const marker: ControllerTakeoverMarker = {
       schemaVersion: 1,
@@ -546,11 +714,12 @@ export class FsLedger implements Ledger {
             `controller lease for run "${runId}" is already held`,
           );
         }
-        await this.replaceControllerLease(runDir, lockFile, {
+        const publishedRecord: ControllerLeaseRecord = {
           ...replacement,
           epoch: holder.epoch + 1,
-        });
-        return;
+        };
+        await this.replaceControllerLease(runDir, lockFile, publishedRecord);
+        return publishedRecord;
       }
 
       const currentHolder = await this.readControllerLease(lockFile, runId);
@@ -1079,7 +1248,7 @@ export class FsLedger implements Ledger {
     }
   }
 
-  private async syncDirectory(path: string): Promise<void> {
+  protected async syncDirectory(path: string): Promise<void> {
     const directory = await open(path, "r");
     try {
       await directory.sync();

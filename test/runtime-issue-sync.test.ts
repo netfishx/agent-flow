@@ -101,6 +101,49 @@ class LeaseFailureLedger implements Ledger {
   }
 }
 
+/**
+ * Delegates every ledger call, fails one commit type, and fails every lease
+ * release. Both failures are needed to reach the double-error window: the
+ * commit failure is the mutation's own error, the release failure is what used
+ * to replace it.
+ */
+class ReleaseFailureLedger implements Ledger {
+  constructor(
+    private readonly delegate: Ledger,
+    private readonly failCommitOn: RunEventType,
+  ) {}
+
+  commit(event: RunEvent): Promise<void> {
+    if (event.type === this.failCommitOn) {
+      return Promise.reject(
+        new Error(`injected ${event.type} commit failure`),
+      );
+    }
+    return this.delegate.commit(event);
+  }
+
+  load(runId: string) {
+    return this.delegate.load(runId);
+  }
+
+  list() {
+    return this.delegate.list();
+  }
+
+  async acquireLease(
+    runId: string,
+    controller: { controllerId: string; pid: number },
+  ): Promise<LeaseHandle> {
+    const lease = await this.delegate.acquireLease(runId, controller);
+    return {
+      release: async () => {
+        await lease.release();
+        throw new Error("injected controller lease release failure");
+      },
+    };
+  }
+}
+
 class BeforeAcquireLedger implements Ledger {
   acquireCalls = 0;
   releaseCalls = 0;
@@ -927,6 +970,78 @@ describe("WorkflowRuntime issue synchronization", () => {
         finished.lanes[laneId],
       );
     }
+  });
+
+  test("a start failure stays primary when its lease release also fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-flow-start-release-"));
+    roots.push(root);
+    const clock = createClock(1_000);
+    const adapter = new CountingAdapter({
+      clock,
+      lanes: [{ laneId: "review", exitCode: 0 }],
+    });
+    const runtime = new WorkflowRuntime({
+      adapter,
+      ledger: new ReleaseFailureLedger(new InMemoryLedger(), "run_started"),
+      clock: clock.now,
+      idgen: () => "run-start-release",
+      readResultFile: adapter.readResultFile,
+      sleep: async () => {},
+    });
+
+    const error = await runtime.startWorkflow(config(root, false)).then(
+      () => null,
+      (rejection: unknown) => rejection,
+    );
+
+    expect(error).toBeInstanceOf(Error);
+    const failure = error as Error;
+    expect(failure.message).toContain("injected run_started commit failure");
+    expect(failure.message).toContain("controller lease release failed");
+    expect(failure.message).toContain(
+      "injected controller lease release failure",
+    );
+    expect(failure.cause).toBeInstanceOf(Error);
+    expect((failure.cause as Error).message).toBe(
+      "injected run_started commit failure",
+    );
+  });
+
+  test("a finished resume failure stays primary when its lease release also fails", async () => {
+    const { handle, ledger } = await finishedRunWithOutstandingComplete(
+      "run-finished-delivery-release",
+    );
+
+    const error = await new WorkflowRuntime({
+      adapter: new ExplodingHerdrAdapter(),
+      ledger: new ReleaseFailureLedger(ledger, "controller_attached"),
+      clock: () => 4_000,
+      idgen: () => "unused",
+      readResultFile: async () => {
+        throw new Error("finished-run retry read a lane artifact");
+      },
+      sleep: async () => {},
+      issueTracker: new FakeIssueTracker(),
+    })
+      .resumeWorkflow(handle.runId)
+      .then(
+        () => null,
+        (rejection: unknown) => rejection,
+      );
+
+    expect(error).toBeInstanceOf(Error);
+    const failure = error as Error;
+    expect(failure.message).toContain(
+      "injected controller_attached commit failure",
+    );
+    expect(failure.message).toContain("controller lease release failed");
+    expect(failure.message).toContain(
+      "injected controller lease release failure",
+    );
+    expect(failure.cause).toBeInstanceOf(Error);
+    expect((failure.cause as Error).message).toBe(
+      "injected controller_attached commit failure",
+    );
   });
 
   test("finished resume with outstanding delivery refuses a live controller holder", async () => {
@@ -1760,7 +1875,7 @@ GAPS:
     });
     await runtime.confirmLaneStarted(handle.runId, "human");
     await runtime.confirmLaneStarted(handle.runId, "sibling");
-    await runtime.takeoverLane(handle.runId, "human");
+    await runtime.takeoverLane(handle.runId, "human", null);
     const checkpointFile = join(
       root,
       "work",
@@ -1830,7 +1945,7 @@ GAPS:
     const runtime = new WorkflowRuntime(deps);
     const handle = await runtime.startWorkflow(config(root));
     await runtime.confirmLaneStarted(handle.runId, "review");
-    await runtime.takeoverLane(handle.runId, "review");
+    await runtime.takeoverLane(handle.runId, "review", null);
     const checkpointFile = join(
       root,
       "work",
@@ -1999,7 +2114,7 @@ GAPS:
       issueTracker: tracker,
     });
     const handle = await runtime.startWorkflow(config(root));
-    await runtime.takeoverLane(handle.runId, "review");
+    await runtime.takeoverLane(handle.runId, "review", null);
     await appendEvent(
       ledger,
       handle.runId,

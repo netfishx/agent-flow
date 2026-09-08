@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { RealHerdrAdapter } from "../herdr/real-adapter.ts";
 import { issueApiPath } from "../issue/gh-argv.ts";
 import { GitReviewIsolation } from "../review/isolation.ts";
@@ -7,18 +8,188 @@ import { projectSynchronization } from "../issue/milestones.ts";
 import { RealIssueTracker } from "../issue/real-tracker.ts";
 import { sameIssueTarget } from "../issue/target.ts";
 import { FsLedger, resolveLedgerRoot } from "../runtime/fs-ledger.ts";
-import type {
-  IssueRef,
-  OwnerDecision,
-} from "../runtime/events.ts";
+import { RealHerdrAgentControl } from "../herdr/real-agent-control.ts";
+import { attemptDisposition } from "../interactive/attempts.ts";
+import {
+  InteractiveLaneController,
+  controlDeliveryState,
+  latestControl,
+  pendingRetries,
+  unresolvedControls,
+} from "../interactive/control-plane.ts";
+import { GitWriteLaneIsolation } from "../interactive/isolation.ts";
+import type { IssueRef, OwnerDecision } from "../runtime/events.ts";
 import type { Ledger } from "../runtime/ledger.ts";
 import { projectRunState, type RunView } from "../runtime/reducer.ts";
-import { WorkflowRuntime } from "../runtime/runtime.ts";
+import {
+  WorkflowRuntime,
+  type LaneOwnershipProvider,
+} from "../runtime/runtime.ts";
 import type { RuntimeDeps } from "../runtime/types.ts";
 import { stat } from "node:fs/promises";
 
 const USAGE =
   "usage: flow status | flow inspect <runId> | flow resume <runId> | flow takeover <runId> <laneId> | flow release <runId> <laneId> | flow decide <runId> --decision <accepted|rejected|changes-requested> --note <text> [--issue-state <text>]";
+
+/**
+ * The interactive write lane's human controls, parsed separately because every
+ * one of them is a HUMAN act: no runtime path issues a steer, a cancel, an
+ * abort, or a retry, so the CLI is where the authorization enters the ledger.
+ */
+const INTERACTIVE_USAGE = [
+  "usage: flow open-lane --workflow <name> --workspace <ws> --cwd <dir> --lane <id> --kind <claude|codex|grok> --model <m> --effort <e> --repo <repoRoot> --worktree <linked worktree>",
+  "       flow start-attempt <runId> <laneId> --note <text> [--parent <attemptId>]",
+  "       flow steer <runId> <laneId> <text>",
+  "       flow cancel-turn <runId> <laneId>",
+  "       flow abort-session <runId> <laneId>",
+  "       flow authorize-retry <runId> <laneId> <attemptId> --note <text>",
+  "       flow reconcile <runId> <laneId> <attemptId>",
+].join("\n");
+
+export const INTERACTIVE_COMMANDS = [
+  "open-lane",
+  "start-attempt",
+  "steer",
+  "cancel-turn",
+  "abort-session",
+  "authorize-retry",
+  "reconcile",
+] as const;
+
+export type InteractiveCommand = (typeof INTERACTIVE_COMMANDS)[number];
+
+export interface InteractiveInvocation {
+  readonly command: InteractiveCommand;
+  readonly runId: string | null;
+  readonly laneId: string | null;
+  readonly attemptId: string | null;
+  readonly text: string | null;
+  readonly flags: Readonly<Record<string, string>>;
+}
+
+const AGENT_KINDS: ReadonlySet<string> = new Set(["claude", "codex", "grok"]);
+
+/** Parse `--flag value` pairs; null on a repeat, a stray, or a missing value. */
+function parseFlags(
+  args: readonly string[],
+  allowed: readonly string[],
+): Readonly<Record<string, string>> | null {
+  const values: Record<string, string> = {};
+  for (let index = 0; index < args.length; index += 2) {
+    const flag = args[index];
+    const value = args[index + 1];
+    if (
+      flag === undefined ||
+      value === undefined ||
+      !allowed.includes(flag) ||
+      flag in values ||
+      value.startsWith("--")
+    ) {
+      return null;
+    }
+    values[flag] = value;
+  }
+  return values;
+}
+
+const OPEN_LANE_FLAGS = [
+  "--workflow",
+  "--workspace",
+  "--cwd",
+  "--lane",
+  "--kind",
+  "--model",
+  "--effort",
+  "--worktree",
+  "--repo",
+] as const;
+
+/** Parse an interactive invocation, or null when it is malformed. */
+export function parseInteractiveArgs(
+  args: readonly string[],
+): InteractiveInvocation | null {
+  const [command, ...rest] = args;
+  if (
+    command === undefined ||
+    !(INTERACTIVE_COMMANDS as readonly string[]).includes(command)
+  ) {
+    return null;
+  }
+
+  if (command === "open-lane") {
+    const flags = parseFlags(rest, OPEN_LANE_FLAGS);
+    if (flags === null) return null;
+    for (const flag of OPEN_LANE_FLAGS) {
+      if (flags[flag] === undefined) return null;
+    }
+    if (!AGENT_KINDS.has(flags["--kind"]!)) return null;
+    return {
+      command,
+      runId: null,
+      laneId: null,
+      attemptId: null,
+      text: null,
+      flags,
+    };
+  }
+
+  const [runId, laneId, third, ...tail] = rest;
+  if (
+    runId === undefined ||
+    laneId === undefined ||
+    runId.startsWith("--") ||
+    laneId.startsWith("--")
+  ) {
+    return null;
+  }
+  const base = {
+    command: command as InteractiveCommand,
+    runId,
+    laneId,
+    flags: {},
+  } as const;
+
+  if (command === "start-attempt") {
+    // No brief here: starting a session and instructing it are separate acts.
+    const flags = parseFlags(
+      third === undefined ? [] : [third, ...tail],
+      ["--note", "--parent"],
+    );
+    if (flags === null || flags["--note"] === undefined) return null;
+    return {
+      ...base,
+      attemptId: flags["--parent"] ?? null,
+      text: null,
+      flags,
+    };
+  }
+  if (command === "steer") {
+    if (third === undefined || tail.length > 0) return null;
+    return { ...base, attemptId: null, text: third };
+  }
+  if (command === "cancel-turn" || command === "abort-session") {
+    if (third !== undefined) return null;
+    return { ...base, attemptId: null, text: null };
+  }
+  if (command === "reconcile") {
+    if (third === undefined || third.startsWith("--") || tail.length > 0) {
+      return null;
+    }
+    return { ...base, attemptId: third, text: null };
+  }
+  // authorize-retry <attemptId> --note <text>
+  if (
+    third === undefined ||
+    third.startsWith("--") ||
+    tail.length !== 2 ||
+    tail[0] !== "--note" ||
+    tail[1] === undefined
+  ) {
+    return null;
+  }
+  return { ...base, attemptId: third, text: tail[1] };
+}
+
 const DEFAULT_LANE_TIMEOUT_MS = 300_000;
 
 interface TextSink {
@@ -28,6 +199,7 @@ interface TextSink {
 export interface FlowCliOptions {
   readonly environment?: NodeJS.ProcessEnv;
   readonly runtimeFactory?: (ledger: Ledger) => WorkflowRuntime;
+  readonly interactiveFactory?: (ledger: Ledger) => InteractiveLaneController;
 }
 
 interface DecideInput {
@@ -123,6 +295,67 @@ function renderSynchronization(run: RunView, stdout: TextSink): void {
   }
 }
 
+/**
+ * Interactive attempts, rendered so the advisory channel and the objective
+ * facts stay visibly apart. `disposition` is computed from the objective facts
+ * alone; the advisory line beside it is labelled as what it is.
+ */
+function renderInteractiveAttempts(run: RunView, stdout: TextSink): void {
+  for (const attemptId of run.interactiveAttemptOrder) {
+    const attempt = run.interactiveAttempts[attemptId]!;
+    const latestAdvisory = attempt.advisory.at(-1);
+    stdout.write(
+      `attempt=${attempt.attemptId} lane=${attempt.laneId} ordinal=${attempt.ordinal} parent=${value(attempt.parentAttemptId)}\n`,
+    );
+    const session =
+      attempt.session.kind === "measured"
+        ? `measured:${attempt.session.id}`
+        : `unavailable(${quotedValue(attempt.session.reason)})`;
+    stdout.write(
+      `  disposition=${attemptDisposition(attempt)} endReason=${value(attempt.endReason)} endCause=${quotedValue(attempt.endCause)} exitCode=${value(attempt.exitCode)} supersededBy=${value(attempt.supersededBy)}\n`,
+    );
+    stdout.write(
+      `  agentKind=${attempt.agentKind} pane=${attempt.paneId} name=${value(attempt.agentName)} session=${session} controlMode=${attempt.controlMode}\n`,
+    );
+    stdout.write(
+      `  authorization actor=${attempt.authorization.actor} note=${quotedValue(attempt.authorization.note)} pendingRetries=${pendingRetries(run, attempt.attemptId)}\n`,
+    );
+    stdout.write(
+      `  declared brief=${attempt.briefFile} checkpoint=${attempt.checkpointFile} result=${attempt.resultPointer}\n`,
+    );
+    stdout.write(
+      `  checkpoint origin=${value(attempt.agentCheckpoint?.origin ?? null)} state=${value(attempt.agentCheckpoint?.semanticState ?? null)} runnerEvidence=${attempt.runnerEvidence.length}\n`,
+    );
+    for (const record of attempt.runnerEvidence) {
+      stdout.write(
+        `  runner=${record.evidenceId} pane=${record.paneId} exitCode=${value(record.exitCode)} log=${record.logFile}\n`,
+      );
+    }
+    const latest = latestControl(attempt);
+    const unresolved = unresolvedControls(attempt);
+    stdout.write(
+      `  steer submitted=${attempt.steerSubmissions} observed=${attempt.steerObservations} cancelTurnRequestedAt=${value(attempt.lastCancelTurnAt)} abortRequestedAt=${value(attempt.lastAbortAt)}\n`,
+    );
+    // Never `control=null delivered=null`: a request with no delivery is an
+    // explicit `unconfirmed`, not an absence, and it is never dropped.
+    stdout.write(
+      `  controls=${attempt.controls.length} unresolvedControls=${unresolved.length} lastControl=${value(latest?.control ?? null)} delivery=${latest === null ? "none" : controlDeliveryState(latest)} detail=${quotedValue(latest?.delivery?.detail ?? null)}\n`,
+    );
+    for (const record of unresolved) {
+      stdout.write(
+        `  unresolved control=${record.control} controlId=${record.controlId} requestedAt=${record.requestedAt} delivery=unconfirmed\n`,
+      );
+    }
+    stdout.write(
+      `  reconciliation=${value(attempt.reconciliation?.outcome ?? null)} detail=${quotedValue(attempt.reconciliation?.detail ?? null)}\n`,
+    );
+    // ADVISORY. Never evidence, and never an input to `disposition` above.
+    stdout.write(
+      `  advisory(not evidence) count=${attempt.advisory.length} latest=${value(latestAdvisory?.status ?? null)} source=${value(latestAdvisory?.source ?? null)}\n`,
+    );
+  }
+}
+
 function renderRun(run: RunView, stdout: TextSink): void {
   stdout.write(
     `runId=${run.runId} workflow=${run.workflow} state=${projectRunState(run)} finishStatus=${value(run.finishStatus)} updatedAt=${run.updatedAt}\n`,
@@ -142,7 +375,7 @@ function renderRun(run: RunView, stdout: TextSink): void {
       `  registeredAt=${lane.registeredAt} dispatchIntentAt=${value(lane.dispatchIntentAt)} dispatchedAt=${value(lane.dispatchedAt)} liveAt=${value(lane.liveAt)} completedAt=${value(lane.completedAt)} checkpointAt=${value(lane.checkpointAt)} contractEvaluatedAt=${value(lane.contractEvaluatedAt)} verificationRecordedAt=${value(lane.verificationRecordedAt)}\n`,
     );
     stdout.write(
-      `  artifacts stdout=${lane.logFile} stderr=${lane.stderrFile} checkpoint=${value(lane.checkpointFile)} result=${value(lane.resultFile)} evidence=${value(lane.evidenceFile)}\n`,
+      `  artifacts stdout=${value(lane.logFile)} stderr=${value(lane.stderrFile)} checkpoint=${value(lane.checkpointFile)} result=${value(lane.resultFile)} evidence=${value(lane.evidenceFile)}\n`,
     );
     if (lane.kind === "agent") {
       const session =
@@ -178,6 +411,7 @@ function renderRun(run: RunView, stdout: TextSink): void {
       );
     }
   }
+  renderInteractiveAttempts(run, stdout);
 }
 
 function laneTimeout(environment: NodeJS.ProcessEnv): number {
@@ -293,6 +527,149 @@ async function requireLedgerRoot(root: string): Promise<void> {
   }
 }
 
+/**
+ * The dependencies a real interactive controller gets. Split out so the wiring
+ * is testable on its own — the same reason `realRuntimeDeps` is exported.
+ */
+export function realInteractiveController(
+  ledger: Ledger,
+  ledgerRoot: string,
+): InteractiveLaneController {
+  return new InteractiveLaneController({
+    adapter: new RealHerdrAdapter(),
+    agentControl: new RealHerdrAgentControl(),
+    ledger,
+    // Proves the write lane's worktree before any pane or event exists.
+    isolation: new GitWriteLaneIsolation(),
+    // Attempt artifacts share the ledger's lifetime, so a checkpoint the
+    // ledger points at cannot outlive or predecease the record naming it.
+    artifactRoot: join(ledgerRoot, "interactive"),
+    clock: () => Date.now(),
+    idgen: () =>
+      `att-${Date.now().toString(36)}-${randomUUID().replaceAll("-", "").slice(0, 12)}`,
+    sessionIdgen: () => randomUUID(),
+  });
+}
+
+async function runInteractiveCli(
+  args: readonly string[],
+  stdout: TextSink,
+  stderr: TextSink,
+  options: FlowCliOptions,
+): Promise<number> {
+  const invocation = parseInteractiveArgs(args);
+  if (invocation === null) {
+    stderr.write(`${INTERACTIVE_USAGE}\n`);
+    return 2;
+  }
+  try {
+    const environment = options.environment ?? process.env;
+    const root = resolveLedgerRoot(environment);
+    await requireLedgerRoot(root);
+    const ledger = new FsLedger(root);
+    const controller =
+      options.interactiveFactory?.(ledger) ??
+      realInteractiveController(ledger, root);
+    const flags = invocation.flags;
+    let runId = invocation.runId;
+    const laneId = invocation.laneId!;
+    switch (invocation.command) {
+      case "open-lane": {
+        const opened = await controller.openLane({
+          workflow: flags["--workflow"]!,
+          workspace: flags["--workspace"]!,
+          cwd: flags["--cwd"]!,
+          laneId: flags["--lane"]!,
+          agentKind: flags["--kind"] as "claude" | "codex" | "grok",
+          model: flags["--model"]!,
+          effort: flags["--effort"]!,
+          worktreePath: flags["--worktree"]!,
+          repoRoot: flags["--repo"]!,
+        });
+        runId = opened.runId;
+        stdout.write(`runId=${opened.runId} laneId=${opened.laneId}\n`);
+        break;
+      }
+      case "start-attempt": {
+        // Launch and bind only. Herdr's readiness is advisory — it reports a
+        // vendor update modal as idle — so the first instruction is a separate,
+        // human-driven act once the pane has been looked at.
+        const outcome = await controller.startAttempt(runId!, laneId, {
+          authorization: { note: flags["--note"]! },
+          ...(invocation.attemptId === null
+            ? {}
+            : { parentAttemptId: invocation.attemptId }),
+        });
+        stdout.write(
+          `attempt=${outcome.attemptId} started=${outcome.started} startFailure=${quotedValue(outcome.startFailure)}\n`,
+        );
+        if (outcome.started) {
+          stdout.write(
+            `the session is bound but has been told nothing; inspect the pane, clear any trust or update dialog, then submit the brief with: flow steer ${runId} ${laneId} <text>\n`,
+          );
+        }
+        break;
+      }
+      case "steer":
+        await controller.steer(runId!, laneId, invocation.text!);
+        break;
+      case "cancel-turn":
+        await controller.cancelTurn(runId!, laneId);
+        break;
+      case "abort-session":
+        await controller.abortSession(runId!, laneId);
+        break;
+      case "authorize-retry":
+        await controller.authorizeRetry(
+          runId!,
+          laneId,
+          invocation.attemptId!,
+          invocation.text!,
+        );
+        break;
+      case "reconcile":
+        await controller.reconcileAttempt(
+          runId!,
+          laneId,
+          invocation.attemptId!,
+        );
+        break;
+    }
+    const run = await ledger.load(runId!);
+    if (!run) {
+      stderr.write(`run "${runId}" not found\n`);
+      return 1;
+    }
+    renderRun(run, stdout);
+    return 0;
+  } catch (error) {
+    stderr.write(
+      `flow: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    return 1;
+  }
+}
+
+/**
+ * The ownership capability `flow takeover` / `flow release` hand to the
+ * runtime. The CLI does not decide whether it is needed — the runtime holds the
+ * lane and decides by its kind — so this builds a controller only when the
+ * runtime actually asks, and derives the payload from the run the runtime has
+ * already loaded. Read-only: one best-effort agent observation, no commit, and
+ * never the controller lease.
+ */
+function ownershipCapability(
+  ledger: Ledger,
+  ledgerRoot: string,
+  options: FlowCliOptions,
+): LaneOwnershipProvider {
+  return (run, laneId) =>
+    (
+      options.interactiveFactory?.(ledger) ??
+      realInteractiveController(ledger, ledgerRoot)
+    ).ownershipFrom(run, laneId);
+}
+
 export async function runFlowCli(
   args: readonly string[],
   stdout: TextSink = process.stdout,
@@ -300,6 +677,12 @@ export async function runFlowCli(
   options: FlowCliOptions = {},
 ): Promise<number> {
   const [command, runId, laneId, ...extra] = args;
+  if (
+    command !== undefined &&
+    (INTERACTIVE_COMMANDS as readonly string[]).includes(command)
+  ) {
+    return runInteractiveCli(args, stdout, stderr, options);
+  }
   const decide =
     command === "decide" ? parseDecideArgs(args.slice(1)) : null;
   if (
@@ -352,12 +735,19 @@ export async function runFlowCli(
       );
       const runtime = runtimeFor(authorizedTarget);
       await runtime.resumeWorkflow(runId!, laneTimeout(environment));
-    } else if (command === "takeover") {
+    } else if (command === "takeover" || command === "release") {
       const runtime = runtimeFor(null);
-      await runtime.takeoverLane(runId!, laneId!);
-    } else if (command === "release") {
-      const runtime = runtimeFor(null);
-      await runtime.releaseLane(runId!, laneId!);
+      // An interactive lane records WHAT changed hands; a headless lane has no
+      // attempt to name and keeps the empty shape. The runtime decides which,
+      // because it is the layer that holds the lane. The payload is derived
+      // without the controller lease, because a human takes a lane over exactly
+      // when a controller is running and holding it.
+      const ownership = ownershipCapability(ledger, root, options);
+      if (command === "takeover") {
+        await runtime.takeoverLane(runId!, laneId!, ownership);
+      } else {
+        await runtime.releaseLane(runId!, laneId!, ownership);
+      }
     } else if (command === "decide") {
       const authorizedTarget = await deliveryTargetFor(
         ledger,

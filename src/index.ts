@@ -113,6 +113,66 @@ export type { HerdrAdapter } from "./herdr/adapter.ts";
 export { RealHerdrAdapter } from "./herdr/real-adapter.ts";
 export type { RealHerdrAdapterOptions } from "./herdr/real-adapter.ts";
 
+// The interactive write lane. Its argv builders and JSON parsers are NOT
+// exported, for the same reason the agent-lane batteries are not: they emit
+// CLI-family mechanics and shell quoting, which the design keeps inside the
+// implementation (docs/design/observable-multi-agent-runtime.md section 6).
+export {
+  AttemptNotBoundError,
+  AttemptNotControllableError,
+  InteractiveLaneController,
+  LaneTakenOverError,
+  RetryNotAuthorizedError,
+  WriteLaneIsolationError,
+  controlDeliveryState,
+  latestControl,
+  pendingRetries,
+  unresolvedControls,
+} from "./interactive/control-plane.ts";
+export { GitWriteLaneIsolation } from "./interactive/isolation.ts";
+export type {
+  WriteLaneIsolationOutcome,
+  WriteLaneIsolationPort,
+} from "./interactive/isolation.ts";
+export type {
+  InteractiveDeps,
+  OpenLaneConfig,
+  RunnerRequest,
+  StartAttemptInput,
+  StartAttemptOutcome,
+} from "./interactive/control-plane.ts";
+// `objectiveFactsOf` and `projectAttemptDisposition` are the advisory wall's
+// two halves and are NOT exported: a caller wants a disposition, and reaching
+// for the halves is how the wall gets routed around. Their tests import the
+// module path directly, as the command builders' tests already do.
+export { attemptDisposition } from "./interactive/attempts.ts";
+export type {
+  AdvisoryAgentStatus,
+  AdvisoryObservation,
+  AdvisoryStateSource,
+  AttemptAuthorization,
+  AttemptCheckpoint,
+  AttemptDisposition,
+  AttemptEndReason,
+  ControlDelivery,
+  ControlDeliveryState,
+  ControlRecord,
+  DeliveredControl,
+  InteractiveAgentKind,
+  InteractiveAttemptView,
+  InteractiveRunnerEvidence,
+  ReconciliationOutcome,
+  ReconciliationRecord,
+  SteerObservation,
+  SteerObservationOutcome,
+} from "./interactive/types.ts";
+export type {
+  AgentPromptResult,
+  HerdrAgentControl,
+} from "./herdr/agent-control.ts";
+export { RealHerdrAgentControl } from "./herdr/real-agent-control.ts";
+export type { RealHerdrAgentControlOptions } from "./herdr/real-agent-control.ts";
+
 export {
   REPORT_CONTRACT_BLOCK,
   validateReportContract,

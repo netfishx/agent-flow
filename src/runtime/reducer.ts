@@ -22,6 +22,11 @@ import type {
   ReviewAxis,
   SessionIdentity,
 } from "../review/types.ts";
+import type {
+  AdvisoryObservation,
+  DeliveredControl,
+  InteractiveAttemptView,
+} from "../interactive/types.ts";
 import { verificationPassed } from "../review/verification.ts";
 import { checkpointSemanticSignature } from "./checkpoint.ts";
 
@@ -80,10 +85,19 @@ export interface LaneWorktreeDispositionView {
 export interface LaneView {
   readonly laneId: string;
   readonly paneId: string;
-  readonly logFile: string;
-  readonly stderrFile: string;
-  readonly sentinelToken: string;
-  readonly kind: "simulated" | "agent";
+  /**
+   * Headless-lane artifacts and completion sentinel. Null on an INTERACTIVE
+   * lane, which has no captured stdout and no sentinel — an empty string here
+   * would be a path that does not exist dressed up as one that does.
+   */
+  readonly logFile: string | null;
+  readonly stderrFile: string | null;
+  readonly sentinelToken: string | null;
+  readonly kind: "simulated" | "agent" | "interactive";
+  /** Root the interactive lane derives each attempt's declared paths under. */
+  readonly artifactRoot: string | null;
+  /** The repository an interactive lane's worktree was verified against. */
+  readonly repoRoot: string | null;
   readonly steps: number;
   readonly stepDelaySeconds: number;
   readonly role?: string;
@@ -164,6 +178,21 @@ export interface RunView {
   } | null;
   readonly lanes: Readonly<Record<string, LaneView>>;
   readonly laneOrder: readonly string[];
+  /**
+   * Interactive write-lane attempts, keyed by attemptId and append-only. A
+   * retry adds a record; it never rewrites one, so two attempts of one lane
+   * are distinguishable from these alone, with no pane inspected.
+   */
+  readonly interactiveAttempts: Readonly<Record<string, InteractiveAttemptView>>;
+  readonly interactiveAttemptOrder: readonly string[];
+  /**
+   * Every recorded human retry authorization, by the attempt it authorizes a
+   * retry PAST, in order. One authorization buys exactly one new attempt: a
+   * retry is available only while this list holds more entries for a parent
+   * than there are attempts already naming it. Kept as raw events so a fresh
+   * controller rebuilds pending authorization from the ledger, not memory.
+   */
+  readonly retryAuthorizations: readonly string[];
   readonly deliveries: Readonly<Record<string, DeliveryView>>;
   readonly deliveryOrder: readonly string[];
   readonly decisions: readonly DecisionView[];
@@ -243,6 +272,53 @@ function withLane(
     updatedAt: event.at,
     lastAppliedSequence: event.sequence,
     lanes: { ...state.lanes, [lane.laneId]: update(lane) },
+  };
+}
+
+function attemptFor(state: RunView, attemptId: string): InteractiveAttemptView {
+  const attempt = state.interactiveAttempts[attemptId];
+  if (!attempt) throw new Error(`unknown attemptId "${attemptId}"`);
+  return attempt;
+}
+
+/**
+ * Apply a patch to one attempt. Every caller goes through here, so an attempt
+ * is only ever extended in place — there is no path that replaces or deletes a
+ * prior attempt's record.
+ */
+function withAttempt(
+  state: RunView,
+  event: RunEvent,
+  attemptId: string,
+  update: (attempt: InteractiveAttemptView) => InteractiveAttemptView,
+): RunView {
+  const attempt = attemptFor(state, attemptId);
+  return {
+    ...state,
+    updatedAt: event.at,
+    lastAppliedSequence: event.sequence,
+    interactiveAttempts: {
+      ...state.interactiveAttempts,
+      [attemptId]: update(attempt),
+    },
+  };
+}
+
+function advisoryOf(
+  data: {
+    readonly status: AdvisoryObservation["status"];
+    readonly source: AdvisoryObservation["source"];
+    readonly paneId: string;
+    readonly message: string | null;
+  },
+  at: number,
+): AdvisoryObservation {
+  return {
+    status: data.status,
+    source: data.source,
+    paneId: data.paneId,
+    at,
+    ...(data.message === null ? {} : { message: data.message }),
   };
 }
 
@@ -476,6 +552,9 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       controller: null,
       lanes: {},
       laneOrder: [],
+      interactiveAttempts: {},
+      interactiveAttemptOrder: [],
+      retryAuthorizations: [],
       deliveries: {},
       deliveryOrder: [],
       decisions: [],
@@ -508,43 +587,75 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       if (state.lanes[event.laneId]) {
         throw new Error(`lane "${event.laneId}" is already registered`);
       }
+      const data = event.data;
       const registration =
-        event.data.kind === "agent"
+        data.kind === "agent"
           ? {
               kind: "agent" as const,
               steps: 0,
               stepDelaySeconds: 0,
-              axis: event.data.axis,
-              agentKind: event.data.agentKind,
-              model: event.data.model,
-              effort: event.data.effort,
-              promptFile: event.data.promptFile,
-              bundleHash: event.data.bundleHash,
-              rawReportFile: event.data.rawReportFile,
-              worktreePath: event.data.worktreePath,
-              preassignedSessionId: event.data.preassignedSessionId,
+              axis: data.axis,
+              agentKind: data.agentKind,
+              model: data.model,
+              effort: data.effort,
+              promptFile: data.promptFile,
+              bundleHash: data.bundleHash,
+              rawReportFile: data.rawReportFile,
+              worktreePath: data.worktreePath,
+              preassignedSessionId: data.preassignedSessionId,
+              artifactRoot: null,
+              repoRoot: null,
+              logFile: data.logFile,
+              stderrFile: data.stderrFile,
+              sentinelToken: data.sentinelToken,
             }
-          : {
-              // Replayed pre-#7 events carry no `kind`; they are simulated.
-              kind: "simulated" as const,
-              steps: event.data.steps,
-              stepDelaySeconds: event.data.stepDelaySeconds,
-              axis: null,
-              agentKind: null,
-              model: null,
-              effort: null,
-              promptFile: null,
-              bundleHash: null,
-              rawReportFile: null,
-              worktreePath: null,
-              preassignedSessionId: null,
-            };
+          : data.kind === "interactive"
+            ? {
+                // An interactive lane has no captured stdout and no sentinel,
+                // so it registers none. Brief, session, and result paths belong
+                // to an ATTEMPT: a retry allocates new ones under artifactRoot,
+                // and the lane outlives every attempt.
+                kind: "interactive" as const,
+                steps: 0,
+                stepDelaySeconds: 0,
+                axis: null,
+                agentKind: data.agentKind,
+                model: data.model,
+                effort: data.effort,
+                promptFile: null,
+                bundleHash: null,
+                rawReportFile: null,
+                worktreePath: data.worktreePath,
+                preassignedSessionId: null,
+                artifactRoot: data.artifactRoot,
+                repoRoot: data.repoRoot,
+                logFile: null,
+                stderrFile: null,
+                sentinelToken: null,
+              }
+            : {
+                // Replayed pre-#7 events carry no `kind`; they are simulated.
+                kind: "simulated" as const,
+                steps: data.steps,
+                stepDelaySeconds: data.stepDelaySeconds,
+                axis: null,
+                agentKind: null,
+                model: null,
+                effort: null,
+                promptFile: null,
+                bundleHash: null,
+                rawReportFile: null,
+                worktreePath: null,
+                preassignedSessionId: null,
+                artifactRoot: null,
+                repoRoot: null,
+                logFile: data.logFile,
+                stderrFile: data.stderrFile,
+                sentinelToken: data.sentinelToken,
+              };
       const lane: LaneView = {
         laneId: event.data.laneId,
         paneId: event.data.paneId,
-        logFile: event.data.logFile,
-        stderrFile: event.data.stderrFile,
-        sentinelToken: event.data.sentinelToken,
         ...(event.data.role === undefined ? {} : { role: event.data.role }),
         ...registration,
         isolationPre: null,
@@ -629,8 +740,9 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
           liveAt: event.at,
         };
       });
-    case "lane_checkpoint":
-      return withLane(state, event, (lane) => {
+    case "lane_checkpoint": {
+      const attemptId = event.data.attemptId;
+      const withCheckpoint = withLane(state, event, (lane) => {
         const blockedAnchor =
           lane.blockedAnchor === null && event.data.semanticState === "blocked"
             ? {
@@ -656,6 +768,28 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
           blockedAnchor,
         };
       });
+      if (attemptId === undefined) return withCheckpoint;
+      // An interactive attempt's checkpoint is AGENT-authored at a declared
+      // path. `origin` travels with it, so a runtime-derived `unknown` record
+      // can never be rendered as the Agent's own claim. Write-once: a second
+      // collection would overwrite the record the first one preserved.
+      return withAttempt(withCheckpoint, event, attemptId, (attempt) => {
+        if (attempt.agentCheckpoint !== null) {
+          throw new Error(
+            `attempt "${attemptId}" already has a checkpoint; it is write-once`,
+          );
+        }
+        return {
+          ...attempt,
+          agentCheckpoint: {
+            file: event.data.checkpointFile,
+            semanticState: event.data.semanticState,
+            origin: event.actor === "runtime" ? "runtime" : "agent",
+            at: event.at,
+          },
+        };
+      });
+    }
     case "lane_exited":
       return withLane(state, event, (lane) => {
         assertNonTerminal(lane, event.type);
@@ -793,14 +927,311 @@ export function reduce(state: RunView | undefined, event: RunEvent): RunView {
       }));
     }
     case "lane_takeover":
-      return withLane(state, event, (lane) => ({
-        ...lane,
-        controlMode: "human_owned",
+    case "lane_release": {
+      const controlMode: ControlMode =
+        event.type === "lane_takeover" ? "human_owned" : "managed";
+      const next = withLane(state, event, (lane) => ({ ...lane, controlMode }));
+      // The lane is the source of truth for ownership; each of its attempts
+      // mirrors it so an attempt record reads correctly on its own.
+      return {
+        ...next,
+        interactiveAttempts: Object.fromEntries(
+          Object.entries(next.interactiveAttempts).map(([id, attempt]) => [
+            id,
+            attempt.laneId === event.laneId
+              ? { ...attempt, controlMode }
+              : attempt,
+          ]),
+        ),
+      };
+    }
+    case "interactive_attempt_started": {
+      const data = event.data;
+      const lane = laneFor(state, event);
+      if (lane.kind !== "interactive") {
+        throw new Error(
+          "interactive_attempt_started applies to interactive lanes only",
+        );
+      }
+      if (state.interactiveAttempts[data.attemptId]) {
+        throw new Error(`attempt "${data.attemptId}" is already started`);
+      }
+      if (
+        data.parentAttemptId !== null &&
+        !state.interactiveAttempts[data.parentAttemptId]
+      ) {
+        throw new Error(
+          `attempt "${data.attemptId}" names unknown parent "${data.parentAttemptId}"`,
+        );
+      }
+      const attempt: InteractiveAttemptView = {
+        attemptId: data.attemptId,
+        ordinal: data.ordinal,
+        runId: state.runId,
+        laneId: lane.laneId,
+        parentAttemptId: data.parentAttemptId,
+        agentKind: data.agentKind,
+        model: data.model,
+        effort: data.effort,
+        paneId: data.paneId,
+        expectedAgentName: data.expectedAgentName,
+        agentName: null,
+        session: {
+          kind: "unavailable",
+          reason: "the attempt has not bound an agent yet",
+        },
+        worktreePath: data.worktreePath,
+        briefFile: data.briefFile,
+        checkpointFile: data.checkpointFile,
+        resultPointer: data.resultPointer,
+        startedAt: event.at,
+        endedAt: null,
+        endReason: null,
+        endCause: null,
+        exitCode: null,
+        supersededBy: null,
+        authorization: { ...data.authorization, at: event.at },
+        agentCheckpoint: null,
+        runnerEvidence: [],
+        reconciliation: null,
+        advisory: [],
+        controlMode: lane.controlMode,
+        steerSubmissions: 0,
+        steerObservations: 0,
+        lastCancelTurnAt: null,
+        lastAbortAt: null,
+        controls: [],
+      };
+      // `supersededBy` is DERIVED here from the child naming its parent. There
+      // is no separate supersede event, so the two directions cannot disagree.
+      const parent =
+        data.parentAttemptId === null
+          ? null
+          : state.interactiveAttempts[data.parentAttemptId]!;
+      return withRun(state, event, {
+        interactiveAttempts: {
+          ...state.interactiveAttempts,
+          ...(parent === null
+            ? {}
+            : { [parent.attemptId]: { ...parent, supersededBy: data.attemptId } }),
+          [data.attemptId]: attempt,
+        },
+        interactiveAttemptOrder: [
+          ...state.interactiveAttemptOrder,
+          data.attemptId,
+        ],
+      });
+    }
+    case "interactive_attempt_bound":
+      return withAttempt(state, event, event.data.attemptId, (attempt) => {
+        if (attempt.agentName !== null) {
+          throw new Error("duplicate interactive_attempt_bound");
+        }
+        if (attempt.endReason !== null) {
+          throw new Error(
+            `attempt "${attempt.attemptId}" ended as "${attempt.endReason}" and cannot bind an agent`,
+          );
+        }
+        return {
+          ...attempt,
+          agentName: event.data.agentName,
+          session: event.data.session,
+        };
+      });
+    case "interactive_attempt_ended":
+      return withAttempt(state, event, event.data.attemptId, (attempt) => {
+        // An end is PERMANENT. No second end, whatever the first one was —
+        // a start failure is an end like any other, and overwriting it would
+        // delete the only record of why the attempt never ran.
+        if (attempt.endReason !== null) {
+          throw new Error(
+            `attempt "${attempt.attemptId}" already ended as "${attempt.endReason}"`,
+          );
+        }
+        return {
+          ...attempt,
+          endedAt: event.at,
+          endReason: event.data.endReason,
+          endCause: event.data.cause,
+          exitCode: event.data.exitCode,
+        };
+      });
+    case "interactive_attempt_reconciled":
+      // Reconciliation is a repeatable OBSERVATION: the projection keeps the
+      // latest and the event log keeps the history. It never revives an ended
+      // attempt — `endReason` is not touched here, and the control-plane guard
+      // reads it, so a later `live` sighting restores nothing.
+      return withAttempt(state, event, event.data.attemptId, (attempt) => ({
+        ...attempt,
+        // The pane id is re-read rather than assumed: a pane moved between
+        // workspaces receives a new workspace-qualified id.
+        paneId: event.data.paneId,
+        reconciliation: {
+          outcome: event.data.outcome,
+          at: event.at,
+          detail: event.data.detail,
+        },
       }));
-    case "lane_release":
-      return withLane(state, event, (lane) => ({
-        ...lane,
-        controlMode: "managed",
+    case "interactive_retry_authorized": {
+      // The authorization stands alone in the ledger so it survives a
+      // controller that dies before the new attempt starts.
+      const parent = event.data.parentAttemptId;
+      if (!state.interactiveAttempts[parent]) {
+        throw new Error(
+          `interactive_retry_authorized names unknown attempt "${parent}"`,
+        );
+      }
+      return withRun(state, event, {
+        retryAuthorizations: [...state.retryAuthorizations, parent],
+      });
+    }
+    case "interactive_runner_evidence":
+      return withAttempt(state, event, event.data.attemptId, (attempt) => {
+        if (
+          attempt.runnerEvidence.some(
+            (record) => record.evidenceId === event.data.evidenceId,
+          )
+        ) {
+          throw new Error(
+            `duplicate runner evidence "${event.data.evidenceId}"`,
+          );
+        }
+        return {
+          ...attempt,
+          runnerEvidence: [
+            ...attempt.runnerEvidence,
+            {
+              evidenceId: event.data.evidenceId,
+              attemptId: event.data.attemptId,
+              command: event.data.command,
+              logFile: event.data.logFile,
+              paneId: event.data.paneId,
+              exitCode: event.data.exitCode,
+              startedAt: event.data.startedAt,
+              endedAt: event.data.endedAt,
+            },
+          ],
+        };
+      });
+    case "lane_steer_submitted":
+      return withAttempt(state, event, event.data.attemptId, (attempt) => ({
+        ...attempt,
+        steerSubmissions: attempt.steerSubmissions + 1,
+      }));
+    case "lane_steer_observed":
+      return withAttempt(state, event, event.data.attemptId, (attempt) => ({
+        ...attempt,
+        steerObservations: attempt.steerObservations + 1,
+        // The observed state joins the ADVISORY channel. It is recorded, and
+        // it is unreadable by any outcome projection.
+        advisory:
+          event.data.observedStatus === null || event.data.source === null
+            ? attempt.advisory
+            : [
+                ...attempt.advisory,
+                advisoryOf(
+                  {
+                    status: event.data.observedStatus,
+                    source: event.data.source,
+                    paneId: attempt.paneId,
+                    message: null,
+                  },
+                  event.at,
+                ),
+              ],
+      }));
+    // Control INTENT, recorded before the Herdr call so a controller that dies
+    // mid-call still leaves the request behind. Delivery is a separate fact,
+    // paired to this intent by `controlId`.
+    case "lane_cancel_turn":
+    case "lane_abort_session": {
+      const control: DeliveredControl =
+        event.type === "lane_cancel_turn" ? "cancel-turn" : "abort-session";
+      const method =
+        event.type === "lane_cancel_turn"
+          ? ("send-keys" as const)
+          : ("signal-process-group" as const);
+      const controlId = event.data.controlId;
+      return withAttempt(state, event, event.data.attemptId, (attempt) => {
+        // Unique for the life of the attempt, not just against the latest
+        // record: reusing an id would let a later delivery attach to the wrong
+        // request.
+        if (attempt.controls.some((record) => record.controlId === controlId)) {
+          throw new Error(
+            `control id "${controlId}" was already used on attempt "${attempt.attemptId}"`,
+          );
+        }
+        return {
+          ...attempt,
+          ...(control === "cancel-turn"
+            ? { lastCancelTurnAt: event.at }
+            : { lastAbortAt: event.at }),
+          controls: [
+            ...attempt.controls,
+            { controlId, control, method, requestedAt: event.at, delivery: null },
+          ],
+        };
+      });
+    }
+    case "lane_control_delivered":
+      return withAttempt(state, event, event.data.attemptId, (attempt) => {
+        // A delivery is meaningless without the request it carried out, and a
+        // second one would overwrite the first record of what happened.
+        const index = attempt.controls.findIndex(
+          (record) => record.controlId === event.data.controlId,
+        );
+        const pending = index === -1 ? null : attempt.controls[index]!;
+        if (pending === null) {
+          throw new Error(
+            `lane_control_delivered "${event.data.controlId}" has no pending control intent on attempt "${attempt.attemptId}"`,
+          );
+        }
+        if (pending.delivery !== null) {
+          throw new Error(
+            `delivery for control "${event.data.controlId}" was already recorded`,
+          );
+        }
+        if (pending.control !== event.data.control) {
+          throw new Error(
+            `delivery control "${event.data.control}" does not match intent "${pending.control}"`,
+          );
+        }
+        const controls = [...attempt.controls];
+        controls[index] = {
+          ...pending,
+          delivery: {
+            delivered: event.data.delivered,
+            detail: event.data.detail,
+            observedStatus: event.data.observedStatus,
+            at: event.at,
+          },
+        };
+        return {
+          ...attempt,
+          controls,
+          // A status seen after the effect is still ADVISORY, and joins that
+          // channel rather than becoming a delivery confirmation of its own.
+          advisory:
+            event.data.observedStatus === null
+              ? attempt.advisory
+              : [
+                  ...attempt.advisory,
+                  advisoryOf(
+                    {
+                      status: event.data.observedStatus,
+                      source: "herdr-detection",
+                      paneId: attempt.paneId,
+                      message: null,
+                    },
+                    event.at,
+                  ),
+                ],
+        };
+      });
+    case "lane_advisory_state_observed":
+      return withAttempt(state, event, event.data.attemptId, (attempt) => ({
+        ...attempt,
+        advisory: [...attempt.advisory, advisoryOf(event.data, event.at)],
       }));
     case "controller_attached":
       return withRun(state, event, {

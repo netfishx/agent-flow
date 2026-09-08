@@ -85,6 +85,16 @@ export interface FakeHerdrAdapterOptions {
   readonly failRunInPaneAfter?: number;
   /** Throw on `splitPane` only after this many successful calls. */
   readonly failSplitPaneAfter?: number;
+  /**
+   * Exit code the interactive lane's RUNNER pane reports. The runner is an
+   * ordinary headless command under the same sentinel contract as a lane, so
+   * the fake writes its sentinel into the durable log and nothing else.
+   */
+  readonly runnerExitCode?: number;
+  /** Make the runner leave no sentinel, so no exit code can be parsed. */
+  readonly runnerOmitsSentinel?: boolean;
+  /** Pane ids `processInfo` rejects, modelling a pane that no longer exists. */
+  readonly missingPaneIds?: readonly string[];
 }
 
 interface FakePaneState {
@@ -145,6 +155,9 @@ export class FakeHerdrAdapter implements HerdrAdapter {
   private readonly failRunInPane: boolean;
   private readonly failRunInPaneAfter: number | null;
   private readonly failSplitPaneAfter: number | null;
+  private readonly runnerExitCode: number;
+  private readonly runnerOmitsSentinel: boolean;
+  private readonly missingPaneIds: ReadonlySet<string>;
   private runInPaneCalls = 0;
   private splitPaneCalls = 0;
   private readonly panes = new Map<string, FakePaneState>();
@@ -161,6 +174,8 @@ export class FakeHerdrAdapter implements HerdrAdapter {
   readonly waitTimeoutMs: number[] = [];
   readonly interruptedPaneIds: string[] = [];
   readonly dispatched: { paneId: string; command: string }[] = [];
+  /** Every cwd a pane was split into — proves which path Herdr really got. */
+  readonly splitCwds: string[] = [];
 
   constructor(options: FakeHerdrAdapterOptions = {}) {
     this.clock = options.clock ?? createClock();
@@ -168,11 +183,27 @@ export class FakeHerdrAdapter implements HerdrAdapter {
     this.failRunInPane = options.failRunInPane ?? false;
     this.failRunInPaneAfter = options.failRunInPaneAfter ?? null;
     this.failSplitPaneAfter = options.failSplitPaneAfter ?? null;
+    this.runnerExitCode = options.runnerExitCode ?? 0;
+    this.runnerOmitsSentinel = options.runnerOmitsSentinel ?? false;
+    this.missingPaneIds = new Set(options.missingPaneIds ?? []);
     for (const lane of options.lanes ?? []) this.programs.set(lane.laneId, lane);
   }
 
   paneIdForLane(laneId: string): string | undefined {
     return this.paneByLane.get(laneId);
+  }
+
+  /**
+   * Model an interactive agent process living in a pane. `herdr agent start`
+   * puts a real process there, so its foreground group differs from the shell
+   * and a signal to that group IS delivered — without this the fake would only
+   * ever exercise the "nothing to signal" path.
+   */
+  occupyPane(paneId: string): void {
+    const state = this.panes.get(paneId);
+    if (!state) throw new Error(`fake: unknown pane ${paneId}`);
+    state.role = "lane";
+    state.finished = false;
   }
 
   /** Simulate a lane exiting on its own without going through wait/interrupt. */
@@ -212,6 +243,7 @@ export class FakeHerdrAdapter implements HerdrAdapter {
       throw new Error("fake: splitPane failed");
     }
     this.splitPaneCalls++;
+    this.splitCwds.push(_opts.cwd);
     const paneId = `wf:p${++this.paneSeq}`;
     this.panes.set(paneId, {
       paneId,
@@ -237,6 +269,27 @@ export class FakeHerdrAdapter implements HerdrAdapter {
     const state = this.panes.get(pane.id);
     if (!state) throw new Error(`fake: unknown pane ${pane.id}`);
     const tokens = scanSingleQuoted(shellCommand);
+    if (tokens[0]?.startsWith("# flow interactive runner")) {
+      // tokens: [script, runId, evidenceId, cwd, logFile, ...argv]
+      const [, runId, evidenceId, , logFile] = tokens;
+      if (!runId || !evidenceId || !logFile) {
+        throw new Error(`fake: could not parse runner command: ${shellCommand}`);
+      }
+      state.role = "lane";
+      state.runId = runId;
+      state.laneId = evidenceId;
+      state.logFile = logFile;
+      state.finished = true;
+      await mkdir(dirname(logFile), { recursive: true });
+      await writeFile(
+        logFile,
+        this.runnerOmitsSentinel
+          ? `RUNNER_START run=${runId} evidence=${evidenceId}\n`
+          : `RUNNER_START run=${runId} evidence=${evidenceId}\nFLOW_${runId}_RUNNER_${evidenceId}_EXIT=${this.runnerExitCode}\n`,
+        "utf8",
+      );
+      return;
+    }
     if (tokens[0]?.startsWith("# flow agent lane")) {
       // tokens: [script, runId, laneId, cwd, logFile, stderrFile, rawFile,
       // promptFile, stdinMode, rawMode, ...cli]
@@ -346,6 +399,9 @@ export class FakeHerdrAdapter implements HerdrAdapter {
     this.processInfoCalls++;
     this.processInfoPaneIds.push(pane.id);
     this.tick(this.advances.processInfo);
+    if (this.missingPaneIds.has(pane.id)) {
+      throw new Error(`fake: pane ${pane.id} no longer exists`);
+    }
     const state = this.panes.get(pane.id);
     if (!state) throw new Error(`fake: unknown pane ${pane.id}`);
     const running = state.role === "lane" && !state.finished;
