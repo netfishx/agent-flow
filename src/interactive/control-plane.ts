@@ -45,6 +45,7 @@ import type { WriteLaneIsolationPort } from "./isolation.ts";
 import type { AgentInfoView } from "../herdr/agent-json.ts";
 import type {
   AdvisoryAgentStatus,
+  AttemptEndReason,
   ControlDeliveryState,
   ControlRecord,
   DeliveredControl,
@@ -206,6 +207,15 @@ interface ProbeResult {
 
 const DEFAULT_STEER_WAIT_MS = 5_000;
 const DEFAULT_RUNNER_TIMEOUT_MS = 300_000;
+
+/**
+ * What an effect can report about its own delivery. Returning nothing means
+ * "it landed unless it threw", which is all a fire-and-forget call can say.
+ */
+interface EffectOutcome {
+  readonly delivered: boolean;
+  readonly detail: string | null;
+}
 
 export class InteractiveLaneController {
   private readonly runs = new Map<string, RunView>();
@@ -467,7 +477,13 @@ export class InteractiveLaneController {
       type: "lane_steer_submitted",
       actor: "human",
       laneId,
-      data: { attemptId: attempt.attemptId, text, paneId: attempt.paneId, target },
+      data: {
+        attemptId: attempt.attemptId,
+        text,
+        paneId: attempt.paneId,
+        target,
+        method: "agent-prompt",
+      },
     });
     const result = await this.deps.agentControl.promptAgent(target, text, {
       waitMs: this.deps.steerWaitMs ?? DEFAULT_STEER_WAIT_MS,
@@ -526,6 +542,7 @@ export class InteractiveLaneController {
         data: {
           attemptId: attempt.attemptId,
           controlId,
+          target,
           method: "send-keys",
           keys: [...keys],
         },
@@ -575,6 +592,7 @@ export class InteractiveLaneController {
       this.assertControllable(attempt);
 
       const controlId = this.deps.idgen();
+      const target = this.targetOf(attempt);
       const probe = await this.probePane(attempt);
       if (probe.outcome !== "live") {
         await commit({
@@ -601,23 +619,51 @@ export class InteractiveLaneController {
         data: {
           attemptId: attempt.attemptId,
           controlId,
+          target,
           method: "signal-process-group",
         },
       });
 
-      // An undelivered signal is an OBSERVATION, not a failure: the pane's
-      // foreground group being back at the shell means the session was already
-      // gone. The attempt still ends, and the cause says which of the two
-      // happened, so `aborted` never implies a signal that was not sent.
-      let signalDetail: string | null = null;
+      // `delivered: false` from the adapter has two different meanings, and
+      // only one of them is an ending. The adapter distinguishes them by
+      // `processGroupId`, so this reads that rather than writing one sentence
+      // over both:
+      //
+      //   - null    — the pane's foreground group IS its shell, so nothing was
+      //               running and the session had already gone. The attempt
+      //               ends, but as `session-exit`: no signal was sent, and
+      //               `aborted` would credit this human act with an ending it
+      //               did not cause.
+      //   - a pgid  — a live foreground group was signalled and the signal did
+      //               not land. Whether the session survived is unknown — the
+      //               group may be gone, or unsignalable — so NOTHING ends
+      //               here. The failed intent and its failed delivery both stay
+      //               in the ledger, the adapter's own reason is carried into
+      //               the record, and the attempt stays controllable.
+      //
+      // Either way the delivery record says `delivered: false`, because that
+      // field means the effect landed.
+      const ending: { reason: AttemptEndReason | null; cause: string | null } = {
+        reason: null,
+        cause: null,
+      };
       const { error, ...delivery } = await this.deliver(async () => {
         const evidence = await this.deps.adapter.interruptPane({
           id: attempt.paneId,
         });
-        if (!evidence.delivered) {
-          signalDetail = `${evidence.signal} was not delivered: the pane had no foreground process group of its own`;
+        if (evidence.delivered) {
+          ending.reason = "aborted";
+          return { delivered: true, detail: null };
         }
-      }, this.targetOf(attempt));
+        ending.cause =
+          evidence.processGroupId === null
+            ? `${evidence.signal} was not sent: the pane's foreground process group was its own shell, so the session had already ended`
+            : `${evidence.signal} could not be delivered to process group ${evidence.processGroupId}${
+                evidence.detail === undefined ? "" : `: ${evidence.detail}`
+              }; whether the session is still running is unknown`;
+        if (evidence.processGroupId === null) ending.reason = "session-exit";
+        return { delivered: false, detail: ending.cause };
+      }, target);
       await commit({
         type: "lane_control_delivered",
         actor: "runtime",
@@ -628,18 +674,17 @@ export class InteractiveLaneController {
           control: "abort-session",
           method: "signal-process-group",
           ...delivery,
-          detail: signalDetail ?? delivery.detail,
         },
       });
-      if (delivery.delivered) {
+      if (ending.reason !== null) {
         await commit({
           type: "interactive_attempt_ended",
           actor: "runtime",
           laneId,
           data: {
             attemptId: attempt.attemptId,
-            endReason: "aborted",
-            cause: signalDetail,
+            endReason: ending.reason,
+            cause: ending.cause,
             // No exit code is invented: the signal went to a process group,
             // and Herdr exposes no exit code on any surface.
             exitCode: null,
@@ -788,7 +833,10 @@ export class InteractiveLaneController {
 
   /**
    * Drop this run's advisory source on request. A lane that ends normally does
-   * not need it: `abortSession` releases what it published on its own.
+   * not need it: `abortSession` releases what it published on its own — but
+   * only when the abort ended the attempt. An abort whose signal did not land
+   * ends nothing and releases nothing, which is exactly when this is the way
+   * out.
    */
   async releaseAdvisoryState(runId: string, laneId: string): Promise<void> {
     await this.mutate(runId, async (_commit, run) => {
@@ -1135,34 +1183,52 @@ export class InteractiveLaneController {
    * and never prevents the delivery fact from being recorded.
    */
   private async deliver(
-    effect: () => Promise<void>,
+    effect: () => Promise<void | EffectOutcome>,
     target: string,
   ): Promise<{
     readonly delivered: boolean;
     readonly detail: string | null;
     readonly observedStatus: AdvisoryAgentStatus | null;
+    readonly target: string;
     readonly error?: Error;
   }> {
+    let outcome: void | EffectOutcome;
     try {
-      await effect();
+      outcome = await effect();
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
-      return { delivered: false, detail: failure.message, observedStatus: null, error: failure };
+      return {
+        delivered: false,
+        detail: failure.message,
+        observedStatus: null,
+        target,
+        error: failure,
+      };
     }
+    // An effect that returns nothing landed by not throwing — that is all
+    // `send-keys` can say. An effect that returns its own evidence is believed:
+    // a signal the OS refused is not a delivery, however cleanly the call
+    // returned.
+    const landed = outcome?.delivered ?? true;
+    const effectDetail = outcome?.detail ?? null;
     try {
       const observed = await this.deps.agentControl.getAgent(target);
       return {
-        delivered: true,
-        detail: null,
+        delivered: landed,
+        detail: effectDetail,
         observedStatus: observed?.status ?? null,
+        target,
       };
     } catch (error) {
+      const why = error instanceof Error ? error.message : String(error);
       return {
-        delivered: true,
-        detail: `delivered, but not observed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        delivered: landed,
+        detail:
+          effectDetail === null
+            ? `delivered, but not observed: ${why}`
+            : `${effectDetail}; observation failed: ${why}`,
         observedStatus: null,
+        target,
       };
     }
   }
@@ -1569,11 +1635,18 @@ export function controlDeliveryState(
  * Controls whose delivery never landed. They are kept, never replayed, and
  * never erased by a later control: the effect may have reached the session,
  * and only a human can decide what to do about that.
+ *
+ * Both shapes count. `unconfirmed` is a request with no delivery recorded at
+ * all; `failed` is a delivery that says the effect did not land — which an
+ * abort whose signal was refused now produces without throwing, so it would
+ * otherwise leave the operator's view the moment any later control landed.
  */
 export function unresolvedControls(
   attempt: InteractiveAttemptView,
 ): readonly ControlRecord[] {
-  return attempt.controls.filter((record) => record.delivery === null);
+  return attempt.controls.filter(
+    (record) => controlDeliveryState(record) !== "delivered",
+  );
 }
 
 /** The most recent control, or null when none was ever requested. */

@@ -633,7 +633,10 @@ describe("P2-1 the reducer pairs deliveries strictly", () => {
     type: "lane_cancel_turn" as const,
     actor: "human" as const,
     laneId: "l1",
-    data: { attemptId, controlId, method: "send-keys" as const, keys: ["esc"] },
+    data: {
+      attemptId, controlId, target: "t1",
+      method: "send-keys" as const, keys: ["esc"],
+    },
   });
 
   const delivery = (
@@ -645,7 +648,7 @@ describe("P2-1 the reducer pairs deliveries strictly", () => {
     actor: "runtime" as const,
     laneId: "l1",
     data: {
-      attemptId, controlId, control,
+      attemptId, controlId, control, target: "t1",
       method: control === "cancel-turn"
         ? ("send-keys" as const)
         : ("signal-process-group" as const),

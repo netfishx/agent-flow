@@ -6,6 +6,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FakeHerdrAdapter, createClock } from "../src/herdr/fake-adapter.ts";
+import type { InterruptEvidence, PaneRef } from "../src/herdr/types.ts";
 import { FakeHerdrAgentControl } from "../src/herdr/fake-agent-control.ts";
 import type { AgentInfoView } from "../src/herdr/agent-json.ts";
 import { InMemoryLedger, type Ledger } from "../src/runtime/ledger.ts";
@@ -22,7 +23,9 @@ import {
   InteractiveLaneController,
   LaneTakenOverError,
   RetryNotAuthorizedError,
+  controlDeliveryState,
   pendingRetries,
+  unresolvedControls,
 } from "../src/interactive/control-plane.ts";
 import { agentNameFor } from "../src/herdr/agent-argv.ts";
 import { buildNativeArgs } from "../src/interactive/commands.ts";
@@ -827,8 +830,11 @@ function ownershipData(committed: readonly RunEvent[], type: string) {
 async function seed(
   ledger: Ledger,
   runId: string,
-  type: "lane_takeover" | "lane_release",
+  type: string,
   laneId: string,
+  // The shape every takeover and release carried before Revision 14.
+  data: unknown = {},
+  actor: "human" | "runtime" = "human",
 ): Promise<void> {
   const run = (await ledger.load(runId))!;
   await ledger.commit({
@@ -839,10 +845,9 @@ async function seed(
     at: 9_000 + run.lastAppliedSequence,
     controllerEpoch: 0,
     type,
-    actor: "human",
+    actor,
     laneId,
-    // The shape every takeover and release carried before Revision 14.
-    data: {},
+    data,
   } as RunEvent);
 }
 
@@ -1577,5 +1582,252 @@ describe("R3-1 the runtime entry point decides ownership by lane kind", () => {
       method: "ledger-control-mode",
       observedStatus: expect.any(String),
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Revision 17 — B-1 abort facts and B-3 control-event fields.
+//
+// Measured against `efdcde5`, not asserted: four of the eight fail there and
+// are the reason the fix exists — the three undelivered-signal cases in R17-1
+// (stays controllable, ends as session-exit, releases the advisory source) and
+// the field coverage in R17-2. Of the four that already passed at `efdcde5`,
+// three guard behaviour that was already right (a delivered signal still
+// aborts and still releases; a throwing effect fabricates nothing; an effect
+// resolving `null` still records its delivery — a fail-open this revision
+// could have introduced and did not), and one is a tripwire, labelled where
+// it sits.
+// ---------------------------------------------------------------------------
+
+/** A fake whose interrupt reports exactly the evidence a test needs. */
+class FixedInterruptAdapter extends FakeHerdrAdapter {
+  constructor(private readonly evidence: InterruptEvidence) {
+    super();
+  }
+  override async interruptPane(pane: PaneRef): Promise<InterruptEvidence> {
+    this.interruptedPaneIds.push(pane.id);
+    return this.evidence;
+  }
+}
+
+describe("R17-1 an abort signal that did not land is not recorded as delivered", () => {
+  test("a live foreground group that refused the signal leaves the attempt controllable", async () => {
+    const adapter = new FixedInterruptAdapter({
+      signal: "SIGINT",
+      processGroupId: 4242,
+      delivered: false,
+      detail: "kill EPERM",
+    });
+    const { ledger, committed } = recording(new InMemoryLedger());
+    const h = harness({ adapter, ledger });
+    const { runId, laneId } = await opened(h);
+    await h.controller.publishAdvisoryState(runId, laneId, "working");
+    committed.length = 0;
+
+    await h.controller.abortSession(runId, laneId);
+
+    const [after] = await h.controller.attempts(runId, laneId);
+    // The signal never reached the group, so nothing about the session is known
+    // and nothing ended.
+    expect(after!.endReason).toBeNull();
+    expect(attemptDisposition(after!)).toBe("running");
+    expect(committed.some((e) => e.type === "interactive_attempt_ended")).toBe(
+      false,
+    );
+
+    // The intent and its failed delivery are both kept.
+    const record = after!.controls.at(-1)!;
+    expect(record.control).toBe("abort-session");
+    expect(record.delivery?.delivered).toBe(false);
+    expect(controlDeliveryState(record)).toBe("failed");
+    // And it stays in the operator's view rather than dropping out of it as
+    // soon as some later control lands.
+    expect(unresolvedControls(after!)).toHaveLength(1);
+    // The detail names the group that was actually signalled, not the other arm,
+    // and claims nothing about a session nobody observed.
+    expect(record.delivery?.detail).toContain("4242");
+    // The adapter's own reason survives into the ledger rather than being
+    // replaced by a guess about which errno it was.
+    expect(record.delivery?.detail).toContain("kill EPERM");
+    expect(record.delivery?.detail).toContain("unknown");
+    expect(record.delivery?.detail).not.toContain("already ended");
+
+    // Nothing ended, so this run's advisory source is NOT dropped: releasing it
+    // would describe an attempt that is still the runtime's to describe.
+    expect(h.control.releaseCalls).toHaveLength(0);
+
+    // And a human can still act on the session, whose state is unknown.
+    await h.controller.cancelTurn(runId, laneId);
+    const [still] = await h.controller.attempts(runId, laneId);
+    expect(still!.controls).toHaveLength(2);
+    expect(still!.controls.at(-1)?.control).toBe("cancel-turn");
+    // The later, successful cancel does not bury the failed abort.
+    expect(unresolvedControls(still!).map((c) => c.control)).toEqual([
+      "abort-session",
+    ]);
+  });
+
+  test("a foreground group already back at the shell ends the attempt as session-exit", async () => {
+    const adapter = new FixedInterruptAdapter({
+      signal: "SIGINT",
+      processGroupId: null,
+      delivered: false,
+    });
+    const h = harness({ adapter });
+    const { runId, laneId } = await opened(h);
+
+    await h.controller.abortSession(runId, laneId);
+
+    const [after] = await h.controller.attempts(runId, laneId);
+    // The session was already gone. It was not this signal that ended it.
+    expect(after!.endReason).toBe("session-exit");
+    expect(after!.exitCode).toBeNull();
+    expect(after!.controls.at(-1)?.delivery?.delivered).toBe(false);
+    expect(attemptDisposition(after!)).toBe("unknown");
+  });
+
+  test("the session-exit arm releases the advisory source as well", async () => {
+    const adapter = new FixedInterruptAdapter({
+      signal: "SIGINT",
+      processGroupId: null,
+      delivered: false,
+    });
+    const h = harness({ adapter });
+    const { runId, laneId } = await opened(h);
+    await h.controller.publishAdvisoryState(runId, laneId, "working");
+
+    await h.controller.abortSession(runId, laneId);
+
+    // The attempt ended, so this run's advisory source is dropped — the end is
+    // what cleanup keys off, not which of the two endings it was.
+    const [after] = await h.controller.attempts(runId, laneId);
+    expect(after!.endReason).toBe("session-exit");
+    expect(h.control.releaseCalls).toHaveLength(1);
+  });
+
+  test("a delivered signal still aborts and still releases the advisory source", async () => {
+    const h = harness();
+    const { runId, laneId } = await opened(h);
+    await h.controller.publishAdvisoryState(runId, laneId, "working");
+
+    await h.controller.abortSession(runId, laneId);
+
+    const [after] = await h.controller.attempts(runId, laneId);
+    expect(after!.controls.at(-1)?.delivery?.delivered).toBe(true);
+    expect(after!.endReason).toBe("aborted");
+    expect(attemptDisposition(after!)).toBe("aborted");
+    expect(h.control.releaseCalls).toHaveLength(1);
+  });
+
+  test("an effect that resolves null still records its delivery", async () => {
+    // `sendKeys` is typed `Promise<void>`, and a `void` promise may resolve
+    // `null`. Dereferencing that would throw out of `deliver` and lose the
+    // delivery record — the one thing the intent/delivery pair exists to keep.
+    class NullSendKeys extends FakeHerdrAgentControl {
+      override async sendKeys(): Promise<void> {
+        return null as unknown as void;
+      }
+    }
+    const h = harness({ control: (a) => new NullSendKeys({ panes: a }) });
+    const { runId, laneId } = await opened(h);
+
+    await h.controller.cancelTurn(runId, laneId);
+
+    const [after] = await h.controller.attempts(runId, laneId);
+    expect(after!.controls.at(-1)?.delivery?.delivered).toBe(true);
+  });
+
+  test("an interrupt that throws fabricates neither a delivery nor an end", async () => {
+    class ThrowingInterrupt extends FakeHerdrAdapter {
+      override async interruptPane(): Promise<InterruptEvidence> {
+        throw new Error("herdr pane process-info failed (exit 1)");
+      }
+    }
+    const h = harness({ adapter: new ThrowingInterrupt() });
+    const { runId, laneId } = await opened(h);
+
+    await expect(h.controller.abortSession(runId, laneId)).rejects.toThrow(
+      /process-info failed/,
+    );
+    const [after] = await h.controller.attempts(runId, laneId);
+    expect(after!.endReason).toBeNull();
+    expect(after!.controls.at(-1)?.delivery?.delivered).toBe(false);
+  });
+});
+
+describe("R17-2 every control event names its target and its method", () => {
+  test("steer, cancel-turn, abort-session and their deliveries carry both", async () => {
+    const { ledger, committed } = recording(new InMemoryLedger());
+    const h = harness({ ledger });
+    const { runId, laneId, attempt } = await opened(h);
+    const target = attempt.agentName!;
+    committed.length = 0;
+
+    await h.controller.steer(runId, laneId, "hello");
+    await h.controller.cancelTurn(runId, laneId);
+    await h.controller.abortSession(runId, laneId);
+
+    const dataOf = (type: string) =>
+      committed
+        .filter((event) => event.type === type)
+        .map((event) => event.data as Record<string, unknown>);
+
+    const [steer] = dataOf("lane_steer_submitted");
+    expect(steer!.target).toBe(target);
+    // The mechanism the runtime actually used, named on the intent itself.
+    expect(steer!.method).toBe("agent-prompt");
+
+    for (const type of ["lane_cancel_turn", "lane_abort_session"]) {
+      const [intent] = dataOf(type);
+      expect(intent!.target).toBe(target);
+    }
+
+    const deliveries = dataOf("lane_control_delivered");
+    expect(deliveries).toHaveLength(2);
+    for (const delivery of deliveries) {
+      // The target the call actually used, never one recomputed from an
+      // attempt that has since changed.
+      expect(delivery.target).toBe(target);
+    }
+  });
+
+  test("control events recorded before Revision 17 still replay from disk", async () => {
+    // A tripwire, not a guard: nothing reads the new fields yet, so this cannot
+    // fail on their absence. It runs through the durable reader — the real
+    // serializer and the production replay path — so it WILL fail the day a
+    // reader or a validating parse is added and forgets the legacy shape.
+    const ledger = new FsLedger(root);
+    const h = harness({ ledger });
+    const { runId, laneId, attempt } = await opened(h);
+
+    // The shapes these two carried before Revision 17: no target anywhere.
+    await seed(ledger, runId, "lane_abort_session", laneId, {
+      attemptId: attempt.attemptId,
+      controlId: "legacy-1",
+      method: "signal-process-group",
+    });
+    await seed(
+      ledger,
+      runId,
+      "lane_control_delivered",
+      laneId,
+      {
+        attemptId: attempt.attemptId,
+        controlId: "legacy-1",
+        control: "abort-session",
+        method: "signal-process-group",
+        delivered: true,
+        detail: null,
+        observedStatus: null,
+      },
+      "runtime",
+    );
+
+    // Replayed by a controller that never saw the events written.
+    const replayed = await new FsLedger(root).load(runId);
+    const after = replayed!.interactiveAttempts[attempt.attemptId]!;
+    const record = after.controls.at(-1)!;
+    expect(record.controlId).toBe("legacy-1");
+    expect(record.delivery?.delivered).toBe(true);
   });
 });

@@ -352,6 +352,8 @@ export interface LaneSteerSubmittedData {
   readonly text: string;
   readonly paneId: string;
   readonly target: string;
+  /** The mechanism, named on the intent for the same reason the others name it. */
+  readonly method: "agent-prompt";
 }
 
 /**
@@ -375,6 +377,8 @@ export interface LaneCancelTurnData {
   readonly attemptId: string;
   /** Pairs this intent with exactly one delivery. */
   readonly controlId: string;
+  /** The target this call actually resolved to, not one recomputed later. */
+  readonly target: string;
   readonly method: "send-keys";
   readonly keys: readonly string[];
 }
@@ -387,6 +391,8 @@ export interface LaneAbortSessionData {
   readonly attemptId: string;
   /** Pairs this intent with exactly one delivery. */
   readonly controlId: string;
+  /** The target this call actually resolved to, not one recomputed later. */
+  readonly target: string;
   readonly method: "signal-process-group";
 }
 
@@ -401,7 +407,14 @@ export interface LaneControlDeliveredData {
   /** Must name an intent that has no delivery yet, of the same control. */
   readonly controlId: string;
   readonly control: DeliveredControl;
+  /** The target the effect was actually issued against. */
+  readonly target: string;
   readonly method: "send-keys" | "signal-process-group";
+  /**
+   * Whether the effect LANDED — not whether the call returned without
+   * throwing. An interrupt that reports an undelivered signal is `false` here,
+   * and `controlDeliveryState` reads that as `failed`.
+   */
   readonly delivered: boolean;
   readonly detail: string | null;
   readonly observedStatus: AdvisoryAgentStatus | null;

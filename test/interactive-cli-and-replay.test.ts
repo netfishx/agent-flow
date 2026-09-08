@@ -80,10 +80,11 @@ interface Seams {
 
 function seams(): Seams {
   const clock = createClock(1_000);
+  const adapter = new FakeHerdrAdapter({ clock });
   let seq = 0;
   return {
-    adapter: new FakeHerdrAdapter({ clock }),
-    agentControl: new FakeHerdrAgentControl(),
+    adapter,
+    agentControl: new FakeHerdrAgentControl({ panes: adapter }),
     next: () => ++seq,
   };
 }

@@ -344,7 +344,7 @@ describe("P2-B reducer pairs every delivery with its intent", () => {
         actor: "runtime",
         laneId: "l1",
         data: {
-          attemptId: "a1", controlId: "c1", control: "cancel-turn",
+          attemptId: "a1", controlId: "c1", control: "cancel-turn", target: "t1",
           method: "send-keys", delivered: true, detail: null, observedStatus: null,
         },
       }),
@@ -358,7 +358,10 @@ describe("P2-B reducer pairs every delivery with its intent", () => {
       type: "lane_cancel_turn",
       actor: "human",
       laneId: "l1",
-      data: { attemptId: "a1", controlId: "c1", method: "send-keys", keys: ["esc"] },
+      data: {
+        attemptId: "a1", controlId: "c1", target: "t1",
+        method: "send-keys", keys: ["esc"],
+      },
     });
     await ledger.commit({
       ...base(runId, 5),
@@ -366,7 +369,7 @@ describe("P2-B reducer pairs every delivery with its intent", () => {
       actor: "runtime",
       laneId: "l1",
       data: {
-        attemptId: "a1", controlId: "c1", control: "cancel-turn",
+        attemptId: "a1", controlId: "c1", control: "cancel-turn", target: "t1",
         method: "send-keys", delivered: true, detail: null, observedStatus: null,
       },
     });
@@ -377,7 +380,7 @@ describe("P2-B reducer pairs every delivery with its intent", () => {
         actor: "runtime",
         laneId: "l1",
         data: {
-          attemptId: "a1", controlId: "c1", control: "cancel-turn",
+          attemptId: "a1", controlId: "c1", control: "cancel-turn", target: "t1",
           method: "send-keys", delivered: true, detail: null, observedStatus: null,
         },
       }),
@@ -391,7 +394,10 @@ describe("P2-B reducer pairs every delivery with its intent", () => {
       type: "lane_cancel_turn",
       actor: "human",
       laneId: "l1",
-      data: { attemptId: "a1", controlId: "c1", method: "send-keys", keys: ["esc"] },
+      data: {
+        attemptId: "a1", controlId: "c1", target: "t1",
+        method: "send-keys", keys: ["esc"],
+      },
     });
     await expect(
       ledger.commit({
@@ -400,7 +406,7 @@ describe("P2-B reducer pairs every delivery with its intent", () => {
         actor: "runtime",
         laneId: "l1",
         data: {
-          attemptId: "a1", controlId: "c1", control: "abort-session",
+          attemptId: "a1", controlId: "c1", control: "abort-session", target: "t1",
           method: "signal-process-group", delivered: true, detail: null,
           observedStatus: null,
         },

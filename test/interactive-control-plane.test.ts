@@ -52,7 +52,10 @@ function harness(
 ) {
   const clock = createClock(1_000);
   const adapter = new FakeHerdrAdapter({ clock, ...options.adapter });
-  const agentControl = new FakeHerdrAgentControl(options.agent);
+  const agentControl = new FakeHerdrAgentControl({
+    panes: adapter,
+    ...options.agent,
+  });
   const ledger = new InMemoryLedger();
   let seq = 0;
   const controller = new InteractiveLaneController({

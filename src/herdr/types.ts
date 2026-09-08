@@ -62,4 +62,10 @@ export interface InterruptEvidence {
   readonly signal: string;
   readonly processGroupId: number | null;
   readonly delivered: boolean;
+  /**
+   * Why an undelivered signal failed, when the adapter has a reason. Present
+   * only on the arm where signalling was attempted and threw; a caller that
+   * records the failure must not invent one in its place.
+   */
+  readonly detail?: string;
 }
